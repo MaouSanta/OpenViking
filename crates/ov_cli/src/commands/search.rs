@@ -19,6 +19,7 @@ const SEARCH_RESULT_COLLECTION_KEYS: &[&str] =
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SearchRenderMode {
     Find,
+    FindResource,
     Search,
     SkillsList,
     SkillsFind,
@@ -34,6 +35,13 @@ impl SearchRenderContext {
     fn find(node_limit: i32) -> Self {
         Self {
             mode: SearchRenderMode::Find,
+            node_limit,
+        }
+    }
+
+    fn find_resource(node_limit: i32) -> Self {
+        Self {
+            mode: SearchRenderMode::FindResource,
             node_limit,
         }
     }
@@ -76,6 +84,7 @@ impl SearchRenderContext {
     fn item_noun(self) -> (&'static str, &'static str) {
         match self.mode {
             SearchRenderMode::SkillsList | SearchRenderMode::SkillsFind => ("skill", "skills"),
+            SearchRenderMode::FindResource => ("resource bundle", "resource bundles"),
             _ => ("result", "results"),
         }
     }
@@ -152,6 +161,34 @@ pub async fn find(
         output_format,
         compact,
         SearchRenderContext::find(node_limit),
+    );
+    Ok(())
+}
+
+pub async fn find_resource(
+    client: &HttpClient,
+    query: &str,
+    uri: &str,
+    node_limit: i32,
+    threshold: Option<f64>,
+    tags: Option<Vec<String>>,
+    output_format: OutputFormat,
+    compact: bool,
+) -> Result<()> {
+    let result = client
+        .find_resource(
+            query.to_string(),
+            uri.to_string(),
+            node_limit,
+            threshold,
+            tags,
+        )
+        .await?;
+    output_search_results(
+        &result,
+        output_format,
+        compact,
+        SearchRenderContext::find_resource(node_limit),
     );
     Ok(())
 }
@@ -317,7 +354,7 @@ fn search_ranking_line(context: Option<SearchRenderContext>, pass_count: Option<
     };
 
     let suffix = match context.mode {
-        SearchRenderMode::Find => format!(
+        SearchRenderMode::Find | SearchRenderMode::FindResource => format!(
             "limit {} final {}",
             context.node_limit,
             pluralize(context.node_limit as u64, "result", "results")

@@ -207,6 +207,7 @@ class SyncOpenViking:
         timeout: float = None,
         build_index: bool = True,
         summarize: bool = False,
+        bundle: bool = False,
         args: Optional[Dict[str, Any]] = None,
         telemetry: TelemetryRequest = False,
         **kwargs,
@@ -239,6 +240,7 @@ class SyncOpenViking:
                 timeout=timeout,
                 build_index=build_index,
                 summarize=summarize,
+                bundle=bundle,
                 args=args,
                 telemetry=telemetry,
                 **kwargs,
@@ -445,6 +447,27 @@ class SyncOpenViking:
                 time_field,
                 level,
                 image,
+            )
+        )
+
+    def find_resource(
+        self,
+        query: str,
+        target_uri: Union[str, List[str]] = "viking://resources",
+        limit: int = 10,
+        score_threshold: Optional[float] = None,
+        tags: Optional[List[str]] = None,
+        telemetry: TelemetryRequest = False,
+    ) -> Dict[str, Any]:
+        """Find atomic resource bundles by aggregated child-vector score."""
+        return run_async(
+            self._async_client.find_resource(
+                query=query,
+                target_uri=target_uri,
+                limit=limit,
+                score_threshold=score_threshold,
+                tags=tags,
+                telemetry=telemetry,
             )
         )
 

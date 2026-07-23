@@ -97,6 +97,34 @@ async def test_add_resource_forwards_args_to_service(
     assert seen["args"] == {"feishu_access_token": "u-test"}
 
 
+async def test_add_resource_forwards_bundle_mode_to_service(
+    client: httpx.AsyncClient,
+    service,
+    monkeypatch,
+):
+    seen = {}
+
+    async def fake_add_resource(**kwargs):
+        seen.update(kwargs)
+        return {
+            "status": "success",
+            "root_uri": "viking://resources/demo",
+        }
+
+    monkeypatch.setattr(service.resources, "add_resource", fake_add_resource)
+
+    resp = await client.post(
+        "/api/v1/resources",
+        json={
+            "path": "https://example.com/model.stp",
+            "bundle": True,
+        },
+    )
+
+    assert resp.status_code == 200
+    assert seen["bundle"] is True
+
+
 async def test_add_resource_with_telemetry_wait(
     client: httpx.AsyncClient,
     sample_markdown_file,

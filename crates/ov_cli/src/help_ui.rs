@@ -75,7 +75,14 @@ const FILESYSTEM: &[HelpCommand] =
     help_commands!["ls", "tree", "mkdir", "rm", "mv", "stat", "attrs", "get"];
 
 const SEARCH_CONTEXT: &[HelpCommand] = help_commands![
-    "find", "search", "grep", "glob", "abstract", "overview", "read"
+    "find",
+    "find-resource",
+    "search",
+    "grep",
+    "glob",
+    "abstract",
+    "overview",
+    "read"
 ];
 
 const CONFIG_STATUS: &[HelpCommand] = help_commands![
@@ -468,6 +475,30 @@ const COMMAND_HELP_SPECS: &[CommandHelpSpec] = &[
             HelpItem {
                 label: "ov tree <uri>",
                 description: "Explore the result's neighborhood.",
+            },
+        ],
+    },
+    CommandHelpSpec {
+        path: &["find-resource"],
+        purpose: "Find complete atomic resource bundles by vector similarity.",
+        examples: &[
+            HelpItem {
+                label: "ov find-resource \"blue gearbox\"",
+                description: "Return matching bundle roots, not individual files.",
+            },
+            HelpItem {
+                label: "ov find-resource \"beam\" --tags kind=step",
+                description: "Restrict discovery to one canonical source kind.",
+            },
+        ],
+        next_steps: &[
+            HelpItem {
+                label: "ov read <bundle-uri>/manifest.json",
+                description: "Inspect the bundle asset card.",
+            },
+            HelpItem {
+                label: "ov grep \"pattern\" -u <bundle-uri>",
+                description: "Find exact data inside the chosen bundle.",
             },
         ],
     },
@@ -2297,6 +2328,7 @@ fn localized_command_description<'a>(
         "add-skill" => "添加技能到 OpenViking",
         "skills" => "管理已安装技能",
         "find" => "语义检索相关上下文",
+        "find-resource" => "检索完整原子资源包",
         "read" => "读取精确资源内容",
         "write" => "更新已有资源",
         "add-memory" => "直接添加记忆",

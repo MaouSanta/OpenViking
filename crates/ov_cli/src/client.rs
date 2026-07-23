@@ -530,6 +530,25 @@ impl HttpClient {
         self.post("/api/v1/search/find", &body).await
     }
 
+    pub async fn find_resource(
+        &self,
+        query: String,
+        uri: String,
+        node_limit: i32,
+        threshold: Option<f64>,
+        tags: Option<Vec<String>>,
+    ) -> Result<serde_json::Value> {
+        let mut body = serde_json::json!({
+            "query": query,
+            "target_uri": uri,
+            "limit": node_limit,
+            "score_threshold": threshold,
+            "tags": tags,
+        });
+        compact_request_body(&mut body);
+        self.post("/api/v1/search/find-resource", &body).await
+    }
+
     pub async fn search(
         &self,
         query: String,
@@ -609,6 +628,7 @@ impl HttpClient {
         reason: &str,
         instruction: &str,
         wait: bool,
+        bundle: bool,
         timeout: Option<f64>,
         strict: bool,
         ignore_dirs: Option<String>,
@@ -640,6 +660,13 @@ impl HttpClient {
                 body.as_object_mut()
                     .expect("add_resource request body must be an object")
                     .insert("create_parent".to_string(), serde_json::Value::Bool(true));
+            }
+            // Omit false so older servers that do not know bundle mode keep
+            // accepting ordinary add-resource calls.
+            if bundle {
+                body.as_object_mut()
+                    .expect("add_resource request body must be an object")
+                    .insert("bundle".to_string(), serde_json::Value::Bool(true));
             }
             compact_request_body(&mut body);
             body
@@ -1949,6 +1976,31 @@ mod tests {
         assert!(request.starts_with("GET /api/v1/fs/tree?"));
         assert!(!request.contains("tz="));
         assert!(!request.contains("include_mod_time_iso="));
+    }
+
+    #[tokio::test]
+    async fn find_resource_posts_atomic_bundle_discovery_payload() {
+        let (base_url, request_rx) = spawn_request_capture_server().await;
+        let client = HttpClient::new(base_url, None, None, None, None, 5.0, false, None);
+
+        client
+            .find_resource(
+                "blue gearbox".to_string(),
+                "viking://resources/cad".to_string(),
+                3,
+                Some(0.4),
+                Some(vec!["kind=step".to_string()]),
+            )
+            .await
+            .expect("find-resource request should succeed");
+
+        let request = request_rx.await.expect("request should be captured");
+        assert!(request.starts_with("POST /api/v1/search/find-resource "));
+        assert!(request.contains(r#""query":"blue gearbox""#));
+        assert!(request.contains(r#""target_uri":"viking://resources/cad""#));
+        assert!(request.contains(r#""limit":3"#));
+        assert!(request.contains(r#""score_threshold":0.4"#));
+        assert!(request.contains(r#""tags":["kind=step"]"#));
     }
 
     #[tokio::test]

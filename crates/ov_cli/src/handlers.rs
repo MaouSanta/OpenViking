@@ -21,6 +21,7 @@ pub async fn handle_add_resource(
     reason: String,
     instruction: String,
     wait: bool,
+    bundle: bool,
     timeout: Option<f64>,
     strict_mode: bool,
     ignore_dirs: Option<String>,
@@ -34,6 +35,12 @@ pub async fn handle_add_resource(
     let is_url =
         path.starts_with("http://") || path.starts_with("https://") || path.starts_with("git@");
 
+    if bundle && is_url {
+        return Err(Error::Client(
+            "--bundle accepts one local source file, not a remote URL or repository.".to_string(),
+        ));
+    }
+
     if !is_url {
         use std::path::Path;
 
@@ -45,7 +52,19 @@ pub async fn handle_add_resource(
                 "Local path does not exist: {path}. If the path contains spaces, wrap it in quotes."
             )));
         }
+        if bundle && !path_obj.is_file() {
+            return Err(Error::Client(
+                "--bundle accepts one local source file, not a directory.".to_string(),
+            ));
+        }
         path = unescaped_path;
+    }
+
+    if bundle && watch_interval != 0.0 {
+        return Err(Error::Client(
+            "--bundle does not support --watch-interval; ingest a new bundle for new content."
+                .to_string(),
+        ));
     }
 
     // Check that only one of --to, --parent, or --parent-auto-create is set
@@ -101,6 +120,7 @@ pub async fn handle_add_resource(
         reason,
         instruction,
         wait,
+        bundle,
         timeout,
         strict,
         effective_ignore_dirs,
@@ -1328,6 +1348,46 @@ pub async fn handle_find(
         None,
         level,
         context_type,
+        tags,
+        ctx.output_format,
+        ctx.compact,
+    )
+    .await
+}
+
+pub async fn handle_find_resource(
+    query: String,
+    uri: String,
+    node_limit: i32,
+    threshold: Option<f64>,
+    tags: Option<Vec<String>>,
+    ctx: CliContext,
+) -> Result<()> {
+    if query.trim().is_empty() {
+        return Err(Error::Client("Search query must not be empty.".to_string()));
+    }
+
+    let mut params = vec![format!("--uri={}", uri), format!("-n {}", node_limit)];
+    if let Some(t) = threshold {
+        params.push(format!("--threshold {}", t));
+    }
+    if let Some(ref tags) = tags {
+        params.push(format!("--tags {}", tags.join(",")));
+    }
+    params.push(format!("\"{}\"", query));
+    print_command_echo(
+        "ov find-resource",
+        &params.join(" "),
+        ctx.config.echo_command,
+    );
+
+    let client = ctx.get_client();
+    commands::search::find_resource(
+        &client,
+        &query,
+        &uri,
+        node_limit,
+        threshold,
         tags,
         ctx.output_format,
         ctx.compact,

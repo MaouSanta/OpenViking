@@ -82,6 +82,7 @@ class AddResourceRequest(BaseModel):
     exclude: Optional[str] = None
     directly_upload_media: bool = True
     preserve_structure: Optional[bool] = None
+    bundle: bool = False
     args: Dict[str, Any] = Field(default_factory=dict)
     telemetry: TelemetryRequest = False
     watch_interval: float = 0
@@ -147,7 +148,12 @@ async def temp_upload(
         if signed is None:
             return {"temp_file_id": temp_file_id}
         return await ingest_temp_upload(
-            store, temp_file_id, _ctx, to=signed.to, reason=signed.reason
+            store,
+            temp_file_id,
+            _ctx,
+            to=signed.to,
+            reason=signed.reason,
+            bundle=signed.bundle,
         )
 
     try:
@@ -193,9 +199,12 @@ async def add_resource(
     if path is None:
         raise InvalidArgumentError("Either 'path' or 'temp_file_id' must be provided.")
 
-    # Use original_filename from upload if source_name not explicitly provided
+    # Bundle kind must follow the uploaded original's suffix, not a client
+    # override. Ordinary resource ingestion preserves the existing override.
     source_name = request.source_name
-    if source_name is None and original_filename is not None:
+    if request.bundle and original_filename is not None:
+        source_name = original_filename
+    elif source_name is None and original_filename is not None:
         source_name = original_filename
 
     kwargs = {
@@ -205,6 +214,7 @@ async def add_resource(
         "include": request.include,
         "exclude": request.exclude,
         "directly_upload_media": request.directly_upload_media,
+        "bundle": request.bundle,
         "watch_interval": request.watch_interval,
         "create_parent": request.create_parent,
     }

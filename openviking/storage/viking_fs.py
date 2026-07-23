@@ -479,6 +479,122 @@ class VikingFS:
                     resource=normalized_uri,
                 )
 
+    async def _ensure_atomic_bundle_write_allowed(
+        self,
+        uri: str,
+        *,
+        ctx: Optional[RequestContext],
+        uri_is_directory: bool = False,
+        allow_atomic_bundle_write: bool = False,
+    ) -> None:
+        """Reject a mutation of a member of an immutable atomic resource bundle."""
+        if allow_atomic_bundle_write:
+            return
+        from openviking.resource.atomic_bundle import find_resource_bundle_root
+
+        root_uri = await find_resource_bundle_root(
+            self,
+            uri,
+            ctx=self._ctx_or_default(ctx),
+            uri_is_directory=uri_is_directory,
+        )
+        if root_uri:
+            raise FailedPreconditionError(
+                "Atomic resource bundles are immutable. "
+                f"Operate on the complete bundle root instead: {root_uri}",
+                details={"bundle_root": root_uri, "uri": uri},
+            )
+
+    @staticmethod
+    def _ensure_atomic_bundle_manifest_creation_allowed(
+        uri: str,
+        content: Union[str, bytes],
+        *,
+        allow_atomic_bundle_write: bool,
+    ) -> None:
+        """Reserve the atomic-bundle marker for the controlled ingestion path."""
+        if allow_atomic_bundle_write or not uri.rstrip("/").endswith("/manifest.json"):
+            return
+        try:
+            if VikingURI(uri).scope != "resources":
+                return
+        except ValueError:
+            return
+        try:
+            from openviking.resource.atomic_bundle import is_resource_bundle_manifest
+
+            raw = content.decode("utf-8") if isinstance(content, bytes) else content
+            is_marker = is_resource_bundle_manifest(json.loads(raw))
+        except (TypeError, UnicodeDecodeError, ValueError):
+            is_marker = False
+        if is_marker:
+            raise FailedPreconditionError(
+                "Create an atomic resource bundle through add_resource(bundle=true), "
+                "not a generic file write.",
+                details={"uri": uri},
+            )
+
+    async def _ensure_atomic_bundle_delete_allowed(
+        self,
+        uri: str,
+        *,
+        ctx: Optional[RequestContext],
+        uri_is_directory: bool,
+    ) -> None:
+        """Allow deleting a bundle root, but never one of its members."""
+        from openviking.resource.atomic_bundle import find_resource_bundle_root
+
+        root_uri = await find_resource_bundle_root(
+            self,
+            uri,
+            ctx=self._ctx_or_default(ctx),
+            uri_is_directory=uri_is_directory,
+        )
+        if root_uri and uri.rstrip("/") != root_uri:
+            raise FailedPreconditionError(
+                "Atomic resource bundles must be removed as a complete package: "
+                f"{root_uri}",
+                details={"bundle_root": root_uri, "uri": uri},
+            )
+
+    async def _ensure_atomic_bundle_move_allowed(
+        self,
+        old_uri: str,
+        new_uri: str,
+        *,
+        ctx: Optional[RequestContext],
+        source_is_directory: bool,
+    ) -> None:
+        """Keep moves at bundle boundaries and prevent writes into an existing bundle."""
+        from openviking.resource.atomic_bundle import find_resource_bundle_root
+
+        real_ctx = self._ctx_or_default(ctx)
+        source_root = await find_resource_bundle_root(
+            self,
+            old_uri,
+            ctx=real_ctx,
+            uri_is_directory=source_is_directory,
+        )
+        if source_root and old_uri.rstrip("/") != source_root:
+            raise FailedPreconditionError(
+                "Atomic resource bundles must be moved as a complete package: "
+                f"{source_root}",
+                details={"bundle_root": source_root, "uri": old_uri},
+            )
+
+        destination_root = await find_resource_bundle_root(
+            self,
+            new_uri,
+            ctx=real_ctx,
+            uri_is_directory=source_is_directory,
+        )
+        if destination_root:
+            raise FailedPreconditionError(
+                "Cannot move content into an atomic resource bundle: "
+                f"{destination_root}",
+                details={"bundle_root": destination_root, "uri": new_uri},
+            )
+
     # ========== AGFS Basic Commands ==========
 
     async def read(
@@ -527,6 +643,12 @@ class VikingFS:
     ) -> str:
         """Write file"""
         self._ensure_mutable_access(uri, ctx)
+        self._ensure_atomic_bundle_manifest_creation_allowed(
+            uri,
+            data,
+            allow_atomic_bundle_write=False,
+        )
+        await self._ensure_atomic_bundle_write_allowed(uri, ctx=ctx)
         path = self._uri_to_path(uri, ctx=ctx)
         if isinstance(data, str):
             data = data.encode("utf-8")
@@ -540,9 +662,16 @@ class VikingFS:
         mode: str = "755",
         exist_ok: bool = False,
         ctx: Optional[RequestContext] = None,
+        _allow_atomic_bundle_write: bool = False,
     ) -> None:
         """Create directory."""
         self._ensure_mutable_access(uri, ctx)
+        await self._ensure_atomic_bundle_write_allowed(
+            uri,
+            ctx=ctx,
+            uri_is_directory=True,
+            allow_atomic_bundle_write=_allow_atomic_bundle_write,
+        )
         path = self._uri_to_path(uri, ctx=ctx)
         # Always ensure parent directories exist before creating this directory
         await self._ensure_parent_dirs(path, ctx=ctx)
@@ -578,6 +707,13 @@ class VikingFS:
         from openviking.storage.transaction import LockContext, get_lock_manager
 
         self._ensure_delete_access(uri, ctx)
+        # Catch file members before stat; this also protects orphan-vector cleanup
+        # calls for a path that has already disappeared from the filesystem.
+        await self._ensure_atomic_bundle_delete_allowed(
+            uri,
+            ctx=ctx,
+            uri_is_directory=False,
+        )
         path = self._uri_to_path(uri, ctx=ctx)
         target_uri = self._path_to_uri(path, ctx=ctx)
 
@@ -616,6 +752,11 @@ class VikingFS:
             return {"estimated_deleted_count": estimated_count}
 
         if is_dir:
+            await self._ensure_atomic_bundle_delete_allowed(
+                uri,
+                ctx=ctx,
+                uri_is_directory=True,
+            )
             if not recursive:
                 raise FailedPreconditionError(
                     f"Cannot remove directory without --recursive: {uri}",
@@ -720,6 +861,13 @@ class VikingFS:
                         details={"from_uri": old_uri, "to_uri": new_uri},
                     )
 
+        await self._ensure_atomic_bundle_move_allowed(
+            old_uri,
+            new_uri,
+            ctx=ctx,
+            source_is_directory=is_dir,
+        )
+
         real_ctx = self._ctx_or_default(ctx)
         old_uri = canonicalize_uri(old_uri, real_ctx)
         new_uri = canonicalize_uri(new_uri, real_ctx)
@@ -760,6 +908,7 @@ class VikingFS:
                     is_temp=is_temp,
                     ctx=ctx,
                     lock_handle=active_lock_handle,
+                    allow_atomic_bundle_write=True,
                 )
             except Exception as e:
                 if "not found" in str(e).lower():
@@ -826,6 +975,7 @@ class VikingFS:
         is_temp: bool,
         ctx: Optional[RequestContext] = None,
         lock_handle: Optional["LockHandle"] = None,
+        allow_atomic_bundle_write: bool = False,
     ) -> None:
         """Copy source to destination for mv without deleting source."""
         if is_temp:
@@ -839,7 +989,11 @@ class VikingFS:
 
         if is_dir:
             await self._copy_dir_through_vikingfs(
-                old_uri, new_uri, ctx=ctx, lock_handle=lock_handle
+                old_uri,
+                new_uri,
+                ctx=ctx,
+                lock_handle=lock_handle,
+                allow_atomic_bundle_write=allow_atomic_bundle_write,
             )
         else:
             await self._copy_file_through_vikingfs(
@@ -847,6 +1001,7 @@ class VikingFS:
                 new_uri,
                 ctx=ctx,
                 lock_handle=lock_handle,
+                allow_atomic_bundle_write=allow_atomic_bundle_write,
             )
 
     async def _copy_dir_through_vikingfs(
@@ -855,9 +1010,15 @@ class VikingFS:
         new_uri: str,
         ctx: Optional[RequestContext] = None,
         lock_handle: Optional["LockHandle"] = None,
+        allow_atomic_bundle_write: bool = False,
     ) -> None:
         """Recursively copy a directory through VikingFS read/write hooks."""
-        await self.mkdir(new_uri, exist_ok=True, ctx=ctx)
+        await self.mkdir(
+            new_uri,
+            exist_ok=True,
+            ctx=ctx,
+            _allow_atomic_bundle_write=allow_atomic_bundle_write,
+        )
 
         entries = await self.ls(old_uri, show_all_hidden=True, ctx=ctx)
         for entry in entries:
@@ -872,6 +1033,7 @@ class VikingFS:
                     new_child_uri,
                     ctx=ctx,
                     lock_handle=lock_handle,
+                    allow_atomic_bundle_write=allow_atomic_bundle_write,
                 )
             else:
                 await self._copy_file_through_vikingfs(
@@ -879,6 +1041,7 @@ class VikingFS:
                     new_child_uri,
                     ctx=ctx,
                     lock_handle=lock_handle,
+                    allow_atomic_bundle_write=allow_atomic_bundle_write,
                 )
 
     async def _copy_file_through_vikingfs(
@@ -887,10 +1050,17 @@ class VikingFS:
         to_uri: str,
         ctx: Optional[RequestContext] = None,
         lock_handle: Optional["LockHandle"] = None,
+        allow_atomic_bundle_write: bool = False,
     ) -> None:
         """Copy one file through VikingFS read/write hooks without deleting source."""
         content_bytes = await self.read_file_bytes(from_uri, ctx=ctx)
-        await self.write_file_bytes(to_uri, content_bytes, ctx=ctx, lock_handle=lock_handle)
+        await self.write_file_bytes(
+            to_uri,
+            content_bytes,
+            ctx=ctx,
+            lock_handle=lock_handle,
+            _allow_atomic_bundle_write=allow_atomic_bundle_write,
+        )
 
     async def grep(
         self,
@@ -2232,6 +2402,11 @@ class VikingFS:
         if isinstance(uris, str):
             uris = [uris]
         self._ensure_mutable_access(from_uri, ctx)
+        await self._ensure_atomic_bundle_write_allowed(
+            from_uri,
+            ctx=ctx,
+            uri_is_directory=True,
+        )
         for uri in uris:
             self._ensure_access(uri, ctx)
 
@@ -2255,6 +2430,11 @@ class VikingFS:
     ) -> None:
         """Delete relation."""
         self._ensure_mutable_access(from_uri, ctx)
+        await self._ensure_atomic_bundle_write_allowed(
+            from_uri,
+            ctx=ctx,
+            uri_is_directory=True,
+        )
         self._ensure_access(uri, ctx)
         from_path = self._uri_to_path(from_uri, ctx=ctx)
 
@@ -3068,9 +3248,20 @@ class VikingFS:
         content: Union[str, bytes],
         ctx: Optional[RequestContext] = None,
         lock_handle: Optional["LockHandle"] = None,
+        _allow_atomic_bundle_write: bool = False,
     ) -> None:
         """Write file directly."""
         self._ensure_mutable_access(uri, ctx)
+        self._ensure_atomic_bundle_manifest_creation_allowed(
+            uri,
+            content,
+            allow_atomic_bundle_write=_allow_atomic_bundle_write,
+        )
+        await self._ensure_atomic_bundle_write_allowed(
+            uri,
+            ctx=ctx,
+            allow_atomic_bundle_write=_allow_atomic_bundle_write,
+        )
         path = self._uri_to_path(uri, ctx=ctx)
         await self._ensure_parent_dirs(path, ctx=ctx)
 
@@ -3183,9 +3374,20 @@ class VikingFS:
         content: bytes,
         ctx: Optional[RequestContext] = None,
         lock_handle: Optional["LockHandle"] = None,
+        _allow_atomic_bundle_write: bool = False,
     ) -> None:
         """Write single binary file."""
         self._ensure_mutable_access(uri, ctx)
+        self._ensure_atomic_bundle_manifest_creation_allowed(
+            uri,
+            content,
+            allow_atomic_bundle_write=_allow_atomic_bundle_write,
+        )
+        await self._ensure_atomic_bundle_write_allowed(
+            uri,
+            ctx=ctx,
+            allow_atomic_bundle_write=_allow_atomic_bundle_write,
+        )
         path = self._uri_to_path(uri, ctx=ctx)
         await self._ensure_parent_dirs(path, ctx=ctx)
 
@@ -3204,6 +3406,7 @@ class VikingFS:
     ) -> None:
         """Append content to file."""
         self._ensure_mutable_access(uri, ctx)
+        await self._ensure_atomic_bundle_write_allowed(uri, ctx=ctx)
         path = self._uri_to_path(uri, ctx=ctx)
 
         try:
@@ -3444,6 +3647,12 @@ class VikingFS:
         """Move file."""
         self._ensure_mutable_access(from_uri, ctx)
         self._ensure_mutable_access(to_uri, ctx)
+        await self._ensure_atomic_bundle_move_allowed(
+            from_uri,
+            to_uri,
+            ctx=ctx,
+            source_is_directory=False,
+        )
         from_path = self._uri_to_path(from_uri, ctx=ctx)
 
         await self._copy_file_through_vikingfs(from_uri, to_uri, ctx=ctx)
@@ -3471,6 +3680,11 @@ class VikingFS:
         """Persist an already-encrypted temp tree without rewriting file bytes."""
         self._ensure_access(temp_uri, ctx)
         self._ensure_mutable_access(target_uri, ctx)
+        await self._ensure_atomic_bundle_write_allowed(
+            target_uri,
+            ctx=ctx,
+            uri_is_directory=True,
+        )
         src_path = self._uri_to_path(temp_uri, ctx=ctx)
         dst_path = self._uri_to_path(target_uri, ctx=ctx)
         await self._ensure_parent_dirs(dst_path, ctx=ctx)
@@ -3553,6 +3767,11 @@ class VikingFS:
         """Write context to AGFS (L0/L1/L2)."""
 
         self._ensure_mutable_access(uri, ctx)
+        await self._ensure_atomic_bundle_write_allowed(
+            uri,
+            ctx=ctx,
+            uri_is_directory=True,
+        )
         path = self._uri_to_path(uri, ctx=ctx)
 
         try:

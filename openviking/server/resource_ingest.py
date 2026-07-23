@@ -24,6 +24,7 @@ async def ingest_temp_upload(
     *,
     to: str = "",
     reason: str = "",
+    bundle: bool = False,
     args: Optional[dict[str, Any]] = None,
 ) -> dict[str, Any]:
     """Resolve a temp upload and ingest it as a resource; return the raw add_resource result.
@@ -45,6 +46,7 @@ async def ingest_temp_upload(
                 ctx=ctx,
                 to=to or None,
                 reason=reason,
+                bundle=bundle,
                 source_name=resolved.original_filename,
                 wait=False,
                 allow_local_path_resolution=True,

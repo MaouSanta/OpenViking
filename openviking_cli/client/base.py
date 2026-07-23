@@ -42,6 +42,7 @@ class BaseClient(ABC):
         instruction: str = "",
         wait: bool = False,
         timeout: Optional[float] = None,
+        bundle: bool = False,
         watch_interval: float = 0,
         args: Optional[Dict[str, Any]] = None,
         telemetry: TelemetryRequest = False,
@@ -81,6 +82,19 @@ class BaseClient(ABC):
         target_uri: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Find skills by semantic search."""
+        ...
+
+    @abstractmethod
+    async def find_resource(
+        self,
+        query: str,
+        target_uri: Union[str, List[str]] = "viking://resources",
+        limit: int = 10,
+        score_threshold: Optional[float] = None,
+        tags: Optional[List[str]] = None,
+        telemetry: TelemetryRequest = False,
+    ) -> Dict[str, Any]:
+        """Find atomic resource bundles by aggregated child-vector score."""
         ...
 
     @abstractmethod
