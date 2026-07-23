@@ -347,6 +347,13 @@ enum Commands {
         /// Wait until processing is complete
         #[arg(long, help_heading = "Common options")]
         wait: bool,
+        /// Store one local source file as an immutable atomic resource bundle
+        #[arg(
+            long,
+            conflicts_with_all = ["manifest", "add_type"],
+            help_heading = "Common options"
+        )]
+        bundle: bool,
         /// Wait timeout in seconds (only used with --wait)
         #[arg(
             long,
@@ -715,6 +722,37 @@ enum Commands {
         )]
         context_type: Option<Vec<String>>,
         /// Only include results matching all of these explicit tags
+        #[arg(long = "tags", value_delimiter = ',')]
+        tags: Option<Vec<String>>,
+    },
+    /// [Data] Find complete atomic resource bundles by vector similarity
+    FindResource {
+        /// Search query
+        #[arg(value_name = "query")]
+        query: String,
+        /// Target URI (defaults to the resources namespace)
+        #[arg(
+            short,
+            long,
+            default_value = "viking://resources",
+            value_name = "uri",
+            help_heading = "Common options"
+        )]
+        uri: String,
+        /// Maximum resource bundles returned
+        #[arg(
+            short = 'n',
+            long = "node-limit",
+            alias = "limit",
+            default_value = "10",
+            value_name = "n",
+            help_heading = "Common options"
+        )]
+        node_limit: i32,
+        /// Score threshold
+        #[arg(short, long, value_name = "score", help_heading = "Common options")]
+        threshold: Option<f64>,
+        /// Only include resource bundles matching all of these explicit tags
         #[arg(long = "tags", value_delimiter = ',')]
         tags: Option<Vec<String>>,
     },
@@ -2158,7 +2196,14 @@ fn canonical_plain_help_token(token: &str) -> &str {
 fn allows_plain_help_as_user_input(command: &str) -> bool {
     matches!(
         command,
-        "add-resource" | "add-skill" | "find" | "search" | "grep" | "glob" | "add-memory"
+        "add-resource"
+            | "add-skill"
+            | "find"
+            | "find-resource"
+            | "search"
+            | "grep"
+            | "glob"
+            | "add-memory"
     )
 }
 
@@ -2338,6 +2383,7 @@ fn is_top_level_server_command(command: &str) -> bool {
             | "write"
             | "get"
             | "find"
+            | "find-resource"
             | "search"
             | "grep"
             | "glob"
@@ -2920,6 +2966,7 @@ async fn main() {
             reason,
             instruction,
             wait,
+            bundle,
             timeout,
             strict_mode,
             ignore_dirs,
@@ -2968,6 +3015,7 @@ async fn main() {
                     reason,
                     instruction,
                     wait,
+                    bundle,
                     timeout,
                     strict_mode,
                     ignore_dirs,
@@ -3421,6 +3469,13 @@ async fn main() {
             )
             .await
         }
+        Commands::FindResource {
+            query,
+            uri,
+            node_limit,
+            threshold,
+            tags,
+        } => handlers::handle_find_resource(query, uri, node_limit, threshold, tags, ctx).await,
         Commands::Search {
             query,
             image,
@@ -3587,6 +3642,50 @@ mod tests {
                 );
             }
             _ => panic!("expected find command"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_atomic_bundle_and_resource_discovery_commands() {
+        let add = Cli::try_parse_from([
+            "ov",
+            "add-resource",
+            "./model.stp",
+            "--bundle",
+            "--to",
+            "viking://resources/model",
+        ])
+        .expect("atomic bundle add should parse");
+        match add.command {
+            Commands::AddResource { bundle, to, .. } => {
+                assert!(bundle);
+                assert_eq!(to.as_deref(), Some("viking://resources/model"));
+            }
+            _ => panic!("expected add-resource command"),
+        }
+
+        let find = Cli::try_parse_from([
+            "ov",
+            "find-resource",
+            "blue gearbox",
+            "--tags",
+            "kind=step",
+            "-n",
+            "3",
+        ])
+        .expect("resource discovery command should parse");
+        match find.command {
+            Commands::FindResource {
+                query,
+                node_limit,
+                tags,
+                ..
+            } => {
+                assert_eq!(query, "blue gearbox");
+                assert_eq!(node_limit, 3);
+                assert_eq!(tags, Some(vec!["kind=step".to_string()]));
+            }
+            _ => panic!("expected find-resource command"),
         }
     }
 
@@ -3945,6 +4044,7 @@ mod tests {
             "write",
             "get",
             "find",
+            "find-resource",
             "search",
             "grep",
             "glob",
@@ -4865,6 +4965,7 @@ mod tests {
     fn plain_help_is_allowed_as_free_form_user_input() {
         for args in [
             vec!["ov", "find", "help"],
+            vec!["ov", "find-resource", "help"],
             vec!["ov", "search", "help"],
             vec!["ov", "grep", "help"],
             vec!["ov", "glob", "help"],

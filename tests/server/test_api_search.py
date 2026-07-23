@@ -55,7 +55,14 @@ async def test_find_basic(client_with_resource):
     assert "telemetry" not in body
 
 
-@pytest.mark.parametrize("endpoint", ["/api/v1/search/find", "/api/v1/search/search"])
+@pytest.mark.parametrize(
+    "endpoint",
+    [
+        "/api/v1/search/find",
+        "/api/v1/search/find-resource",
+        "/api/v1/search/search",
+    ],
+)
 async def test_search_endpoints_reject_unknown_request_fields(
     client: httpx.AsyncClient,
     endpoint: str,
@@ -108,6 +115,39 @@ async def test_find_with_target_uri_and_tags_passes_target_and_filter(
         "conds": [
             {"op": "must", "field": "search_tags", "conds": ["team=search"]},
             {"op": "must", "field": "search_tags", "conds": ["env=prod"]},
+        ],
+    }
+
+
+async def test_find_resource_forces_resource_type_and_forwards_tags(
+    client: httpx.AsyncClient, service, monkeypatch
+):
+    captured = {}
+
+    async def fake_find_resource(*, target_uri=None, filter=None, **kwargs):
+        captured["target_uri"] = target_uri
+        captured["filter"] = filter
+        return {"resources": [], "total": 0}
+
+    monkeypatch.setattr(service.search, "find_resource", fake_find_resource)
+
+    resp = await client.post(
+        "/api/v1/search/find-resource",
+        json={
+            "query": "bearing assembly",
+            "target_uri": "viking://resources/cad",
+            "tags": ["kind=step"],
+        },
+    )
+
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "ok"
+    assert captured["target_uri"] == "viking://resources/cad"
+    assert captured["filter"] == {
+        "op": "and",
+        "conds": [
+            {"op": "must", "field": "context_type", "conds": ["resource"]},
+            {"op": "must", "field": "search_tags", "conds": ["kind=step"]},
         ],
     }
 

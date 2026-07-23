@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
 
 from openviking.core.path_variables import resolve_path_variables
 from openviking.core.uri_validation import validate_optional_viking_uris
+from openviking.resource.atomic_bundle import find_resource_bundle_root
 from openviking.server.identity import RequestContext
 from openviking.storage.viking_fs import VikingFS
 from openviking.utils.image_search import (
@@ -165,3 +166,68 @@ class SearchService:
             image_url=resolved_image_url,
         )
         return result
+
+    async def find_resource(
+        self,
+        query: str,
+        ctx: RequestContext,
+        target_uri: Union[str, List[str]] = "viking://resources",
+        limit: int = 10,
+        score_threshold: Optional[float] = None,
+        filter: Optional[Dict] = None,
+    ) -> Dict[str, Any]:
+        """Find atomic resource bundles by their highest-scored indexed child.
+
+        The implementation intentionally starts from the existing file-level
+        vector retrieval path. It only changes the final projection: child hits
+        are grouped by their nearest explicit bundle root, and the highest score
+        becomes the score of that root.
+        """
+        if limit < 1:
+            raise InvalidArgumentError("limit must be at least 1")
+        _ensure_non_empty_query(query)
+        resolved_target_uri = validate_optional_viking_uris(
+            target_uri,
+            field_name="target_uri",
+            allowed_scopes="resources",
+        )
+        viking_fs = self._ensure_initialized()
+
+        child_result = await viking_fs.find(
+            query=query,
+            ctx=ctx,
+            target_uri=resolved_target_uri,
+            limit=limit,
+            score_threshold=score_threshold,
+            filter=filter,
+            level=[2],
+        )
+
+        grouped: Dict[str, Dict[str, Any]] = {}
+        root_cache: Dict[str, Optional[str]] = {}
+        for match in child_result.resources:
+            matched_uri = str(match.uri)
+            root_uri = root_cache.get(matched_uri)
+            if matched_uri not in root_cache:
+                root_uri = await find_resource_bundle_root(
+                    viking_fs,
+                    matched_uri,
+                    ctx=ctx,
+                    uri_is_directory=False,
+                )
+                root_cache[matched_uri] = root_uri
+            if not root_uri:
+                continue
+
+            score = float(match.score)
+            current = grouped.get(root_uri)
+            if current is None or score > current["score"]:
+                grouped[root_uri] = {
+                    "uri": root_uri,
+                    "score": score,
+                    "matched_uri": matched_uri,
+                    "match_reason": match.match_reason,
+                }
+
+        resources = sorted(grouped.values(), key=lambda item: (-item["score"], item["uri"]))[:limit]
+        return {"resources": resources, "total": len(resources)}

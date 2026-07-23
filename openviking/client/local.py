@@ -134,6 +134,7 @@ class LocalClient(BaseClient):
         timeout: Optional[float] = None,
         build_index: bool = True,
         summarize: bool = False,
+        bundle: bool = False,
         telemetry: TelemetryRequest = False,
         watch_interval: float = 0,
         args: Optional[Dict[str, Any]] = None,
@@ -173,6 +174,7 @@ class LocalClient(BaseClient):
                 build_index=build_index,
                 summarize=summarize,
                 processing_mode=processing_mode,
+                bundle=bundle,
                 watch_interval=watch_interval,
                 args=args,
                 tags=tags,
@@ -739,6 +741,36 @@ class LocalClient(BaseClient):
                 filter=resolved_filter,
                 level=level,
                 image_url=image_url,
+            ),
+        )
+        return attach_telemetry_payload(
+            execution.result,
+            execution.telemetry,
+        )
+
+    async def find_resource(
+        self,
+        query: str,
+        target_uri: Union[str, List[str]] = "viking://resources",
+        limit: int = 10,
+        score_threshold: Optional[float] = None,
+        tags: Optional[List[str]] = None,
+        telemetry: TelemetryRequest = False,
+    ) -> Dict[str, Any]:
+        """Find atomic resource bundles rather than individual indexed files."""
+        resolved_filter = _resolve_search_filter(
+            None, "resource", None, None, None, tags
+        )
+        execution = await run_with_telemetry(
+            operation="search.find_resource",
+            telemetry=telemetry,
+            fn=lambda: self._service.search.find_resource(
+                query=query,
+                ctx=self._ctx,
+                target_uri=target_uri,
+                limit=limit,
+                score_threshold=score_threshold,
+                filter=resolved_filter,
             ),
         )
         return attach_telemetry_payload(
