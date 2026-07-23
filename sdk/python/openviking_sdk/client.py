@@ -642,6 +642,7 @@ class AsyncHTTPClient:
         exclude: Optional[str] = None,
         directly_upload_media: bool = True,
         preserve_structure: Optional[bool] = None,
+        bundle: bool = False,
         watch_interval: float = 0,
         args: Optional[Dict[str, Any]] = None,
         telemetry: Any = False,
@@ -683,6 +684,9 @@ class AsyncHTTPClient:
             request_data["tag_mode"] = tag_mode
         if preserve_structure is not None:
             request_data["preserve_structure"] = preserve_structure
+        # Keep false omitted for compatibility with pre-bundle servers.
+        if bundle:
+            request_data["bundle"] = True
 
         path_obj = Path(path)
         if not add_type and path_obj.exists():
@@ -1212,6 +1216,29 @@ class AsyncHTTPClient:
         }
         payload = self._compact_request_body(payload)
         response = await self._request("POST", "/api/v1/search/find", json=payload)
+        return self._handle_response_data(response).get("result", {})
+
+    async def find_resource(
+        self,
+        query: str,
+        target_uri: Union[str, List[str]] = "viking://resources",
+        limit: int = 10,
+        score_threshold: Optional[float] = None,
+        tags: Optional[List[str]] = None,
+        telemetry: Any = False,
+    ) -> Dict[str, Any]:
+        """Find atomic resource bundles, scoring each bundle by its best child hit."""
+        payload = self._compact_request_body(
+            {
+                "query": query,
+                "target_uri": self._normalize_target_uri(target_uri),
+                "limit": limit,
+                "score_threshold": score_threshold,
+                "tags": tags,
+                "telemetry": telemetry,
+            }
+        )
+        response = await self._request("POST", "/api/v1/search/find-resource", json=payload)
         return self._handle_response_data(response).get("result", {})
 
     async def search(
@@ -1861,6 +1888,7 @@ class SyncHTTPClient:
         exclude: Optional[str] = None,
         directly_upload_media: bool = True,
         preserve_structure: Optional[bool] = None,
+        bundle: bool = False,
         watch_interval: float = 0,
         args: Optional[Dict[str, Any]] = None,
         telemetry: Any = False,
@@ -1885,6 +1913,7 @@ class SyncHTTPClient:
                 exclude=exclude,
                 directly_upload_media=directly_upload_media,
                 preserve_structure=preserve_structure,
+                bundle=bundle,
                 watch_interval=watch_interval,
                 processing_mode=processing_mode,
                 args=args,
@@ -2233,6 +2262,27 @@ class SyncHTTPClient:
                 tags=tags,
                 telemetry=telemetry,
                 image=image,
+            )
+        )
+
+    def find_resource(
+        self,
+        query: str,
+        target_uri: Union[str, List[str]] = "viking://resources",
+        limit: int = 10,
+        score_threshold: Optional[float] = None,
+        tags: Optional[List[str]] = None,
+        telemetry: Any = False,
+    ) -> Dict[str, Any]:
+        """Find atomic resource bundles, scoring each bundle by its best child hit."""
+        return run_async(
+            self._async_client.find_resource(
+                query=query,
+                target_uri=target_uri,
+                limit=limit,
+                score_threshold=score_threshold,
+                tags=tags,
+                telemetry=telemetry,
             )
         )
 

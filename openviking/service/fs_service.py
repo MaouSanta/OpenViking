@@ -15,6 +15,10 @@ from openviking.privacy import (
     get_skill_name_from_uri,
     restore_skill_content,
 )
+from openviking.resource.atomic_bundle import (
+    RESOURCE_BUNDLE_MANIFEST,
+    find_resource_bundle_root,
+)
 from openviking.resource.watch_storage import is_watch_task_control_uri
 from openviking.server.identity import RequestContext
 from openviking.session.memory.memory_updater import MemoryUpdater
@@ -26,7 +30,11 @@ from openviking.telemetry import get_current_telemetry
 from openviking.telemetry.request_wait_tracker import get_request_wait_tracker
 from openviking.telemetry.resource_summary import build_queue_status_payload
 from openviking.utils.embedding_utils import vectorize_directory_meta
-from openviking_cli.exceptions import DeadlineExceededError, NotInitializedError
+from openviking_cli.exceptions import (
+    DeadlineExceededError,
+    FailedPreconditionError,
+    NotInitializedError,
+)
 from openviking_cli.utils import VikingURI, get_logger
 
 logger = get_logger(__name__)
@@ -601,6 +609,46 @@ class FSService:
         """Set explicit retrieval tags for a file or directory semantic nodes."""
         uri = validate_viking_uri(uri)
         viking_fs = self._ensure_initialized()
+        bundle_root = await find_resource_bundle_root(
+            viking_fs,
+            uri,
+            ctx=ctx,
+            uri_is_directory=True,
+        )
+        if bundle_root:
+            raise FailedPreconditionError(
+                "Atomic resource bundle tags are system-owned and derived from its manifest: "
+                f"{bundle_root}",
+                details={"bundle_root": bundle_root, "uri": uri},
+            )
+        if recursive:
+            # ContentWriteCoordinator will traverse the same tree. Reject before
+            # it updates any index rows, so a parent-level recursive tag update
+            # cannot overwrite the required manifest-projected `kind=<kind>` tag.
+            entries = await viking_fs.tree(
+                uri,
+                ctx=ctx,
+                output="original",
+                show_all_hidden=True,
+                node_limit=None,
+                level_limit=None,
+            )
+            for entry in entries:
+                entry_uri = str(entry.get("uri") or "")
+                if not entry_uri.endswith(f"/{RESOURCE_BUNDLE_MANIFEST}"):
+                    continue
+                nested_bundle_root = await find_resource_bundle_root(
+                    viking_fs,
+                    entry_uri,
+                    ctx=ctx,
+                    uri_is_directory=False,
+                )
+                if nested_bundle_root:
+                    raise FailedPreconditionError(
+                        "Atomic resource bundle tags are system-owned and derived from its "
+                        f"manifest: {nested_bundle_root}",
+                        details={"bundle_root": nested_bundle_root, "uri": uri},
+                    )
         coordinator = ContentWriteCoordinator(viking_fs=viking_fs)
         return await coordinator.set_tags(
             uri=uri,

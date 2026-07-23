@@ -41,12 +41,14 @@ def test_consume_returns_bound_business_params(store):
         ttl_seconds=60,
         to="viking://resources/team/proj",
         reason="quarterly",
+        bundle=True,
         actor_peer_id="bot-a",
         processing_mode="vectors_only",
     )
     consumed = store.consume(token)
     assert consumed.to == "viking://resources/team/proj"
     assert consumed.reason == "quarterly"
+    assert consumed.bundle is True
     assert consumed.actor_peer_id == "bot-a"
     assert consumed.processing_mode == "vectors_only"
 

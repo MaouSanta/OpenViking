@@ -13,13 +13,24 @@ import json
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 from uuid import uuid4
 
 from openviking.core.content_targets import ContentTargetSpec
+from openviking.core.context import Context, ContextLevel, Vectorize
 from openviking.core.uri_validation import validate_optional_content_target_uri
 from openviking.parse.parsers.constants import MPEG_TS_EXTENSION_ALIAS
+from openviking.resource.atomic_bundle import (
+    RESOURCE_BUNDLE_MANIFEST,
+    build_manifest,
+    find_resource_bundle_root,
+    kind_from_source_name,
+    read_source_and_sha256,
+    serialize_manifest,
+    source_basename,
+)
 from openviking.resource.feishu_watch_auth import (
     FEISHU_ACCESS_TOKEN_ARG,
     FEISHU_REFRESH_TOKEN_ARG,
@@ -41,6 +52,7 @@ from openviking.server.user_config import (
     effective_skill_add_target,
 )
 from openviking.storage.queuefs import QueueManager, get_queue_manager
+from openviking.storage.queuefs.embedding_msg_converter import EmbeddingMsgConverter
 from openviking.storage.viking_fs import VikingFS
 from openviking.storage.vikingdb_manager import VikingDBManager
 from openviking.telemetry import get_current_telemetry, register_telemetry, unregister_telemetry
@@ -55,6 +67,7 @@ from openviking.utils.network_guard import ensure_public_remote_target
 from openviking.utils.resource_processor import ResourceProcessor
 from openviking.utils.skill_processor import SkillProcessingPreparation, SkillProcessor
 from openviking_cli.exceptions import (
+    AlreadyExistsError,
     ConflictError,
     DeadlineExceededError,
     InternalError,
@@ -109,6 +122,7 @@ _ADD_RESOURCE_ARGS_RESERVED_FIELDS = frozenset(
         "defer_post_processing",
         "tags",
         "tag_mode",
+        "bundle",
     }
 )
 _ADD_RESOURCE_TAG_MODES = frozenset({"replace", "append"})
@@ -729,6 +743,217 @@ class ResourceService:
         )
         return root_uri, resource_lock
 
+    async def _add_atomic_resource_bundle(
+        self,
+        *,
+        path: str,
+        ctx: RequestContext,
+        target: ContentTargetSpec,
+        wait: bool,
+        timeout: Optional[float],
+        build_index: bool,
+        summarize: bool,
+        watch_interval: float,
+        allow_local_path_resolution: bool,
+        source_name: Optional[str],
+    ) -> Dict[str, Any]:
+        """Persist one immutable source file plus its V1 atomic-bundle manifest."""
+        if summarize:
+            raise InvalidArgumentError("bundle=true does not run a Parser or summarizer")
+        if watch_interval != 0:
+            raise InvalidArgumentError("bundle=true does not support watch_interval")
+        if is_remote_resource_source(path) or not allow_local_path_resolution:
+            raise InvalidArgumentError(
+                "bundle=true requires a local file or a server-resolved temporary upload"
+            )
+
+        source_file = Path(path).expanduser()
+        try:
+            is_file = await asyncio.to_thread(source_file.is_file)
+        except OSError as exc:
+            raise InvalidArgumentError(f"Cannot read bundle source: {path}") from exc
+        if not is_file:
+            raise InvalidArgumentError(f"bundle source must be an existing file: {path}")
+
+        stored_name = source_basename(path, source_name)
+        if stored_name.lower() == RESOURCE_BUNDLE_MANIFEST:
+            raise InvalidArgumentError(
+                f"bundle source file name is reserved: {RESOURCE_BUNDLE_MANIFEST}"
+            )
+        kind = kind_from_source_name(stored_name)
+        source_bytes, source_sha256 = await read_source_and_sha256(source_file)
+        ingested_at = datetime.now(timezone.utc)
+        manifest = build_manifest(
+            kind=kind,
+            source_path=stored_name,
+            sha256=source_sha256,
+            ingested_at=ingested_at,
+        )
+        manifest_text = serialize_manifest(manifest)
+
+        source_info = _ResourceSourceInfo(
+            source_name=stored_name,
+            source_path=str(source_file),
+            source_format=kind,
+        )
+        root_uri, resource_lock = await self._plan_resource_target(
+            path=path,
+            ctx=ctx,
+            target=target,
+            source_name=stored_name,
+            source_info=source_info,
+        )
+
+        created_root = False
+        try:
+            if await self._viking_fs.exists(root_uri, ctx=ctx):
+                raise AlreadyExistsError(root_uri, "resource bundle")
+            parent_bundle = await find_resource_bundle_root(
+                self._viking_fs,
+                root_uri,
+                ctx=ctx,
+                uri_is_directory=True,
+            )
+            if parent_bundle:
+                raise InvalidArgumentError(
+                    "Atomic resource bundles cannot be nested: "
+                    f"{root_uri} is inside {parent_bundle}"
+                )
+
+            await self._viking_fs.mkdir(
+                root_uri,
+                ctx=ctx,
+                lease_ref=resource_lock,
+                _allow_atomic_bundle_write=True,
+            )
+            created_root = True
+            source_uri = f"{root_uri}/{stored_name}"
+            manifest_uri = f"{root_uri}/{RESOURCE_BUNDLE_MANIFEST}"
+            await self._viking_fs.write_file_bytes(
+                source_uri,
+                source_bytes,
+                ctx=ctx,
+                lease_ref=resource_lock,
+                _allow_atomic_bundle_write=True,
+            )
+            # Write the marker last: before this point no directory is observable as
+            # an atomic bundle, and after it every public mutation guard applies.
+            await self._viking_fs.write_file(
+                manifest_uri,
+                manifest_text,
+                ctx=ctx,
+                lease_ref=resource_lock,
+                _allow_atomic_bundle_write=True,
+            )
+        except Exception:
+            if created_root:
+                with contextlib.suppress(Exception):
+                    await self._viking_fs.rm(
+                        root_uri,
+                        recursive=True,
+                        ctx=ctx,
+                        lease_ref=resource_lock,
+                    )
+            raise
+        finally:
+            # The source snapshot is committed before embedding begins. Indexing
+            # failures must not discard a successfully ingested original.
+            await self._release_lock_ref(resource_lock)
+
+        result: Dict[str, Any] = {
+            "status": "success",
+            "root_uri": root_uri,
+            "source_uri": source_uri,
+            "manifest_uri": manifest_uri,
+            "kind": kind,
+            "source_sha256": source_sha256,
+            "ingested_at": manifest["source"]["ingested_at"],
+            "semantic_status": "skipped",
+            "vector_status": "skipped",
+        }
+        if build_index:
+            queue_status, vector_status = await self._index_atomic_resource_bundle(
+                root_uri=root_uri,
+                manifest_uri=manifest_uri,
+                manifest_text=manifest_text,
+                kind=kind,
+                ingested_at=ingested_at,
+                ctx=ctx,
+                wait=wait,
+                timeout=timeout,
+            )
+            result["vector_status"] = vector_status
+            if queue_status is not None:
+                result["queue_status"] = queue_status
+        return result
+
+    async def _index_atomic_resource_bundle(
+        self,
+        *,
+        root_uri: str,
+        manifest_uri: str,
+        manifest_text: str,
+        kind: str,
+        ingested_at: datetime,
+        ctx: RequestContext,
+        wait: bool,
+        timeout: Optional[float],
+    ) -> tuple[Optional[Dict[str, Any]], str]:
+        """Queue the manifest vector without synthesizing semantic sidecars."""
+        queue_manager = get_queue_manager()
+        embedding_queue = queue_manager.get_queue(queue_manager.EMBEDDING)
+        tag = f"kind={kind}"
+        context = Context(
+            uri=manifest_uri,
+            parent_uri=root_uri,
+            is_leaf=True,
+            context_type="resource",
+            level=ContextLevel.DETAIL,
+            created_at=ingested_at,
+            updated_at=ingested_at,
+            user=ctx.user,
+            account_id=ctx.account_id,
+        )
+        context.set_vectorize(Vectorize(text=manifest_text, full_text=manifest_text))
+        message = EmbeddingMsgConverter.from_context(context)
+        if message is None:
+            raise InternalError("Unable to create an index message for resource bundle")
+        message.context_data["search_tags"] = [tag]
+        messages = [message]
+
+        telemetry = get_current_telemetry()
+        telemetry_id = telemetry.telemetry_id if wait else ""
+        request_wait_tracker = get_request_wait_tracker()
+        if telemetry_id:
+            register_telemetry(telemetry)
+            request_wait_tracker.register_request(telemetry_id)
+        try:
+            for message in messages:
+                message.telemetry_id = telemetry_id
+                if telemetry_id:
+                    request_wait_tracker.register_embedding_root(telemetry_id, message.id)
+                await embedding_queue.enqueue(message)
+
+            if not wait:
+                return None, "queued"
+            try:
+                if telemetry_id:
+                    await request_wait_tracker.wait_for_request(telemetry_id, timeout=timeout)
+                    queue_status = request_wait_tracker.build_queue_status(telemetry_id)
+                else:
+                    queue_status = build_queue_status_payload(
+                        await queue_manager.wait_complete(timeout=timeout)
+                    )
+            except TimeoutError as exc:
+                raise DeadlineExceededError("queue processing", timeout) from exc
+            embedding = queue_status.get("Embedding", {})
+            failed = bool(embedding.get("error_count", 0)) if isinstance(embedding, dict) else False
+            return queue_status, "failed" if failed else "complete"
+        finally:
+            if telemetry_id:
+                request_wait_tracker.cleanup(telemetry_id)
+                unregister_telemetry(telemetry_id)
+
     @staticmethod
     def _target_doc_name(
         path: str,
@@ -791,6 +1016,7 @@ class ResourceService:
         build_index: bool = True,
         summarize: bool = False,
         processing_mode: ProcessingMode = DEFAULT_PROCESSING_MODE,
+        bundle: bool = False,
         watch_interval: float = 0,
         tags: Optional[List[str]] = None,
         tag_mode: str = "replace",
@@ -822,6 +1048,7 @@ class ResourceService:
             build_index=build_index,
             summarize=summarize,
             processing_mode=processing_mode,
+            bundle=bundle,
             watch_interval=watch_interval,
             manage_watch=True,
             tags=tags,
@@ -884,6 +1111,7 @@ class ResourceService:
         build_index: bool = True,
         summarize: bool = False,
         processing_mode: ProcessingMode = DEFAULT_PROCESSING_MODE,
+        bundle: bool = False,
         watch_interval: float = 0,
         manage_watch: bool = True,
         tags: Optional[List[str]] = None,
@@ -913,6 +1141,7 @@ class ResourceService:
             build_index: Whether to build vector index immediately (default: True)
             summarize: Whether to generate summary (default: False)
             processing_mode: Post-ingest processing mode for semantic/vector work
+            bundle: Store one source file as an immutable atomic resource bundle.
             watch_interval: Watch interval in minutes for automatic resource monitoring.
                 - watch_interval > 0: Creates or updates a watch task. The resource will be
                   automatically re-processed at the specified interval by the scheduler.
@@ -964,6 +1193,27 @@ class ResourceService:
             if default_parent:
                 parent = default_parent
                 kwargs["create_parent"] = True
+
+        if bundle:
+            target = ContentTargetSpec.from_fields(
+                ctx=ctx,
+                kind="resource",
+                to=to,
+                parent=parent,
+                create_parent=bool(kwargs.get("create_parent", False)),
+            )
+            return await self._add_atomic_resource_bundle(
+                path=path,
+                ctx=ctx,
+                target=target,
+                wait=wait,
+                timeout=timeout,
+                build_index=build_index,
+                summarize=summarize,
+                watch_interval=watch_interval,
+                allow_local_path_resolution=allow_local_path_resolution,
+                source_name=kwargs.get("source_name"),
+            )
 
         if self._connector.should_delegate(
             path,
