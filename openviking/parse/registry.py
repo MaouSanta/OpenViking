@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Union
 from openviking.parse.base import ParseResult
 from openviking.parse.parsers.base_parser import BaseParser
 from openviking.parse.parsers.directory import DirectoryParser
+from openviking.parse.parsers.dwg import DWGParser
 from openviking.parse.parsers.epub import EPubParser
 from openviking.parse.parsers.excel import ExcelParser
 
@@ -74,6 +75,7 @@ class ParserRegistry:
         self.register("epub", EPubParser(config=self._parser_configs.get("epub")))
         self.register("zip", ZipParser())
         self.register("directory", DirectoryParser())
+        self.register("dwg", DWGParser())
 
         self.register("image", ImageParser(config=self._parser_configs.get("image")))
         self.register("audio", AudioParser())

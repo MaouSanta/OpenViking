@@ -21,10 +21,11 @@ from uuid import uuid4
 import httpx
 
 from openviking.connector.client import ConnectorClient
-from openviking.core.context import Context, ContextLevel, Vectorize
 from openviking.core.content_targets import ContentTargetSpec
+from openviking.core.context import Context, ContextLevel, Vectorize
 from openviking.core.uri_validation import validate_optional_content_target_uri
 from openviking.resource.atomic_bundle import (
+    RESOURCE_BUNDLE_DISCOVERY_TAG,
     RESOURCE_BUNDLE_MANIFEST,
     build_manifest,
     find_resource_bundle_root,
@@ -781,7 +782,7 @@ class ResourceService:
         wait: bool,
         timeout: Optional[float],
     ) -> tuple[Optional[Dict[str, Any]], str]:
-        """Queue the manifest vector without synthesizing semantic sidecars."""
+        """Queue the one V1 discovery card without synthesizing semantic sidecars."""
         queue_manager = get_queue_manager()
         embedding_queue = queue_manager.get_queue(queue_manager.EMBEDDING)
         tag = f"kind={kind}"
@@ -800,7 +801,7 @@ class ResourceService:
         message = EmbeddingMsgConverter.from_context(context)
         if message is None:
             raise InternalError("Unable to create an index message for resource bundle")
-        message.context_data["search_tags"] = [tag]
+        message.context_data["search_tags"] = [RESOURCE_BUNDLE_DISCOVERY_TAG, tag]
         messages = [message]
 
         telemetry_id = register_wait_telemetry(wait) if wait else ""

@@ -595,6 +595,61 @@ class VikingFS:
                 details={"uri": uri},
             )
 
+    async def _ensure_temp_copy_cannot_create_atomic_bundle(
+        self,
+        old_uri: str,
+        new_uri: str,
+        *,
+        is_dir: bool,
+        ctx: Optional[RequestContext],
+    ) -> None:
+        """Preflight a raw temp copy by reading only candidate resource manifests."""
+        try:
+            if VikingURI(old_uri).scope != "temp":
+                return
+            if VikingURI(new_uri).scope != "resources":
+                return
+        except ValueError:
+            return
+
+        if not is_dir:
+            if not new_uri.rstrip("/").endswith("/manifest.json"):
+                return
+            content = await self.read_file_bytes(old_uri, ctx=ctx)
+            self._ensure_atomic_bundle_manifest_creation_allowed(
+                new_uri,
+                content,
+                allow_atomic_bundle_write=False,
+            )
+            return
+
+        entries = await self.ls(
+            old_uri,
+            show_all_hidden=True,
+            node_limit=LS_ALL_NODES,
+            ctx=ctx,
+        )
+        for entry in entries:
+            name = entry.get("name", "")
+            if not name or name in (".", ".."):
+                continue
+            old_child_uri = f"{old_uri.rstrip('/')}/{name}"
+            new_child_uri = f"{new_uri.rstrip('/')}/{name}"
+            if entry.get("isDir"):
+                await self._ensure_temp_copy_cannot_create_atomic_bundle(
+                    old_child_uri,
+                    new_child_uri,
+                    is_dir=True,
+                    ctx=ctx,
+                )
+            elif name == "manifest.json":
+                await self._ensure_temp_copy_cannot_create_atomic_bundle(
+                    old_child_uri,
+                    new_child_uri,
+                    is_dir=False,
+                    ctx=ctx,
+                )
+
     async def _ensure_atomic_bundle_delete_allowed(
         self,
         uri: str,
@@ -625,7 +680,7 @@ class VikingFS:
         *,
         ctx: Optional[RequestContext],
         source_is_directory: bool,
-    ) -> None:
+    ) -> bool:
         """Keep moves at bundle boundaries and prevent writes into an existing bundle."""
         from openviking.resource.atomic_bundle import find_resource_bundle_root
 
@@ -655,6 +710,7 @@ class VikingFS:
                 f"{destination_root}",
                 details={"bundle_root": destination_root, "uri": new_uri},
             )
+        return source_root is not None
 
     # ========== AGFS Basic Commands ==========
 
@@ -922,7 +978,7 @@ class VikingFS:
                         details={"from_uri": old_uri, "to_uri": new_uri},
                     )
 
-        await self._ensure_atomic_bundle_move_allowed(
+        allow_atomic_bundle_write = await self._ensure_atomic_bundle_move_allowed(
             old_uri,
             new_uri,
             ctx=ctx,
@@ -932,6 +988,7 @@ class VikingFS:
         real_ctx = self._ctx_or_default(ctx)
         old_uri = canonicalize_uri(old_uri, real_ctx)
         new_uri = canonicalize_uri(new_uri, real_ctx)
+        is_temp = VikingURI(old_uri).scope == "temp"
 
         lock_context = (
             LockContext(
@@ -955,9 +1012,6 @@ class VikingFS:
             uris_to_move = await self._collect_uris(old_path, recursive=True, ctx=ctx)
             uris_to_move.append(target_uri)
 
-            # Check if it's temp directory (files already encrypted)
-            is_temp = old_uri.startswith("viking://temp/")
-
             # Copy source to destination. Source must stay intact until vector updates succeed.
             try:
                 await self._copy_for_mv(
@@ -969,7 +1023,7 @@ class VikingFS:
                     is_temp=is_temp,
                     ctx=ctx,
                     lock_handle=active_lock_handle,
-                    allow_atomic_bundle_write=True,
+                    allow_atomic_bundle_write=allow_atomic_bundle_write,
                 )
             except Exception as e:
                 if "not found" in str(e).lower():
@@ -1040,6 +1094,12 @@ class VikingFS:
     ) -> None:
         """Copy source to destination for mv without deleting source."""
         if is_temp:
+            await self._ensure_temp_copy_cannot_create_atomic_bundle(
+                old_uri,
+                new_uri,
+                is_dir=is_dir,
+                ctx=ctx,
+            )
             await self._async_agfs.cp(
                 old_path,
                 new_path,
@@ -3738,13 +3798,19 @@ class VikingFS:
         target_uri: str,
         ctx: Optional[RequestContext] = None,
     ) -> None:
-        """Persist an already-encrypted temp tree without rewriting file bytes."""
+        """Persist an already-encrypted temp tree after the manifest preflight."""
         self._ensure_access(temp_uri, ctx)
         self._ensure_mutable_access(target_uri, ctx)
         await self._ensure_atomic_bundle_write_allowed(
             target_uri,
             ctx=ctx,
             uri_is_directory=True,
+        )
+        await self._ensure_temp_copy_cannot_create_atomic_bundle(
+            temp_uri,
+            target_uri,
+            is_dir=True,
+            ctx=ctx,
         )
         src_path = self._uri_to_path(temp_uri, ctx=ctx)
         dst_path = self._uri_to_path(target_uri, ctx=ctx)

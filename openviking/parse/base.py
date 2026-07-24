@@ -300,6 +300,9 @@ class ParseResult:
 
     meta: Dict[str, Any] = field(default_factory=dict)
     warnings: List[str] = field(default_factory=list)
+    # Some format parsers produce authoritative L0/L1 navigation during parse.
+    # The semantic queue should index those sidecars, not generate them again.
+    precomputed_semantics: bool = False
 
     @property
     def success(self) -> bool:
@@ -345,6 +348,7 @@ def create_parse_result(
     parse_time: Optional[float] = None,
     meta: Optional[Dict[str, Any]] = None,
     warnings: Optional[List[str]] = None,
+    precomputed_semantics: bool = False,
 ) -> ParseResult:
     """
     Helper function to create ParseResult with all new fields populated.
@@ -372,4 +376,5 @@ def create_parse_result(
         parse_timestamp=datetime.now() if parse_time is not None else None,
         meta=meta or {},
         warnings=warnings or [],
+        precomputed_semantics=precomputed_semantics,
     )

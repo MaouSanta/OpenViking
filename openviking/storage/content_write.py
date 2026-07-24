@@ -8,6 +8,7 @@ import os
 from typing import TYPE_CHECKING, Any, Dict, Optional
 
 from openviking.core.namespace import NamespaceShapeError, canonicalize_uri, context_type_for_uri
+from openviking.resource.atomic_bundle import RESOURCE_BUNDLE_DISCOVERY_TAG_KEY
 from openviking.resource.watch_storage import is_watch_task_control_uri
 from openviking.server.identity import RequestContext
 from openviking.session.memory.memory_updater import MemoryUpdater
@@ -130,6 +131,13 @@ class ContentWriteCoordinator:
 
         self._validate_tag_mode(mode)
         normalized_tags = normalize_search_tags(tags)
+        if any(
+            tag.split("=", 1)[0] == RESOURCE_BUNDLE_DISCOVERY_TAG_KEY
+            for tag in normalized_tags
+        ):
+            raise InvalidArgumentError(
+                f"{RESOURCE_BUNDLE_DISCOVERY_TAG_KEY} search tag is system-owned"
+            )
         stat = await self._safe_stat(normalized_uri, ctx=ctx)
         if stat.get("isDir"):
             return await self._set_directory_tags(

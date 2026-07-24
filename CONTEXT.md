@@ -40,6 +40,14 @@ _Avoid_: file search, bundle interrogation
 A query scoped to one known atomic resource bundle that returns specific metadata or content evidence without requiring the original asset to be downloaded. In the first version, an agent uses the existing `grep` directly on the bundle root.
 _Avoid_: resource discovery, model download
 
+**Parsed Resource**:
+An ordinary resource processed by its extension parser, which may persist derived artifacts and semantic navigation. It is distinct from an Atomic Resource Bundle, whose ingestion intentionally preserves only an immutable source snapshot.
+_Avoid_: atomic resource bundle, raw-only resource
+
+**Drawing Navigation**:
+A non-authoritative L0/L1 pointer layer for a parsed drawing that identifies relevant source locations; values and geometry remain in the complete source JSON.
+_Avoid_: extracted facts, second source of truth
+
 **Searchable Artifact**:
 An artifact that can be reliably text-interpreted, including JSON or STEP; a binary artifact needs a deterministic text projection before it is searchable. V1 uses ordinary `grep` over the bundle root.
 _Avoid_: text sidecar

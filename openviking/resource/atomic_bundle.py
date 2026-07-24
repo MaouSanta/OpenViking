@@ -22,6 +22,8 @@ if TYPE_CHECKING:
 
 RESOURCE_BUNDLE_SCHEMA = "openviking.resource-bundle/v1"
 RESOURCE_BUNDLE_MANIFEST = "manifest.json"
+RESOURCE_BUNDLE_DISCOVERY_TAG_KEY = "resource_bundle"
+RESOURCE_BUNDLE_DISCOVERY_TAG = f"{RESOURCE_BUNDLE_DISCOVERY_TAG_KEY}=true"
 _SHA256_HEX_RE = re.compile(r"^[0-9a-f]{64}$")
 
 # A kind is the normalized source format, not a broad 3D category.
