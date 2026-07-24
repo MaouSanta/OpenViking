@@ -129,6 +129,7 @@ async def test_resource_processor_first_add_summarizes_from_committed_uri(monkey
             source_format="text",
             meta={},
             warnings=[],
+            precomputed_semantics=False,
         )
     )
     rp.tree_builder.finalize_from_temp = AsyncMock(
@@ -178,6 +179,7 @@ async def test_resource_processor_second_add_preserves_temp_uri_for_incremental(
             source_format="text",
             meta={},
             warnings=[],
+            precomputed_semantics=False,
         )
     )
 
@@ -225,6 +227,7 @@ async def test_resource_processor_auto_candidate_skips_existing_and_busy(monkeyp
             source_format="text",
             meta={},
             warnings=[],
+            precomputed_semantics=False,
         )
     )
 

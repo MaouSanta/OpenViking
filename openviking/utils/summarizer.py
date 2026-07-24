@@ -129,6 +129,8 @@ class Summarizer:
                     is_code_repo=kwargs.get("is_code_repo", False),
                     target_preexisting=resolve_target_preexisting(idx, target_uri),
                     ingest_options=ingest_options,
+                    precomputed_semantics=bool(kwargs.get("precomputed_semantics", False)),
+                    bundle_assembly=bool(kwargs.get("bundle_assembly", False)),
                 )
                 if msg.telemetry_id:
                     get_request_wait_tracker().register_semantic_root(msg.telemetry_id, msg.id)
