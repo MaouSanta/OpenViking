@@ -13,6 +13,7 @@ from openviking.parse.base import ParseResult
 from openviking.parse.parsers.base_parser import BaseParser
 from openviking.parse.parsers.constants import TYPESCRIPT_MPEG_TS_EXTENSION
 from openviking.parse.parsers.directory import DirectoryParser
+from openviking.parse.parsers.dwg import DWGParser
 from openviking.parse.parsers.epub import EPubParser
 from openviking.parse.parsers.excel import ExcelParser
 
@@ -69,6 +70,7 @@ class ParserRegistry:
         self._register("epub", EPubParser(config=self._parser_configs.get("epub")))
         self._register("zip", ZipParser())
         self._register("directory", DirectoryParser())
+        self._register("dwg", DWGParser())
 
         self._register("image", ImageParser(config=self._parser_configs.get("image")))
         self._register("audio", AudioParser())

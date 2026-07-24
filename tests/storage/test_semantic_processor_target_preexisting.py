@@ -129,6 +129,33 @@ async def test_target_source_syncs_before_semantic_dag(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_precomputed_semantics_syncs_sidecars_without_running_the_semantic_dag(monkeypatch):
+    monkeypatch.setattr(
+        "openviking.storage.queuefs.semantic_processor.get_viking_fs",
+        lambda: _FakeVikingFS(),
+    )
+    monkeypatch.setattr(
+        "openviking.storage.queuefs.semantic_processor.SemanticLockScope.resolve",
+        AsyncMock(return_value=SimpleNamespace(lock=None, close=AsyncMock())),
+    )
+    processor = SemanticProcessor()
+    processor._sync_topdown_recursive = AsyncMock(return_value=DiffResult())
+    processor._process_precomputed_semantics = AsyncMock()
+
+    await processor.on_dequeue(
+        SemanticMsg(
+            uri="viking://temp/import_root/drawing",
+            target_uri="viking://resources/drawing",
+            context_type="resource",
+            precomputed_semantics=True,
+        ).to_dict()
+    )
+
+    assert processor._sync_topdown_recursive.await_args.kwargs["include_hidden"] is True
+    processor._process_precomputed_semantics.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 async def test_sync_diff_reports_target_uris_and_preserves_sidecars(monkeypatch):
     fake_fs = _SyncVikingFS()
     lease = {

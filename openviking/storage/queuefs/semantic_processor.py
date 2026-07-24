@@ -406,6 +406,7 @@ class SemanticProcessor(DequeueHandlerBase):
                                         msg.target_uri,
                                         ctx=current_ctx,
                                         lock=semantic_lock.lock,
+                                        include_hidden=msg.precomputed_semantics,
                                     )
                                     logger.info(
                                         "[SyncDiff] Diff computed: "
@@ -431,32 +432,39 @@ class SemanticProcessor(DequeueHandlerBase):
                                     f"Using direct incremental semantic update for: {msg.uri}"
                                 )
 
-                            executor = SemanticDagExecutor(
-                                processor=self,
-                                context_type=msg.context_type,
-                                max_concurrent_llm=self.max_concurrent_llm,
-                                ctx=current_ctx,
-                                incremental_update=is_incremental,
-                                target_uri=target_uri,
-                                semantic_msg_id=msg.id,
-                                telemetry_id=msg.telemetry_id,
-                                recursive=msg.recursive,
-                                lock=semantic_lock.lock,
-                                is_code_repo=msg.is_code_repo,
-                                changes=changes,
-                                skip_vectorization=msg.skip_vectorization,
-                                ingest_options=msg.ingest_options,
-                                coalesce_key=msg.coalesce_key,
-                                coalesce_version=msg.coalesce_version,
-                            )
-                            await executor.run(run_uri)
-                            self._cache_dag_stats(
-                                msg.telemetry_id,
-                                run_uri,
-                                executor.get_stats(),
-                            )
-                            if not executor.stale:
-                                await self._enqueue_parent_refresh(msg, target_uri or msg.uri)
+                            if msg.precomputed_semantics:
+                                await self._process_precomputed_semantics(
+                                    msg,
+                                    dir_uri=run_uri,
+                                    ctx=current_ctx,
+                                )
+                            else:
+                                executor = SemanticDagExecutor(
+                                    processor=self,
+                                    context_type=msg.context_type,
+                                    max_concurrent_llm=self.max_concurrent_llm,
+                                    ctx=current_ctx,
+                                    incremental_update=is_incremental,
+                                    target_uri=target_uri,
+                                    semantic_msg_id=msg.id,
+                                    telemetry_id=msg.telemetry_id,
+                                    recursive=msg.recursive,
+                                    lock=semantic_lock.lock,
+                                    is_code_repo=msg.is_code_repo,
+                                    changes=changes,
+                                    skip_vectorization=msg.skip_vectorization,
+                                    ingest_options=msg.ingest_options,
+                                    coalesce_key=msg.coalesce_key,
+                                    coalesce_version=msg.coalesce_version,
+                                )
+                                await executor.run(run_uri)
+                                self._cache_dag_stats(
+                                    msg.telemetry_id,
+                                    run_uri,
+                                    executor.get_stats(),
+                                )
+                                if not executor.stale:
+                                    await self._enqueue_parent_refresh(msg, target_uri or msg.uri)
                     finally:
                         await semantic_lock.close()
                     self._merge_request_stats(msg.telemetry_id, processed=1)
@@ -545,6 +553,50 @@ class SemanticProcessor(DequeueHandlerBase):
 
     def get_dag_stats(self) -> Optional["DagStats"]:
         return SemanticDagExecutor.get_active_stats()
+
+    async def _process_precomputed_semantics(
+        self,
+        msg: SemanticMsg,
+        *,
+        dir_uri: str,
+        ctx: RequestContext,
+    ) -> None:
+        """Index parser-produced L0/L1 sidecars without another VLM request."""
+        viking_fs = get_viking_fs()
+        try:
+            abstract = await viking_fs.read_file(f"{dir_uri}/.abstract.md", ctx=ctx)
+            overview = await viking_fs.read_file(f"{dir_uri}/.overview.md", ctx=ctx)
+        except Exception as exc:
+            raise RuntimeError(
+                f"Precomputed semantic sidecars are missing for {dir_uri}: {exc}"
+            ) from exc
+
+        async def on_complete() -> None:
+            if msg.telemetry_id and msg.id:
+                get_request_wait_tracker().mark_semantic_done(msg.telemetry_id, msg.id)
+
+        if msg.skip_vectorization:
+            await on_complete()
+            return
+
+        from openviking.storage.queuefs.embedding_tracker import EmbeddingTaskTracker
+
+        tracker = EmbeddingTaskTracker.get_instance()
+        await tracker.register(
+            semantic_msg_id=msg.id,
+            total_count=2,
+            on_complete=on_complete,
+            metadata={"uri": dir_uri},
+        )
+        await self._vectorize_directory(
+            uri=dir_uri,
+            context_type=msg.context_type,
+            abstract=abstract,
+            overview=overview,
+            ctx=ctx,
+            semantic_msg_id=msg.id,
+            ingest_options=msg.ingest_options,
+        )
 
     async def _process_memory_directory(
         self,
@@ -775,6 +827,7 @@ class SemanticProcessor(DequeueHandlerBase):
         ctx: Optional[RequestContext] = None,
         file_change_status: Optional[Dict[str, bool]] = None,
         lock: Optional[Dict[str, Any]] = None,
+        include_hidden: bool = False,
     ) -> DiffResult:
         viking_fs = get_viking_fs()
         if not await viking_fs.exists(root_uri, ctx=ctx):
@@ -794,7 +847,7 @@ class SemanticProcessor(DequeueHandlerBase):
                 name = entry.get("name", "")
                 if not name or name in [".", ".."]:
                     continue
-                if name.startswith("."):
+                if name.startswith(".") and not include_hidden:
                     continue
                 item_uri = VikingURI(dir_uri).join(name).uri
                 if entry.get("isDir", False):

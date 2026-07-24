@@ -417,6 +417,7 @@ class ResourceProcessor:
                 "source_committed": source_committed,
                 "target_preexisting": target_preexisting,
                 "is_code_repo": parse_result.source_format == "repository",
+                "precomputed_semantics": parse_result.precomputed_semantics,
             }
             if defer_post_processing:
                 result["_post_process"] = prepared
@@ -457,11 +458,14 @@ class ResourceProcessor:
         temp_dir_path = prepared.get("temp_dir_path")
         source_committed = bool(prepared.get("source_committed"))
         target_preexisting = bool(prepared.get("target_preexisting"))
+        precomputed_semantics = bool(prepared.get("precomputed_semantics"))
         build_index = bool(kwargs.get("build_index", True))
         processing_mode = normalize_processing_mode(processing_mode)
         vectors_only = processing_mode == VECTORS_ONLY
         ingest_options = IngestOptions.from_value(kwargs.pop("ingest_options", None))
-        should_summarize = not vectors_only and (summarize or build_index)
+        should_summarize = not vectors_only and (
+            build_index or (summarize and not precomputed_semantics)
+        )
         result: Dict[str, Any] = {"status": "success", "root_uri": root_uri}
 
         if should_summarize:
@@ -478,6 +482,7 @@ class ResourceProcessor:
                         is_code_repo=bool(prepared.get("is_code_repo")),
                         target_preexisting=target_preexisting,
                         ingest_options=ingest_options,
+                        precomputed_semantics=precomputed_semantics,
                         **kwargs,
                     )
                     if (
