@@ -5,32 +5,28 @@ This context defines the terms used when a resource directory represents one com
 ## Language
 
 **Atomic Resource Bundle**:
-An explicitly marked, opt-in resource directory that represents one source asset together with its associated artifacts. It is a generic resource primitive, with 3D assets as its first consumer, and its identity does not change when it contains files or subdirectories.
+A marked resource directory that represents one source asset together with its associated artifacts as the minimum `find_resource` result. Ingestion assembles it before publication; after publication, it is replaced or removed only as a complete unit.
 _Avoid_: atomic folder, leaf node, leaf folder
 
 **Bundle Manifest**:
-The required immutable root-level `manifest.json` of an atomic resource bundle. It marks the bundle, acts as the source asset card, and carries a Manifest Schema, exactly one Resource Kind, and the original asset's path, hash, and ingestion time.
-_Avoid_: optional metadata file, directory-name convention
+The required root-level `manifest.json` that marks an atomic resource bundle and inventories the sealed package. It carries a Manifest Schema, exactly one Resource Kind, source identity, and each derived artifact's role, path, schema, and hash.
+_Avoid_: optional metadata file, source-only card, directory-name convention
 
 **Bundle Boundary**:
 The complete subtree rooted at an atomic resource bundle. It may contain ordinary directories but cannot contain another Bundle Manifest.
 _Avoid_: nested bundle, package hierarchy
 
 **Bundle Ingestion**:
-The opt-in creation of an immutable atomic resource bundle through `add-resource(bundle=true)`. The target URI names the bundle root; ingestion derives the Resource Kind from the original artifact's suffix, rejecting an extensionless source, then creates its Bundle Manifest and original artifact without running a parser.
-_Avoid_: separate bundle upload API, implicit bundle creation
+The explicit creation of an atomic resource bundle through `add-resource(bundle=true)`. The target URI names the bundle root; ingestion preserves the original artifact and may run its format parser to add derived artifacts before publishing the bundle.
+_Avoid_: raw-only upload, parser-free bundle
 
 **Bundle Snapshot**:
-The immutable source manifest and artifact inventory created by Bundle Ingestion. Replacing content creates a new bundle; move and removal operate on the complete Bundle Boundary.
+The source manifest and artifact inventory sealed by Bundle Ingestion. Replacing content creates a new bundle; move and removal operate on the complete Bundle Boundary.
 _Avoid_: mutable resource package, partial bundle update
 
 **Index Tag**:
 A normalized `key=value` exact-match value projected from an atomic resource bundle's Bundle Manifest into the retrieval index. The required `kind=<value>` is one such tag; tags are not the bundle's authoritative metadata.
 _Avoid_: metadata source, asset truth
-
-**Asset Card**:
-The structured, machine-verifiable source inventory in a Bundle Manifest.
-_Avoid_: L1 overview, generated summary
 
 **Resource Discovery**:
 Semantic selection across atomic resource bundles that returns bundle roots, scored by the strongest relevant artifact within each bundle.
@@ -41,19 +37,23 @@ A query scoped to one known atomic resource bundle that returns specific metadat
 _Avoid_: resource discovery, model download
 
 **Parsed Resource**:
-An ordinary resource processed by its extension parser, which may persist derived artifacts and semantic navigation. It is distinct from an Atomic Resource Bundle, whose ingestion intentionally preserves only an immutable source snapshot.
-_Avoid_: atomic resource bundle, raw-only resource
+A resource processed by its extension parser, which may persist derived artifacts and semantic navigation. It may also be an Atomic Resource Bundle when those artifacts must be discovered and managed as one resource unit.
+_Avoid_: raw-only resource
 
-**Drawing Navigation**:
-A non-authoritative L0/L1 pointer layer for a parsed drawing that identifies relevant source locations; values and geometry remain in the complete source JSON.
-_Avoid_: extracted facts, second source of truth
+**Beam Topology Index**:
+A deterministic derived DWG artifact that binds beam labels to available geometric and dimensional evidence while preserving confidence states and source-object references. It covers beam topology only, not the complete drawing.
+_Avoid_: DWG topology, complete drawing model, source of truth
+
+**Drawing Text Index**:
+A deterministic derived DWG artifact containing source-grounded drawing text, source-object references, and spatial chunks suitable for retrieval. It excludes OCR and semantic completion.
+_Avoid_: drawing summary, VLM navigation, OCR transcript
 
 **Searchable Artifact**:
 An artifact that can be reliably text-interpreted, including JSON or STEP; a binary artifact needs a deterministic text projection before it is searchable. V1 uses ordinary `grep` over the bundle root.
 _Avoid_: text sidecar
 
 **Manifest Schema**:
-The versioned identifier for a manifest's machine-readable layout. The initial Bundle Manifest uses `openviking.resource-bundle/v1`.
+The versioned identifier for a manifest's machine-readable layout. New Bundle Manifests use `openviking.resource-bundle/v2`; readers retain compatibility with `v1`.
 _Avoid_: implicit JSON shape, parser version
 
 **Resource Kind**:

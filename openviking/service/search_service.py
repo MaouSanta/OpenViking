@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
 
 from openviking.core.path_variables import resolve_path_variables
 from openviking.core.uri_validation import validate_optional_viking_uris
-from openviking.resource.atomic_bundle import RESOURCE_BUNDLE_DISCOVERY_TAG
+from openviking.resource.atomic_bundle import find_resource_bundle_root
 from openviking.server.identity import RequestContext
 from openviking.storage.viking_fs import VikingFS
 from openviking.utils.image_search import (
@@ -19,7 +19,6 @@ from openviking.utils.image_search import (
     is_http_url,
     is_viking_uri,
 )
-from openviking.utils.tags import build_search_tags_filter
 from openviking_cli.exceptions import InvalidArgumentError, NotInitializedError
 from openviking_cli.utils import get_logger
 
@@ -177,7 +176,7 @@ class SearchService:
         score_threshold: Optional[float] = None,
         filter: Optional[Dict] = None,
     ) -> Dict[str, Any]:
-        """Find bundles through their one trusted V1 discovery card."""
+        """Find bundles by their strongest matching indexed artifact."""
         if limit < 1:
             raise InvalidArgumentError("limit must be at least 1")
         _ensure_non_empty_query(query)
@@ -188,31 +187,51 @@ class SearchService:
         )
         viking_fs = self._ensure_initialized()
 
-        discovery_filter = build_search_tags_filter([RESOURCE_BUNDLE_DISCOVERY_TAG])
-        effective_filter = (
-            {"op": "and", "conds": [filter, discovery_filter]}
-            if filter
-            else discovery_filter
-        )
-        discovery_result = await viking_fs.find(
-            query=query,
-            ctx=ctx,
-            target_uri=resolved_target_uri,
-            limit=limit,
-            score_threshold=score_threshold,
-            filter=effective_filter,
-            level=[2],
-        )
-
-        resources = []
-        for match in discovery_result.resources:
-            matched_uri = str(match.uri)
-            resources.append(
-                {
-                    "uri": matched_uri.rsplit("/", 1)[0],
-                    "score": float(match.score),
-                    "matched_uri": matched_uri,
-                    "match_reason": match.match_reason,
-                }
+        grouped: Dict[str, Dict[str, Any]] = {}
+        root_cache: Dict[tuple[str, bool], Optional[str]] = {}
+        candidate_limit = limit
+        # ponytail: 100k child ceiling; move grouping into the vector backend if this is hit.
+        max_candidates = 100_000
+        while True:
+            child_result = await viking_fs.find(
+                query=query,
+                ctx=ctx,
+                target_uri=resolved_target_uri,
+                limit=candidate_limit,
+                score_threshold=score_threshold,
+                filter=filter,
+                level=[0, 1, 2],
             )
+            for match in child_result.resources:
+                matched_uri = str(match.uri)
+                uri_is_directory = int(match.level) != 2
+                cache_key = matched_uri, uri_is_directory
+                if cache_key not in root_cache:
+                    root_cache[cache_key] = await find_resource_bundle_root(
+                        viking_fs,
+                        matched_uri,
+                        ctx=ctx,
+                        uri_is_directory=uri_is_directory,
+                    )
+                root_uri = root_cache[cache_key]
+                if not root_uri:
+                    continue
+                score = float(match.score)
+                current = grouped.get(root_uri)
+                if current is None or score > current["score"]:
+                    grouped[root_uri] = {
+                        "uri": root_uri,
+                        "score": score,
+                        "matched_uri": matched_uri,
+                        "match_reason": match.match_reason,
+                    }
+            if (
+                len(grouped) >= limit
+                or len(child_result.resources) < candidate_limit
+                or candidate_limit >= max_candidates
+            ):
+                break
+            candidate_limit = min(max_candidates, candidate_limit * 2)
+
+        resources = sorted(grouped.values(), key=lambda item: (-item["score"], item["uri"]))[:limit]
         return {"resources": resources, "total": len(resources)}

@@ -56,6 +56,7 @@ _PORTABLE_SCALAR_FIELDS = frozenset(
         "name",
         "description",
         "tags",
+        "search_tags",
         "abstract",
     }
 )
@@ -616,6 +617,7 @@ async def index_resource(
     uri: str,
     ctx: RequestContext,
     ingest_options: IngestOptions | None = None,
+    scalar_override: Optional[Dict[str, Any]] = None,
 ) -> None:
     """
     Build vector index for a resource directory.
@@ -657,6 +659,10 @@ async def index_resource(
             context_type=context_type,
             ctx=ctx,
             ingest_options=ingest_options,
+            scalar_overrides={
+                int(ContextLevel.ABSTRACT.value): scalar_override or {},
+                int(ContextLevel.OVERVIEW.value): scalar_override or {},
+            },
         )
 
     # 2. Index Files
@@ -684,6 +690,7 @@ async def index_resource(
                 context_type=context_type,
                 ctx=ctx,
                 ingest_options=ingest_options,
+                scalar_override=scalar_override,
             )
 
     except Exception as e:

@@ -3891,6 +3891,7 @@ class VikingFS:
         target_uri: str,
         ctx: Optional[RequestContext] = None,
         lease_ref: Dict[str, Any] | None = None,
+        _allow_atomic_bundle_write: bool = False,
     ) -> None:
         """Persist an already-encrypted temp tree after the manifest preflight."""
         self._ensure_access(temp_uri, ctx)
@@ -3899,23 +3900,24 @@ class VikingFS:
             target_uri,
             ctx=ctx,
             uri_is_directory=True,
+            allow_atomic_bundle_write=_allow_atomic_bundle_write,
         )
-        await self._ensure_temp_copy_cannot_create_atomic_bundle(
-            temp_uri,
-            target_uri,
-            is_dir=True,
-            ctx=ctx,
-        )
+        if not _allow_atomic_bundle_write:
+            await self._ensure_temp_copy_cannot_create_atomic_bundle(
+                temp_uri,
+                target_uri,
+                is_dir=True,
+                ctx=ctx,
+            )
         src_path = self._uri_to_path(temp_uri, ctx=ctx)
         dst_path = self._uri_to_path(target_uri, ctx=ctx)
         fs_ctx = self._pathlock_fs_ctx(ctx, lease_ref)
         await self._ensure_parent_dirs(dst_path, ctx=ctx, lease_ref=lease_ref)
-        await self._async_agfs.cp(
-            src_path,
-            dst_path,
-            recursive=True,
-            fs_ctx=fs_ctx or {"account_id": self._ctx_or_default(ctx).account_id},
-        )
+        fs_ctx = fs_ctx or {"account_id": self._ctx_or_default(ctx).account_id}
+        if _allow_atomic_bundle_write:
+            await self._async_agfs.mv(src_path, dst_path, fs_ctx=fs_ctx)
+        else:
+            await self._async_agfs.cp(src_path, dst_path, recursive=True, fs_ctx=fs_ctx)
 
     async def delete_temp(
         self,
