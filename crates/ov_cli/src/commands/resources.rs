@@ -20,6 +20,8 @@ pub async fn add_resource(
     directly_upload_media: bool,
     watch_interval: f64,
     resource_args: Option<Map<String, Value>>,
+    tags: Vec<String>,
+    tag_mode: String,
     format: OutputFormat,
     compact: bool,
     show_progress: bool,
@@ -42,6 +44,8 @@ pub async fn add_resource(
             directly_upload_media,
             watch_interval,
             resource_args,
+            tags,
+            tag_mode,
             show_progress,
             verbose,
         )

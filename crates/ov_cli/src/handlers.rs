@@ -29,6 +29,8 @@ pub async fn handle_add_resource(
     no_directly_upload_media: bool,
     watch_interval: f64,
     resource_args: Option<String>,
+    tags: Vec<String>,
+    tag_mode: String,
     ctx: CliContext,
 ) -> Result<()> {
     let is_url =
@@ -109,6 +111,8 @@ pub async fn handle_add_resource(
         directly_upload_media,
         watch_interval,
         add_resource_args,
+        tags,
+        tag_mode,
         ctx.output_format,
         ctx.compact,
         ctx.should_show_progress(),

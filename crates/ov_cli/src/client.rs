@@ -35,6 +35,17 @@ fn compact_request_body(body: &mut Value) {
     });
 }
 
+fn add_resource_tag_fields(body: &mut Value, tags: &[String], tag_mode: &str) {
+    if tags.is_empty() {
+        return;
+    }
+    let obj = body
+        .as_object_mut()
+        .expect("add_resource request body must be an object");
+    obj.insert("tags".to_string(), serde_json::json!(tags));
+    obj.insert("tag_mode".to_string(), serde_json::json!(tag_mode));
+}
+
 fn normalize_image_input(image: Option<String>) -> Result<Option<String>> {
     let Some(value) = image else {
         return Ok(None);
@@ -617,6 +628,8 @@ impl HttpClient {
         directly_upload_media: bool,
         watch_interval: f64,
         resource_args: Option<Map<String, Value>>,
+        tags: Vec<String>,
+        tag_mode: String,
         show_progress: bool,
         verbose: bool,
     ) -> Result<serde_json::Value> {
@@ -636,6 +649,7 @@ impl HttpClient {
 
         let build_body = |base: serde_json::Value| {
             let mut body = base;
+            add_resource_tag_fields(&mut body, &tags, &tag_mode);
             if create_parent {
                 body.as_object_mut()
                     .expect("add_resource request body must be an object")
@@ -1750,6 +1764,28 @@ mod tests {
         let mut body = json!({"path": "x", "args": {"feishu_access_token": "u-x"}});
         super::compact_request_body(&mut body);
         assert!(body.as_object().unwrap().contains_key("args"));
+    }
+
+    #[test]
+    fn add_resource_tag_fields_adds_tags_and_tag_mode() {
+        let mut body = json!({"path": "https://example.com/demo.md"});
+        let tags = vec!["team=search".to_string(), "env=test".to_string()];
+
+        super::add_resource_tag_fields(&mut body, &tags, "append");
+
+        assert_eq!(body["tags"], json!(["team=search", "env=test"]));
+        assert_eq!(body["tag_mode"], json!("append"));
+    }
+
+    #[test]
+    fn add_resource_tag_fields_omits_empty_tags_for_compatibility() {
+        let mut body = json!({"path": "https://example.com/demo.md"});
+
+        super::add_resource_tag_fields(&mut body, &[], "replace");
+
+        let obj = body.as_object().unwrap();
+        assert!(!obj.contains_key("tags"));
+        assert!(!obj.contains_key("tag_mode"));
     }
 
     #[test]
