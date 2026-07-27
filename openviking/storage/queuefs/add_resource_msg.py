@@ -39,6 +39,8 @@ class AddResourceMsg:
     skip_watch_management: bool = True
     defer_target_resolution: bool = False
     understanding_response_id: Optional[str] = None
+    tags: Optional[list[str]] = None
+    tag_mode: str = "replace"
 
     def to_dict(self) -> Dict[str, Any]:
         data = asdict(self)
@@ -116,4 +118,10 @@ class AddResourceMsg:
                 if isinstance(data.get("understanding_response_id"), str)
                 else None
             ),
+            tags=(
+                list(data["tags"])
+                if isinstance(data.get("tags"), list)
+                else None
+            ),
+            tag_mode=str(data.get("tag_mode") or "replace"),
         )

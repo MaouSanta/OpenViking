@@ -25,6 +25,8 @@ async def ingest_temp_upload(
     to: str = "",
     reason: str = "",
     args: Optional[dict[str, Any]] = None,
+    tags: Optional[list[str]] = None,
+    tag_mode: str = "replace",
 ) -> dict[str, Any]:
     """Resolve a temp upload and ingest it as a resource; return the raw add_resource result.
 
@@ -50,6 +52,8 @@ async def ingest_temp_upload(
                 allow_local_path_resolution=True,
                 enforce_public_remote_targets=True,
                 args=args,
+                tags=tags,
+                tag_mode=tag_mode,
             )
         except Exception:
             await store.mark_failed(resolved, ctx)

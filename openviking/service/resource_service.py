@@ -38,6 +38,7 @@ from openviking.server.user_config import (
     effective_skill_add_target,
 )
 from openviking.storage import VikingDBManager
+from openviking.storage.content_write import ContentWriteCoordinator
 from openviking.storage.queuefs import QueueManager, get_queue_manager
 from openviking.storage.transaction import NO_LOCK, LockLease
 from openviking.storage.viking_fs import VikingFS
@@ -105,8 +106,11 @@ _ADD_RESOURCE_ARGS_RESERVED_FIELDS = frozenset(
         "parser_backend",
         "resolved_extension",
         "defer_post_processing",
+        "tags",
+        "tag_mode",
     }
 )
+_ADD_RESOURCE_TAG_MODES = frozenset({"replace", "append"})
 
 _INTERNAL_INGESTION_FIELDS = frozenset(
     {
@@ -188,6 +192,52 @@ class ResourceService:
                 continue
             sanitized[key] = value
         return sanitized
+
+    def _watch_processor_kwargs(
+        self,
+        processor_kwargs: Dict[str, Any],
+        tags: Optional[List[str]],
+        tag_mode: str,
+    ) -> Dict[str, Any]:
+        watch_kwargs = dict(processor_kwargs)
+        if tags is not None:
+            watch_kwargs["tags"] = tags
+            watch_kwargs["tag_mode"] = tag_mode
+        return watch_kwargs
+
+    def _validate_add_resource_tag_policy(
+        self,
+        *,
+        tags: Optional[List[str]],
+        tag_mode: str,
+    ) -> None:
+        if tags is not None and tag_mode not in _ADD_RESOURCE_TAG_MODES:
+            raise InvalidArgumentError(f"unsupported tag mode: {tag_mode}")
+
+    async def _apply_add_resource_tags(
+        self,
+        *,
+        result: Dict[str, Any],
+        ctx: RequestContext,
+        tags: Optional[List[str]],
+        tag_mode: str,
+        uri: Optional[str] = None,
+    ) -> None:
+        if tags is None:
+            return
+        target_uri = uri or result.get("root_uri")
+        if not target_uri:
+            return
+        if not self._viking_fs:
+            raise NotInitializedError("VikingFS")
+        coordinator = ContentWriteCoordinator(viking_fs=self._viking_fs)
+        result["tags_result"] = await coordinator.set_tags(
+            uri=str(target_uri),
+            tags=tags,
+            mode=tag_mode,
+            recursive=True,
+            ctx=ctx,
+        )
 
     async def _manage_watch_if_needed(
         self,
@@ -425,6 +475,8 @@ class ResourceService:
                 summarize=msg.summarize,
                 watch_interval=msg.watch_interval,
                 manage_watch=not msg.skip_watch_management,
+                tags=msg.tags,
+                tag_mode=msg.tag_mode,
                 allow_local_path_resolution=msg.allow_local_path_resolution,
                 enforce_public_remote_targets=msg.enforce_public_remote_targets,
                 resource_lock=resource_lock,
@@ -468,6 +520,12 @@ class ResourceService:
                 source_name=msg.source_name,
                 timeout=msg.timeout,
             )
+            await self._apply_add_resource_tags(
+                result=result,
+                ctx=ctx,
+                tags=msg.tags,
+                tag_mode=msg.tag_mode,
+            )
             return result
         except TimeoutError as exc:
             raise DeadlineExceededError("queue processing", msg.timeout) from exc
@@ -506,6 +564,8 @@ class ResourceService:
         summarize: bool = False,
         watch_interval: float = 0,
         manage_watch: bool = True,
+        tags: Optional[List[str]] = None,
+        tag_mode: str = "replace",
         allow_local_path_resolution: bool = True,
         enforce_public_remote_targets: bool = False,
         args: Optional[Dict[str, Any]] = None,
@@ -513,6 +573,7 @@ class ResourceService:
     ) -> Dict[str, Any]:
         """Start background ingestion for Git repositories while reserving the target URI."""
         self._ensure_initialized()
+        self._validate_add_resource_tag_policy(tags=tags, tag_mode=tag_mode)
         normalized_args = self._normalize_add_resource_args(args, watch_interval=watch_interval)
         kwargs.update(normalized_args.processor_kwargs)
         from openviking.connector.routing import CONNECTOR_CREDENTIAL_ARGS
@@ -580,6 +641,8 @@ class ResourceService:
                 summarize=summarize,
                 watch_interval=watch_interval,
                 skip_watch_management=not manage_watch,
+                tags=tags,
+                tag_mode=tag_mode,
                 allow_local_path_resolution=allow_local_path_resolution,
                 enforce_public_remote_targets=enforce_public_remote_targets,
                 strict=bool(kwargs.get("strict", False)),
@@ -710,6 +773,8 @@ class ResourceService:
         build_index: bool = True,
         summarize: bool = False,
         watch_interval: float = 0,
+        tags: Optional[List[str]] = None,
+        tag_mode: str = "replace",
         allow_local_path_resolution: bool = True,
         enforce_public_remote_targets: bool = False,
         args: Optional[Dict[str, Any]] = None,
@@ -735,6 +800,8 @@ class ResourceService:
             summarize=summarize,
             watch_interval=watch_interval,
             manage_watch=True,
+            tags=tags,
+            tag_mode=tag_mode,
             allow_local_path_resolution=allow_local_path_resolution,
             enforce_public_remote_targets=enforce_public_remote_targets,
             args=args,
@@ -791,6 +858,8 @@ class ResourceService:
         summarize: bool = False,
         watch_interval: float = 0,
         manage_watch: bool = True,
+        tags: Optional[List[str]] = None,
+        tag_mode: str = "replace",
         allow_local_path_resolution: bool = True,
         enforce_public_remote_targets: bool = False,
         args: Optional[Dict[str, Any]] = None,
@@ -832,6 +901,7 @@ class ResourceService:
             InvalidArgumentError: If the URI scope is not 'resources'
         """
         self._ensure_initialized()
+        self._validate_add_resource_tag_policy(tags=tags, tag_mode=tag_mode)
         normalized_args = self._normalize_add_resource_args(args, watch_interval=watch_interval)
         kwargs.update(normalized_args.processor_kwargs)
         if watch_interval > 0 and kwargs.get("temp_file_id"):
@@ -876,6 +946,8 @@ class ResourceService:
                 ctx=ctx,
                 to=to,
                 reason=reason,
+                tags=tags,
+                tag_mode=tag_mode,
                 connector_args=args or {},
                 **kwargs,
             )
@@ -893,6 +965,8 @@ class ResourceService:
                 summarize=summarize,
                 watch_interval=watch_interval,
                 manage_watch=manage_watch,
+                tags=tags,
+                tag_mode=tag_mode,
                 allow_local_path_resolution=allow_local_path_resolution,
                 enforce_public_remote_targets=enforce_public_remote_targets,
                 **kwargs,
@@ -911,6 +985,8 @@ class ResourceService:
             summarize=summarize,
             watch_interval=watch_interval,
             manage_watch=manage_watch,
+            tags=tags,
+            tag_mode=tag_mode,
             allow_local_path_resolution=allow_local_path_resolution,
             enforce_public_remote_targets=enforce_public_remote_targets,
             watch_auth_state=normalized_args.watch_auth_state,
@@ -932,6 +1008,8 @@ class ResourceService:
         summarize: bool = False,
         watch_interval: float = 0,
         manage_watch: bool = True,
+        tags: Optional[List[str]] = None,
+        tag_mode: str = "replace",
         allow_local_path_resolution: bool = True,
         enforce_public_remote_targets: bool = False,
         watch_auth_state: Optional[Dict[str, Any]] = None,
@@ -1120,6 +1198,8 @@ class ResourceService:
                         skip_watch_management=True,
                         defer_target_resolution=defer_target_resolution,
                         understanding_response_id=understanding_response_id,
+                        tags=tags,
+                        tag_mode=tag_mode,
                     )
                     enqueue_started = True
                     task = await self._enqueue_add_resource_job(
@@ -1149,7 +1229,7 @@ class ResourceService:
                     instruction=instruction,
                     build_index=build_index,
                     summarize=summarize,
-                    processor_kwargs=kwargs,
+                    processor_kwargs=self._watch_processor_kwargs(kwargs, tags, tag_mode),
                     watch_auth_state=watch_auth_state,
                     ctx=ctx,
                 )
@@ -1263,6 +1343,8 @@ class ResourceService:
                     enforce_public_remote_targets=enforce_public_remote_targets,
                     source_name=kwargs.get("source_name"),
                     skip_watch_management=True,
+                    tags=tags,
+                    tag_mode=tag_mode,
                 )
                 task = await self._enqueue_add_resource_job(
                     msg,
@@ -1283,7 +1365,7 @@ class ResourceService:
                 instruction=instruction,
                 build_index=build_index,
                 summarize=summarize,
-                processor_kwargs=kwargs,
+                processor_kwargs=self._watch_processor_kwargs(kwargs, tags, tag_mode),
                 watch_auth_state=watch_auth_state,
                 ctx=ctx,
             )
@@ -1294,6 +1376,12 @@ class ResourceService:
                     reason=reason,
                     source_name=kwargs.get("source_name"),
                     timeout=timeout,
+                )
+                await self._apply_add_resource_tags(
+                    result=result,
+                    ctx=ctx,
+                    tags=tags,
+                    tag_mode=tag_mode,
                 )
             return result
         except Exception as exc:
@@ -1571,6 +1659,8 @@ class ResourceService:
         ctx: RequestContext,
         to: Optional[str],
         reason: str = "",
+        tags: Optional[List[str]] = None,
+        tag_mode: str = "replace",
         connector_args: Optional[Dict[str, Any]] = None,
         **kwargs: Any,
     ) -> Dict[str, Any]:
@@ -1713,6 +1803,8 @@ class ResourceService:
             ctx=ctx,
             reason=reason,
             link_root_uri=task_resource_id or "viking://resources",
+            tags=tags,
+            tag_mode=tag_mode,
         )
 
         background = asyncio.create_task(monitor)
@@ -1738,6 +1830,8 @@ class ResourceService:
         ctx: RequestContext,
         reason: str = "",
         link_root_uri: str = "",
+        tags: Optional[List[str]] = None,
+        tag_mode: str = "replace",
     ) -> Dict[str, Any]:
         """Poll the Connector task until terminal state, then update OV TaskRecord.
 
@@ -1807,6 +1901,16 @@ class ResourceService:
                             for key in ("memory_linking", "warnings"):
                                 if key in link_result:
                                     completion[key] = link_result[key]
+                        tag_result: Dict[str, Any] = {"root_uri": link_root_uri}
+                        await self._apply_add_resource_tags(
+                            result=tag_result,
+                            ctx=ctx,
+                            tags=tags,
+                            tag_mode=tag_mode,
+                            uri=link_root_uri,
+                        )
+                        if "tags_result" in tag_result:
+                            completion["tags_result"] = tag_result["tags_result"]
                         await task_tracker.complete(
                             ov_task_id,
                             completion,

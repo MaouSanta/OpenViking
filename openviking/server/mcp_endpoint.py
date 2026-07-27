@@ -551,6 +551,8 @@ async def add_resource(
     watch_interval: float = 0,
     to: str = "",
     parent: str = "",
+    tags: Optional[list[str]] = None,
+    tag_mode: str = "replace",
     args: Optional[dict[str, Any]] = None,
 ) -> str:
     """Add a resource to OpenViking. Asynchronous — processing happens in the background.
@@ -574,6 +576,8 @@ async def add_resource(
             Leave empty to derive a URI from the source.
         parent: Parent URI under viking://resources/ for remote imports. Mutually exclusive
             with ``to``.
+        tags: Optional explicit k=v retrieval tags to apply after ingestion.
+        tag_mode: Tag update mode, "replace" or "append". Defaults to "replace".
         args: Parser-specific options, e.g. {"feishu_access_token": "..."} for Feishu imports,
             or {"site": true} for whole-site ingestion.
     """
@@ -597,7 +601,14 @@ async def add_resource(
         store = TempUploadStore.build(server_config)
         try:
             result = await ingest_temp_upload(
-                store, temp_file_id, ctx, to=to, reason=description, args=args
+                store,
+                temp_file_id,
+                ctx,
+                to=to,
+                reason=description,
+                args=args,
+                tags=tags,
+                tag_mode=tag_mode,
             )
         except (PermissionDeniedError, InvalidArgumentError) as exc:
             return f"Error: {exc}"
@@ -644,6 +655,8 @@ async def add_resource(
                 watch_interval=watch_interval,
                 enforce_public_remote_targets=True,
                 args=args,
+                tags=tags,
+                tag_mode=tag_mode,
             )
         except Exception as exc:
             return f"Error adding resource: {exc}"
@@ -684,6 +697,8 @@ async def add_resource(
         to=to,
         reason=description,
         actor_peer_id=ctx.actor_peer_id or "",
+        tags=tags,
+        tag_mode=tag_mode,
     )
     base_url, url_source = _resolve_public_base_url()
     upload_url = f"{base_url}/api/v1/resources/temp_upload?token={quote(token, safe='')}"

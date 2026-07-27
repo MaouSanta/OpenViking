@@ -236,6 +236,8 @@ class SyncOpenViking:
         build_index: bool = True,
         summarize: bool = False,
         args: Optional[Dict[str, Any]] = None,
+        tags: Optional[List[str]] = None,
+        tag_mode: str = "replace",
         telemetry: TelemetryRequest = False,
         **kwargs,
     ) -> Dict[str, Any]:
@@ -268,6 +270,8 @@ class SyncOpenViking:
                 build_index=build_index,
                 summarize=summarize,
                 args=args,
+                tags=tags,
+                tag_mode=tag_mode,
                 telemetry=telemetry,
                 **kwargs,
             )

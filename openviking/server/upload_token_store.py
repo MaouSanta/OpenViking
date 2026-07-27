@@ -44,6 +44,8 @@ class _TokenInfo:
     to: str
     reason: str
     actor_peer_id: str
+    tags: Optional[list[str]]
+    tag_mode: str
     expires_at: float
 
 
@@ -56,6 +58,8 @@ class ConsumedUploadToken:
     to: str
     reason: str
     actor_peer_id: str
+    tags: Optional[list[str]]
+    tag_mode: str
 
 
 class UploadTokenStore:
@@ -71,6 +75,8 @@ class UploadTokenStore:
         to: str = "",
         reason: str = "",
         actor_peer_id: str = "",
+        tags: Optional[list[str]] = None,
+        tag_mode: str = "replace",
     ) -> Tuple[str, float]:
         """Mint a fresh token bound to (account, user) plus ``to``/``reason``/``actor_peer_id``.
 
@@ -81,7 +87,7 @@ class UploadTokenStore:
         """
         self._purge_expired()
         expires_at = time.time() + max(1, ttl_seconds)
-        info = _TokenInfo(account_id, user_id, to, reason, actor_peer_id, expires_at)
+        info = _TokenInfo(account_id, user_id, to, reason, actor_peer_id, tags, tag_mode, expires_at)
         for _ in range(8):
             token = "".join(secrets.choice(_TOKEN_ALPHABET) for _ in range(_TOKEN_LENGTH))
             if token not in self._store:
@@ -99,7 +105,13 @@ class UploadTokenStore:
         if info.expires_at < time.time():
             raise UploadTokenError("upload token expired")
         return ConsumedUploadToken(
-            info.account_id, info.user_id, info.to, info.reason, info.actor_peer_id
+            info.account_id,
+            info.user_id,
+            info.to,
+            info.reason,
+            info.actor_peer_id,
+            info.tags,
+            info.tag_mode,
         )
 
     def peek(self, token: str) -> Optional[_TokenInfo]:
