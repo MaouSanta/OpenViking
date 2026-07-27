@@ -15,7 +15,11 @@ import { fileNameFromUri } from '#/lib/viking-uri'
 import type { GetContentDownloadData } from '#/gen/ov-client/types.gen'
 import type { ContentDownloadQuery } from '@ov-server/api/v1/content'
 
-import { formatSize, normalizeReadContent } from '../-lib/normalize'
+import {
+  beautifyJson,
+  formatSize,
+  normalizeReadContent,
+} from '../-lib/normalize'
 import { fetchDirectoryLevelContent, saveFileContent } from '../-lib/api'
 import {
   useVikingFilePreview,
@@ -1035,10 +1039,12 @@ export function FilePreview({
     },
   )
   const preview = previewQuery.preview
-  const displayContent = useMemo(
-    () => memoryFieldsDisplayContent(preview?.content || ''),
-    [preview?.content],
-  )
+  const codeLanguage = detectCodeLanguage(file?.name || '')
+  const isJson = preview?.fileType === 'code' && codeLanguage === 'json'
+  const displayContent = useMemo(() => {
+    const content = memoryFieldsDisplayContent(preview?.content || '')
+    return isJson ? beautifyJson(content) : content
+  }, [isJson, preview?.content])
   const directoryPreview = useDirectoryPreview(file)
   const [markdownMode, setMarkdownMode] = useState<'preview' | 'source'>(
     'preview',
@@ -1082,7 +1088,7 @@ export function FilePreview({
   const [highlightedCodeHtml, setHighlightedCodeHtml] = useState('')
 
   const needsHighlight =
-    preview?.fileType === 'code' ||
+    (preview?.fileType === 'code' && !isJson) ||
     (preview?.fileType === 'markdown' && markdownMode === 'source')
 
   useEffect(() => {
@@ -1098,7 +1104,7 @@ export function FilePreview({
     }
 
     let cancelled = false
-    const language = detectCodeLanguage(file?.name || '')
+    const language = codeLanguage
 
     const run = async () => {
       try {
@@ -1118,7 +1124,7 @@ export function FilePreview({
     return () => {
       cancelled = true
     }
-  }, [preview, file?.name, needsHighlight, displayContent])
+  }, [preview, codeLanguage, needsHighlight, displayContent])
 
   useEffect(() => {
     let alive = true
@@ -1515,15 +1521,19 @@ export function FilePreview({
             {!previewQuery.isLoading &&
             preview?.fileType === 'code' &&
             preview.shouldAutoRead ? (
-              <pre className="overflow-auto rounded-md border bg-muted/20 p-3 text-xs leading-6">
-                <code
-                  className="hljs block"
-                  dangerouslySetInnerHTML={{
-                    __html:
-                      highlightedCodeHtml ||
-                      escapeHtml(displayContent || emptyFileText),
-                  }}
-                />
+              <pre className="overflow-auto whitespace-pre-wrap break-words rounded-md border bg-muted/20 p-3 text-xs leading-6">
+                {isJson ? (
+                  displayContent || emptyFileText
+                ) : (
+                  <code
+                    className="hljs block"
+                    dangerouslySetInnerHTML={{
+                      __html:
+                        highlightedCodeHtml ||
+                        escapeHtml(displayContent || emptyFileText),
+                    }}
+                  />
+                )}
               </pre>
             ) : null}
 

@@ -496,3 +496,11 @@ export function normalizeReadContent(result: unknown): string {
 
   return JSON.stringify(result, null, 2)
 }
+
+export function beautifyJson(content: string): string {
+  try {
+    return JSON.stringify(JSON.parse(content), null, 2)
+  } catch {
+    return content
+  }
+}
