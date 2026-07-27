@@ -1053,6 +1053,7 @@ export function FilePreview({
     Set<DirectoryLevelId>
   >(new Set(['abstract', 'overview']))
   const [editing, setEditing] = useState(false)
+  const [jsonHighlight, setJsonHighlight] = useState(false)
   const [saving, setSaving] = useState(false)
   const editorRef = useRef<CodeEditorHandle>(null)
   const { invalidatePreview } = useInvalidateVikingFs()
@@ -1068,6 +1069,7 @@ export function FilePreview({
   useEffect(() => {
     setMarkdownMode('preview')
     setEditing(false)
+    setJsonHighlight(false)
     setActiveDirectoryLevels(new Set(['abstract', 'overview']))
   }, [file?.uri])
 
@@ -1257,16 +1259,31 @@ export function FilePreview({
                 </Button>
               </div>
             ) : (
-              canEdit && (
-                <Button
-                  size="sm"
-                  variant="ghost"
-                  onClick={() => setEditing(true)}
-                >
-                  <Pencil className="mr-1 size-3.5" />
-                  {t('filePreview.edit')}
-                </Button>
-              )
+              <div className="flex items-center gap-1">
+                {isJson && preview.shouldAutoRead ? (
+                  <Button
+                    size="sm"
+                    variant="ghost"
+                    onClick={() => setJsonHighlight((current) => !current)}
+                  >
+                    {t(
+                      jsonHighlight
+                        ? 'filePreview.plainText'
+                        : 'filePreview.highlight',
+                    )}
+                  </Button>
+                ) : null}
+                {canEdit ? (
+                  <Button
+                    size="sm"
+                    variant="ghost"
+                    onClick={() => setEditing(true)}
+                  >
+                    <Pencil className="mr-1 size-3.5" />
+                    {t('filePreview.edit')}
+                  </Button>
+                ) : null}
+              </div>
             )}
           </div>
           {showCloseButton ? (
@@ -1297,6 +1314,24 @@ export function FilePreview({
               initialContent={preview.content}
               filename={file.name}
               isDark={isDark}
+            />
+          </Suspense>
+        </div>
+      ) : jsonHighlight && isJson && preview.shouldAutoRead ? (
+        <div className="h-full min-h-0 p-2">
+          <Suspense
+            fallback={
+              <div className="flex h-full items-center justify-center text-sm text-muted-foreground">
+                <Loader2 className="mr-2 size-4 animate-spin" />
+                {t('filePreview.loadingEditor')}
+              </div>
+            }
+          >
+            <LazyCodeEditor
+              initialContent={displayContent}
+              filename={file.name}
+              isDark={isDark}
+              readOnly
             />
           </Suspense>
         </div>

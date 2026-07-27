@@ -815,6 +815,7 @@ const zhCN = {
     filePreview: {
       cancel: '取消',
       edit: '编辑',
+      highlight: '高亮',
       emptyFile: '(空文件)',
       emptyPrompt: '选择文件后在这里预览',
       imageFailed: '图片加载失败。',
@@ -825,6 +826,7 @@ const zhCN = {
       markdownPreview: '预览',
       markdownSource: '源码',
       noDirectoryContext: '这个目录暂无摘要或概览。',
+      plainText: '纯文本',
       save: '保存',
       selectDirectoryContext: '选择一个标签查看目录上下文。',
       unsupportedBinary: '二进制文件不支持文本预览。',

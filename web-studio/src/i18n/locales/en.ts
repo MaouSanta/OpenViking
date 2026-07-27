@@ -844,6 +844,7 @@ const en = {
     filePreview: {
       cancel: 'Cancel',
       edit: 'Edit',
+      highlight: 'Highlight',
       emptyFile: '(empty file)',
       emptyPrompt: 'Select a file to preview it here',
       imageFailed: 'Image failed to load.',
@@ -854,6 +855,7 @@ const en = {
       markdownPreview: 'Preview',
       markdownSource: 'Source',
       noDirectoryContext: 'No abstract or overview available for this folder.',
+      plainText: 'Plain text',
       save: 'Save',
       selectDirectoryContext: 'Select a chip to show folder context.',
       unsupportedBinary: 'Binary files do not support text preview.',
