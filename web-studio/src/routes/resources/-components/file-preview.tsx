@@ -1053,6 +1053,9 @@ export function FilePreview({
     Set<DirectoryLevelId>
   >(new Set(['abstract', 'overview']))
   const [editing, setEditing] = useState(false)
+  const [highlightedJsonUri, setHighlightedJsonUri] = useState<string | null>(
+    null,
+  )
   const [saving, setSaving] = useState(false)
   const editorRef = useRef<CodeEditorHandle>(null)
   const { invalidatePreview } = useInvalidateVikingFs()
@@ -1068,6 +1071,7 @@ export function FilePreview({
   useEffect(() => {
     setMarkdownMode('preview')
     setEditing(false)
+    setHighlightedJsonUri(null)
     setActiveDirectoryLevels(new Set(['abstract', 'overview']))
   }, [file?.uri])
 
@@ -1085,38 +1089,51 @@ export function FilePreview({
     )
   }, [file, preview?.fileType])
 
-  const [highlightedCodeHtml, setHighlightedCodeHtml] = useState('')
+  const jsonHighlight = isJson && highlightedJsonUri === file?.uri
+  const [highlightedCode, setHighlightedCode] = useState<{
+    content: string
+    html: string
+    language: string | null
+  } | null>(null)
+  const highlightedCodeHtml =
+    highlightedCode?.content === displayContent &&
+    highlightedCode.language === codeLanguage
+      ? highlightedCode.html
+      : ''
 
   const needsHighlight =
-    (preview?.fileType === 'code' && !isJson) ||
+    (preview?.fileType === 'code' && (!isJson || jsonHighlight)) ||
     (preview?.fileType === 'markdown' && markdownMode === 'source')
 
   useEffect(() => {
     if (!preview || !needsHighlight) {
-      setHighlightedCodeHtml('')
+      setHighlightedCode(null)
       return
     }
 
     const content = displayContent || ''
     if (!content) {
-      setHighlightedCodeHtml('')
+      setHighlightedCode(null)
       return
     }
 
     let cancelled = false
     const language = codeLanguage
+    const finish = (html: string) => {
+      if (!cancelled) setHighlightedCode({ content, html, language })
+    }
 
     const run = async () => {
       try {
         if (language) {
           await ensureLanguage(language)
           if (cancelled) return
-          setHighlightedCodeHtml(hljs.highlight(content, { language }).value)
+          finish(hljs.highlight(content, { language }).value)
         } else {
-          setHighlightedCodeHtml(hljs.highlightAuto(content).value)
+          finish(hljs.highlightAuto(content).value)
         }
       } catch {
-        if (!cancelled) setHighlightedCodeHtml(escapeHtml(content))
+        finish(escapeHtml(content))
       }
     }
 
@@ -1257,16 +1274,34 @@ export function FilePreview({
                 </Button>
               </div>
             ) : (
-              canEdit && (
-                <Button
-                  size="sm"
-                  variant="ghost"
-                  onClick={() => setEditing(true)}
-                >
-                  <Pencil className="mr-1 size-3.5" />
-                  {t('filePreview.edit')}
-                </Button>
-              )
+              <div className="flex items-center gap-1">
+                {isJson && preview.shouldAutoRead ? (
+                  <Button
+                    size="sm"
+                    variant="ghost"
+                    aria-pressed={jsonHighlight}
+                    onClick={() =>
+                      setHighlightedJsonUri(jsonHighlight ? null : file.uri)
+                    }
+                  >
+                    {t(
+                      jsonHighlight
+                        ? 'filePreview.plainText'
+                        : 'filePreview.highlight',
+                    )}
+                  </Button>
+                ) : null}
+                {canEdit ? (
+                  <Button
+                    size="sm"
+                    variant="ghost"
+                    onClick={() => setEditing(true)}
+                  >
+                    <Pencil className="mr-1 size-3.5" />
+                    {t('filePreview.edit')}
+                  </Button>
+                ) : null}
+              </div>
             )}
           </div>
           {showCloseButton ? (
@@ -1522,7 +1557,7 @@ export function FilePreview({
             preview?.fileType === 'code' &&
             preview.shouldAutoRead ? (
               <pre className="overflow-auto whitespace-pre-wrap break-words rounded-md border bg-muted/20 p-3 text-xs leading-6">
-                {isJson ? (
+                {isJson && !jsonHighlight ? (
                   displayContent || emptyFileText
                 ) : (
                   <code
