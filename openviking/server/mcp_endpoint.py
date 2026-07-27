@@ -599,7 +599,7 @@ async def add_resource(
             file. Requires an exact ``to`` target and cannot be combined with
             ``temp_file_id`` or ``parent``. Leave empty for the default path-probing
             behavior.
-        bundle: Store one local source as an immutable atomic resource bundle.
+        bundle: Assemble one local source and its derived artifacts as an immutable bundle.
         description: Optional human-readable reason for adding the resource.
         watch_interval: Auto-refresh cadence in minutes. 0 = no watch. Prefer >=1440 (24h)
             unless the source changes faster — every refresh re-embeds the whole resource.

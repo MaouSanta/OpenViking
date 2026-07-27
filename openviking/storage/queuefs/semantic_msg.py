@@ -56,6 +56,7 @@ class SemanticMsg:
     target_preexisting: Optional[bool] = None
     ingest_options: IngestOptions = field(default_factory=IngestOptions)
     precomputed_semantics: bool = False
+    bundle_assembly: bool = False
     coalesce_key: str = ""
     coalesce_version: int = 0
     changes: Optional[Dict[str, List[str]]] = (
@@ -79,6 +80,7 @@ class SemanticMsg:
         target_preexisting: Optional[bool] = None,
         ingest_options: IngestOptions | Dict[str, Any] | None = None,
         precomputed_semantics: bool = False,
+        bundle_assembly: bool = False,
         coalesce_key: str = "",
         coalesce_version: int = 0,
         changes: Optional[Dict[str, List[str]]] = None,
@@ -99,6 +101,7 @@ class SemanticMsg:
         self.target_preexisting = target_preexisting
         self.ingest_options = IngestOptions.from_value(ingest_options)
         self.precomputed_semantics = precomputed_semantics
+        self.bundle_assembly = bundle_assembly
         self.coalesce_key = coalesce_key
         self.coalesce_version = coalesce_version
         self.changes = changes
@@ -152,6 +155,7 @@ class SemanticMsg:
                 }
             ),
             precomputed_semantics=data.get("precomputed_semantics", False),
+            bundle_assembly=data.get("bundle_assembly", False),
             coalesce_key=data.get("coalesce_key", ""),
             coalesce_version=data.get("coalesce_version", 0),
             changes=data.get("changes"),

@@ -13,7 +13,6 @@ from collections.abc import Callable
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
 
 from openviking.core.context import ContextLevel
-from openviking.utils.ingest_options import IngestOptions
 from openviking.core.namespace import context_type_for_uri
 from openviking.parse.image_rewrite import rewrite_image_uris
 from openviking.parse.tree_builder import TreeBuilder
@@ -24,14 +23,15 @@ from openviking.resource.processing_mode import (
     normalize_processing_mode,
 )
 from openviking.server.identity import RequestContext
-from openviking.storage.vikingdb_manager import VikingDBManager
 from openviking.storage.errors import LockAcquisitionError
 from openviking.storage.expr import And, Eq, PathScope
 from openviking.storage.internal_names import STORAGE_INTERNAL_ENTRY_NAMES
 from openviking.storage.queuefs.semantic_processor import SemanticProcessor
 from openviking.storage.viking_fs import LS_ALL_NODES, get_viking_fs
+from openviking.storage.vikingdb_manager import VikingDBManager
 from openviking.telemetry import get_current_telemetry
 from openviking.utils.embedding_utils import index_resource, vectorize_file
+from openviking.utils.ingest_options import IngestOptions
 from openviking.utils.summarizer import Summarizer
 from openviking_cli.exceptions import OpenVikingError
 from openviking_cli.utils import VikingURI, get_logger
@@ -634,8 +634,9 @@ class ResourceProcessor:
         candidate_uri: str,
         ctx: RequestContext,
         max_attempts: int = 100,
+        exact_lock: bool = False,
     ) -> tuple[str, Dict[str, Any]]:
-        """Pick the first free candidate URI and reserve it with a resource TreeLock."""
+        """Pick the first free candidate URI and reserve it."""
         from openviking.storage.errors import ResourceBusyError
 
         viking_fs = get_viking_fs()
@@ -649,7 +650,10 @@ class ResourceProcessor:
             dst_path = viking_fs._uri_to_path(root_uri, ctx=ctx)
             try:
                 resource_lock = await self.acquire_resource_lock(
-                    dst_path, uri=root_uri, timeout=0.0
+                    dst_path,
+                    uri=root_uri,
+                    timeout=0.0,
+                    exact_lock=exact_lock,
                 )
                 return root_uri, resource_lock
             except ResourceBusyError as exc:
@@ -675,14 +679,18 @@ class ResourceProcessor:
         *,
         uri: str = "",
         timeout: float = 0.0,
+        exact_lock: bool = False,
     ) -> Dict[str, Any]:
-        """Acquire the per-resource TreeLock or raise a structured conflict."""
+        """Acquire the per-resource lock or raise a structured conflict."""
         from openviking.storage.errors import ResourceBusyError
 
         try:
-            return await get_viking_fs()._async_agfs.pathlock_acquire_tree(
-                path, timeout_secs=timeout
+            acquire = (
+                get_viking_fs()._async_agfs.pathlock_acquire_exact
+                if exact_lock
+                else get_viking_fs()._async_agfs.pathlock_acquire_tree
             )
+            return await acquire(path, timeout_secs=timeout)
         except LockAcquisitionError as exc:
             logger.warning(f"[ResourceProcessor] Failed to acquire resource lock on {path}")
             raise ResourceBusyError(
