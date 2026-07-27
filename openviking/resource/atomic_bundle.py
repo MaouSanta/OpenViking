@@ -20,10 +20,9 @@ if TYPE_CHECKING:
     from openviking.storage.viking_fs import VikingFS
 
 
-RESOURCE_BUNDLE_SCHEMA = "openviking.resource-bundle/v1"
+RESOURCE_BUNDLE_SCHEMA_V1 = "openviking.resource-bundle/v1"
+RESOURCE_BUNDLE_SCHEMA = "openviking.resource-bundle/v2"
 RESOURCE_BUNDLE_MANIFEST = "manifest.json"
-RESOURCE_BUNDLE_DISCOVERY_TAG_KEY = "resource_bundle"
-RESOURCE_BUNDLE_DISCOVERY_TAG = f"{RESOURCE_BUNDLE_DISCOVERY_TAG_KEY}=true"
 _SHA256_HEX_RE = re.compile(r"^[0-9a-f]{64}$")
 
 # A kind is the normalized source format, not a broad 3D category.
@@ -79,8 +78,15 @@ async def read_source_and_sha256(path: Path) -> tuple[bytes, str]:
     return await asyncio.to_thread(_read)
 
 
-def build_manifest(*, kind: str, source_path: str, sha256: str, ingested_at: Any) -> dict[str, Any]:
-    """Build the intentionally minimal V1 bundle manifest."""
+def build_manifest(
+    *,
+    kind: str,
+    source_path: str,
+    sha256: str,
+    ingested_at: Any,
+    artifacts: dict[str, dict[str, str]],
+) -> dict[str, Any]:
+    """Build the V2 bundle identity and artifact inventory."""
     return {
         "schema": RESOURCE_BUNDLE_SCHEMA,
         "kind": kind,
@@ -89,6 +95,7 @@ def build_manifest(*, kind: str, source_path: str, sha256: str, ingested_at: Any
             "sha256": sha256,
             "ingested_at": format_iso8601(ingested_at),
         },
+        "artifacts": artifacts,
     }
 
 
@@ -98,16 +105,19 @@ def serialize_manifest(manifest: dict[str, Any]) -> str:
 
 
 def is_resource_bundle_manifest(payload: Any) -> bool:
-    """Return whether *payload* is a complete V1 atomic-bundle marker.
+    """Return whether *payload* is a complete atomic-bundle marker.
 
     The schema string alone must not turn an arbitrary directory into an
-    immutable bundle.  These are the fields whose presence is part of the V1
-    contract; unknown optional fields remain valid for later schema evolution.
+    immutable bundle. V1 remains readable; new V2 manifests also require a
+    complete artifact inventory.
     """
-    if not isinstance(payload, dict) or payload.get("schema") != RESOURCE_BUNDLE_SCHEMA:
+    if not isinstance(payload, dict) or payload.get("schema") not in {
+        RESOURCE_BUNDLE_SCHEMA_V1,
+        RESOURCE_BUNDLE_SCHEMA,
+    }:
         return False
     source = payload.get("source")
-    return (
+    valid_source = (
         isinstance(payload.get("kind"), str)
         and bool(payload["kind"])
         and isinstance(source, dict)
@@ -117,6 +127,31 @@ def is_resource_bundle_manifest(payload: Any) -> bool:
         and bool(_SHA256_HEX_RE.fullmatch(source["sha256"]))
         and isinstance(source.get("ingested_at"), str)
         and bool(source["ingested_at"])
+    )
+    if not valid_source or payload.get("schema") == RESOURCE_BUNDLE_SCHEMA_V1:
+        return valid_source
+
+    artifacts = payload.get("artifacts")
+    if not isinstance(artifacts, dict) or not artifacts:
+        return False
+    for role, artifact in artifacts.items():
+        if (
+            not isinstance(role, str)
+            or not role
+            or not isinstance(artifact, dict)
+            or not isinstance(artifact.get("path"), str)
+            or not artifact["path"]
+            or not isinstance(artifact.get("schema"), str)
+            or not artifact["schema"]
+            or not isinstance(artifact.get("sha256"), str)
+            or not _SHA256_HEX_RE.fullmatch(artifact["sha256"])
+        ):
+            return False
+    source_artifact = artifacts.get("source")
+    return bool(
+        source_artifact
+        and source_artifact["path"] == source["path"]
+        and source_artifact["sha256"] == source["sha256"]
     )
 
 

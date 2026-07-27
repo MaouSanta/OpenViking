@@ -472,8 +472,9 @@ class ResourceProcessor:
         candidate_uri: str,
         ctx: RequestContext,
         max_attempts: int = 100,
+        exact_lock: bool = False,
     ) -> tuple[str, OwnedLockLease]:
-        """Pick the first free candidate URI and reserve it with a resource TreeLock."""
+        """Pick the first free candidate URI and reserve it."""
         from openviking.storage.errors import ResourceBusyError
         from openviking.storage.transaction import get_lock_manager
 
@@ -489,7 +490,11 @@ class ResourceProcessor:
             dst_path = viking_fs._uri_to_path(root_uri, ctx=ctx)
             try:
                 resource_lock = await self.acquire_resource_lock(
-                    lock_manager, dst_path, uri=root_uri, timeout=0.0
+                    lock_manager,
+                    dst_path,
+                    uri=root_uri,
+                    timeout=0.0,
+                    exact_lock=exact_lock,
                 )
                 return root_uri, resource_lock
             except ResourceBusyError as exc:
@@ -516,11 +521,16 @@ class ResourceProcessor:
         *,
         uri: str = "",
         timeout: Any = LOCK_TIMEOUT_DEFAULT,
+        exact_lock: bool = False,
     ) -> OwnedLockLease:
-        """Acquire the per-resource TreeLock or raise a structured conflict."""
+        """Acquire the per-resource lock or raise a structured conflict."""
         from openviking.storage.errors import ResourceBusyError
 
         try:
+            if exact_lock:
+                return await OwnedLockLease.acquire_exact_paths(
+                    lock_manager, [path], timeout=timeout
+                )
             return await OwnedLockLease.acquire_tree(lock_manager, path, timeout=timeout)
         except LockAcquisitionError as exc:
             logger.warning(f"[ResourceProcessor] Failed to acquire resource lock on {path}")

@@ -1,27 +1,25 @@
 # Copyright (c) 2026 Beijing Volcano Engine Technology Co., Ltd.
 # SPDX-License-Identifier: AGPL-3.0
-"""Focused coverage for V1 atomic resource bundles."""
+"""Focused coverage for atomic resource bundles."""
 
 import hashlib
 import json
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, nullcontext
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, call
 
 import pytest
 
-from openviking.resource.atomic_bundle import (
-    RESOURCE_BUNDLE_DISCOVERY_TAG,
-    is_resource_bundle_manifest,
-)
+from openviking.resource.atomic_bundle import is_resource_bundle_manifest
 from openviking.server.identity import RequestContext, Role
 from openviking.service import resource_service as resource_service_module
+from openviking.service import search_service as search_service_module
 from openviking.service.fs_service import FSService
 from openviking.service.resource_service import ResourceService
 from openviking.service.search_service import SearchService
-from openviking.storage.content_write import ContentWriteCoordinator
 from openviking.storage.viking_fs import LS_ALL_NODES, VikingFS
-from openviking_cli.exceptions import FailedPreconditionError, InvalidArgumentError, InvalidURIError
+from openviking.utils.embedding_utils import _apply_scalar_overrides
+from openviking_cli.exceptions import FailedPreconditionError, InvalidURIError
 from openviking_cli.retrieve.types import ContextType, FindResult, MatchedContext
 from openviking_cli.session.user_id import UserIdentifier
 
@@ -52,17 +50,54 @@ class _BundleFS:
         del ctx
         self.directories.add(uri)
 
-    async def write_file_bytes(self, uri, content, *, ctx, lock_handle):
+    async def write_file_bytes(self, uri, content, *, ctx=None, lock_handle=None):
         del ctx, lock_handle
         self.files[uri] = content
 
-    async def write_file(self, uri, content, *, ctx, lock_handle, **kwargs):
+    async def write_file(self, uri, content, *, ctx=None, lock_handle=None, **kwargs):
         del ctx, lock_handle, kwargs
         self.files[uri] = content.encode("utf-8")
 
     async def rm(self, uri, *, recursive, ctx, lock_handle):
         del recursive, ctx, lock_handle
         self.removed.append(uri)
+        self.directories = {path for path in self.directories if not path.startswith(uri)}
+        self.files = {path: data for path, data in self.files.items() if not path.startswith(uri)}
+
+    def bind_request_context(self, ctx):
+        del ctx
+        return nullcontext()
+
+    def create_temp_uri(self, *, ctx=None):
+        del ctx
+        return "viking://temp/staging"
+
+    async def read_file_bytes(self, uri, *, ctx=None):
+        del ctx
+        return self.files[uri]
+
+    async def persist_temp_tree(
+        self,
+        temp_uri,
+        target_uri,
+        *,
+        ctx=None,
+        _allow_atomic_bundle_write=False,
+    ):
+        del ctx
+        assert _allow_atomic_bundle_write
+        prefix = temp_uri.rstrip("/") + "/"
+        self.directories.add(target_uri)
+        for uri, content in list(self.files.items()):
+            if uri.startswith(prefix):
+                self.files[target_uri + uri[len(temp_uri) :]] = content
+
+    async def delete_temp(self, temp_uri, *, ctx=None):
+        del ctx
+        self.directories = {path for path in self.directories if not path.startswith(temp_uri)}
+        self.files = {
+            path: data for path, data in self.files.items() if not path.startswith(temp_uri)
+        }
 
 
 def _bundle_service(viking_fs):
@@ -74,7 +109,7 @@ def _bundle_service(viking_fs):
     )
 
 
-def test_bundle_marker_requires_the_v1_required_fields():
+def test_bundle_marker_reads_v1_and_requires_a_v2_artifact_inventory():
     assert not is_resource_bundle_manifest({"schema": "openviking.resource-bundle/v1"})
     assert not is_resource_bundle_manifest(
         {
@@ -105,6 +140,37 @@ def test_bundle_marker_requires_the_v1_required_fields():
             },
         }
     )
+    assert not is_resource_bundle_manifest(
+        {
+            "schema": "openviking.resource-bundle/v2",
+            "kind": "step",
+            "source": {
+                "path": "model.step",
+                "sha256": "a" * 64,
+                "ingested_at": "2026-07-23T00:00:00+00:00",
+            },
+        }
+    )
+    assert is_resource_bundle_manifest(
+        {
+            "schema": "openviking.resource-bundle/v2",
+            "kind": "step",
+            "source": {
+                "path": "model.step",
+                "sha256": "a" * 64,
+                "ingested_at": "2026-07-23T00:00:00+00:00",
+            },
+            "artifacts": {"source": {"path": "model.step", "schema": "step", "sha256": "a" * 64}},
+        }
+    )
+
+
+def test_bundle_kind_tag_is_applied_to_each_embedding_message():
+    message = SimpleNamespace(context_data={})
+
+    _apply_scalar_overrides(message, {"search_tags": ["kind=dwg"]})
+
+    assert message.context_data["search_tags"] == ["kind=dwg"]
 
 
 @pytest.mark.asyncio
@@ -119,9 +185,10 @@ async def test_add_resource_bundle_writes_only_source_and_manifest(
     service = _bundle_service(viking_fs)
     lock = _Lock()
 
-    service._plan_resource_target = AsyncMock(
-        return_value=("viking://resources/gear", lock)
-    )
+    async def reserve_bundle_target(*_args, **_kwargs):
+        return "viking://resources/gear", lock
+
+    service._plan_resource_target = AsyncMock(side_effect=reserve_bundle_target)
 
     async def no_parent_bundle(*_args, **_kwargs):
         return None
@@ -146,15 +213,126 @@ async def test_add_resource_bundle_writes_only_source_and_manifest(
     }
     assert viking_fs.files["viking://resources/gear/gear.stp"] == b"solid gear"
     manifest = json.loads(viking_fs.files["viking://resources/gear/manifest.json"])
-    assert manifest["schema"] == "openviking.resource-bundle/v1"
+    assert manifest["schema"] == "openviking.resource-bundle/v2"
     assert manifest["kind"] == "step"
     assert manifest["source"]["path"] == "gear.stp"
     assert manifest["source"]["sha256"] == hashlib.sha256(b"solid gear").hexdigest()
+    assert manifest["artifacts"]["source"] == {
+        "path": "gear.stp",
+        "schema": "step",
+        "sha256": hashlib.sha256(b"solid gear").hexdigest(),
+    }
     lock.close.assert_awaited_once()
 
 
 @pytest.mark.asyncio
-async def test_bundle_index_tags_manifest_without_sidecars(
+async def test_dwg_bundle_publishes_complete_artifact_inventory(tmp_path, monkeypatch, ctx):
+    source = tmp_path / "plan.dwg"
+    source.write_bytes(b"dwg snapshot")
+    viking_fs = _BundleFS()
+    service = _bundle_service(viking_fs)
+    lock = _Lock()
+    service._plan_resource_target = AsyncMock(return_value=("viking://resources/plan", lock))
+    service._summarize_bundle_staging = AsyncMock(return_value={})
+
+    async def no_parent_bundle(*_args, **_kwargs):
+        return None
+
+    async def parse_dwg(_parser, _source, **_kwargs):
+        staging = "viking://temp/job/plan_dwg"
+        files = {
+            "plan.dwg": b"dwg snapshot",
+            "beam_topology.json": b'{"schema":"deterministic-dwg-topology-v2"}',
+            "drawing_text.json": b'{"schema":"deterministic-dwg-text-v1"}',
+            ".abstract.md": b"plan abstract",
+            ".overview.md": b"plan overview",
+            "preview.png": b"png",
+        }
+        for name, content in files.items():
+            viking_fs.files[f"{staging}/{name}"] = content
+        return SimpleNamespace(
+            temp_dir_path="viking://temp/job",
+            meta={"temp_root_uri": staging},
+        )
+
+    monkeypatch.setattr(resource_service_module, "find_resource_bundle_root", no_parent_bundle)
+    monkeypatch.setattr("openviking.parse.parsers.dwg.DWGParser.parse", parse_dwg)
+
+    result = await service.add_resource(
+        path=str(source),
+        ctx=ctx,
+        to="viking://resources/plan",
+        bundle=True,
+        build_index=False,
+    )
+
+    root = "viking://resources/plan"
+    assert result["semantic_status"] == "complete"
+    assert set(viking_fs.files) == {
+        f"{root}/plan.dwg",
+        f"{root}/beam_topology.json",
+        f"{root}/drawing_text.json",
+        f"{root}/.abstract.md",
+        f"{root}/.overview.md",
+        f"{root}/preview.png",
+        f"{root}/manifest.json",
+    }
+    manifest = json.loads(viking_fs.files[f"{root}/manifest.json"])
+    assert set(manifest["artifacts"]) == {
+        "source",
+        "beam_topology",
+        "drawing_text",
+        "abstract",
+        "overview",
+        "preview",
+    }
+    assert all(
+        {"path", "schema", "sha256"} <= artifact.keys()
+        for artifact in manifest["artifacts"].values()
+    )
+    assert not any(path.endswith("libredwg.json") for path in viking_fs.files)
+
+
+@pytest.mark.asyncio
+async def test_dwg_bundle_failure_leaves_no_published_tree(tmp_path, monkeypatch, ctx):
+    source = tmp_path / "plan.dwg"
+    source.write_bytes(b"dwg snapshot")
+    viking_fs = _BundleFS()
+    service = _bundle_service(viking_fs)
+    lock = _Lock()
+    service._plan_resource_target = AsyncMock(return_value=("viking://resources/plan", lock))
+    service._summarize_bundle_staging = AsyncMock(side_effect=RuntimeError("semantic failed"))
+
+    async def no_parent_bundle(*_args, **_kwargs):
+        return None
+
+    async def parse_dwg(_parser, _source, **_kwargs):
+        staging = "viking://temp/job/plan_dwg"
+        viking_fs.files[f"{staging}/plan.dwg"] = b"dwg snapshot"
+        return SimpleNamespace(
+            temp_dir_path="viking://temp/job",
+            meta={"temp_root_uri": staging},
+        )
+
+    monkeypatch.setattr(resource_service_module, "find_resource_bundle_root", no_parent_bundle)
+    monkeypatch.setattr("openviking.parse.parsers.dwg.DWGParser.parse", parse_dwg)
+
+    with pytest.raises(RuntimeError, match="semantic failed"):
+        await service.add_resource(
+            path=str(source),
+            ctx=ctx,
+            to="viking://resources/plan",
+            bundle=True,
+            build_index=False,
+        )
+
+    assert not any(path.startswith("viking://resources/plan") for path in viking_fs.files)
+    assert not any(path.startswith("viking://temp/job") for path in viking_fs.files)
+    lock.close.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_bundle_indexes_every_searchable_artifact(
     tmp_path,
     monkeypatch,
     ctx,
@@ -164,17 +342,14 @@ async def test_bundle_index_tags_manifest_without_sidecars(
     viking_fs = _BundleFS()
     service = _bundle_service(viking_fs)
     lock = _Lock()
-    service._plan_resource_target = AsyncMock(
-        return_value=("viking://resources/scene", lock)
-    )
+    service._plan_resource_target = AsyncMock(return_value=("viking://resources/scene", lock))
 
     async def no_parent_bundle(*_args, **_kwargs):
         return None
 
-    queue = SimpleNamespace(enqueue=AsyncMock())
-    queue_manager = SimpleNamespace(EMBEDDING="embedding", get_queue=lambda _name: queue)
+    index = AsyncMock()
     monkeypatch.setattr(resource_service_module, "find_resource_bundle_root", no_parent_bundle)
-    monkeypatch.setattr(resource_service_module, "get_queue_manager", lambda: queue_manager)
+    monkeypatch.setattr(resource_service_module, "index_resource", index)
 
     result = await service.add_resource(
         path=str(source),
@@ -185,15 +360,10 @@ async def test_bundle_index_tags_manifest_without_sidecars(
     )
 
     assert result["vector_status"] == "queued"
-    assert queue.enqueue.await_count == 1
-    messages = [call.args[0] for call in queue.enqueue.await_args_list]
-    assert [message.context_data["uri"] for message in messages] == [
-        "viking://resources/scene/manifest.json",
-    ]
-    assert [message.context_data["level"] for message in messages] == [2]
-    assert all(
-        message.context_data["search_tags"] == [RESOURCE_BUNDLE_DISCOVERY_TAG, "kind=glb"]
-        for message in messages
+    index.assert_awaited_once_with(
+        "viking://resources/scene",
+        ctx,
+        scalar_override={"search_tags": ["kind=glb"]},
     )
     assert set(viking_fs.files) == {
         "viking://resources/scene/scene.glb",
@@ -208,17 +378,17 @@ async def test_bundle_keeps_its_snapshot_if_indexing_fails(tmp_path, monkeypatch
     viking_fs = _BundleFS()
     service = _bundle_service(viking_fs)
     lock = _Lock()
-    service._plan_resource_target = AsyncMock(
-        return_value=("viking://resources/gear", lock)
-    )
+    service._plan_resource_target = AsyncMock(return_value=("viking://resources/gear", lock))
 
     async def no_parent_bundle(*_args, **_kwargs):
         return None
 
-    queue = SimpleNamespace(enqueue=AsyncMock(side_effect=RuntimeError("queue offline")))
-    queue_manager = SimpleNamespace(EMBEDDING="embedding", get_queue=lambda _name: queue)
     monkeypatch.setattr(resource_service_module, "find_resource_bundle_root", no_parent_bundle)
-    monkeypatch.setattr(resource_service_module, "get_queue_manager", lambda: queue_manager)
+    monkeypatch.setattr(
+        resource_service_module,
+        "index_resource",
+        AsyncMock(side_effect=RuntimeError("queue offline")),
+    )
 
     with pytest.raises(RuntimeError, match="queue offline"):
         await service.add_resource(
@@ -237,7 +407,7 @@ async def test_bundle_keeps_its_snapshot_if_indexing_fails(tmp_path, monkeypatch
 
 
 @pytest.mark.asyncio
-async def test_find_resource_returns_one_system_tagged_discovery_card_per_bundle(ctx):
+async def test_find_resource_expands_child_hits_and_uses_each_bundle_maximum(monkeypatch, ctx):
     class _SearchFS:
         def __init__(self):
             self.calls = []
@@ -245,85 +415,75 @@ async def test_find_resource_returns_one_system_tagged_discovery_card_per_bundle
         async def find(self, **kwargs):
             self.calls.append(kwargs)
             assert kwargs["filter"] == {
-                "op": "and",
-                "conds": [
-                    {
-                        "op": "and",
-                        "conds": [
-                            {"op": "must", "field": "context_type", "conds": ["resource"]},
-                            {"op": "must", "field": "search_tags", "conds": ["kind=step"]},
-                        ],
-                    },
-                    {
-                        "op": "must",
-                        "field": "search_tags",
-                        "conds": [RESOURCE_BUNDLE_DISCOVERY_TAG],
-                    },
-                ],
+                "op": "must",
+                "field": "search_tags",
+                "conds": ["kind=step"],
             }
+            resources = [
+                MatchedContext(
+                    uri="viking://resources/a/manifest.json",
+                    context_type=ContextType.RESOURCE,
+                    score=0.4,
+                ),
+                MatchedContext(
+                    uri="viking://resources/a/preview.png",
+                    context_type=ContextType.RESOURCE,
+                    score=0.9,
+                    match_reason="image match",
+                ),
+                MatchedContext(
+                    uri="viking://resources/b/drawing_text.json",
+                    context_type=ContextType.RESOURCE,
+                    score=0.7,
+                ),
+                MatchedContext(
+                    uri="viking://resources/plain/readme.md",
+                    context_type=ContextType.RESOURCE,
+                    score=0.95,
+                ),
+            ]
             return FindResult(
                 memories=[],
                 skills=[],
-                resources=[
-                    MatchedContext(
-                        uri="viking://resources/a/manifest.json",
-                        context_type=ContextType.RESOURCE,
-                        score=0.9,
-                        match_reason="manifest match",
-                    ),
-                    MatchedContext(
-                        uri="viking://resources/b/manifest.json",
-                        context_type=ContextType.RESOURCE,
-                        score=0.7,
-                    ),
-                ],
+                resources=resources[: kwargs["limit"]],
             )
 
     viking_fs = _SearchFS()
+
+    async def root_for_match(_viking_fs, uri, **_kwargs):
+        if "/a/" in uri:
+            return "viking://resources/a"
+        if "/b/" in uri:
+            return "viking://resources/b"
+        return None
+
+    monkeypatch.setattr(search_service_module, "find_resource_bundle_root", root_for_match)
     result = await SearchService(viking_fs=viking_fs).find_resource(
         query="blue gear",
         ctx=ctx,
         limit=2,
-        filter={
-            "op": "and",
-            "conds": [
-                {"op": "must", "field": "context_type", "conds": ["resource"]},
-                {"op": "must", "field": "search_tags", "conds": ["kind=step"]},
-            ],
-        },
+        filter={"op": "must", "field": "search_tags", "conds": ["kind=step"]},
     )
 
-    assert viking_fs.calls[0]["level"] == [2]
-    assert viking_fs.calls[0]["limit"] == 2
+    assert [call["limit"] for call in viking_fs.calls] == [2, 4]
+    assert all(call["level"] == [0, 1, 2] for call in viking_fs.calls)
     assert result == {
         "resources": [
             {
                 "uri": "viking://resources/a",
                 "score": 0.9,
-                "matched_uri": "viking://resources/a/manifest.json",
-                "match_reason": "manifest match",
+                "matched_uri": "viking://resources/a/preview.png",
+                "match_reason": "image match",
             },
             {
                 "uri": "viking://resources/b",
                 "score": 0.7,
-                "matched_uri": "viking://resources/b/manifest.json",
+                "matched_uri": "viking://resources/b/drawing_text.json",
                 "match_reason": "",
             },
         ],
         "total": 2,
     }
-
-
-@pytest.mark.asyncio
-async def test_user_cannot_set_the_system_discovery_tag(ctx):
-    coordinator = ContentWriteCoordinator(viking_fs=object())
-
-    with pytest.raises(InvalidArgumentError, match="system-owned"):
-        await coordinator.set_tags(
-            uri="viking://resources/plain/readme.md",
-            tags=[RESOURCE_BUNDLE_DISCOVERY_TAG],
-            ctx=ctx,
-        )
 
 
 @pytest.mark.asyncio
@@ -594,6 +754,30 @@ async def test_persist_temp_tree_runs_preflight_then_uses_raw_copy(ctx):
         recursive=True,
         fs_ctx={"account_id": ctx.account_id},
     )
+
+
+@pytest.mark.asyncio
+async def test_persist_atomic_bundle_uses_native_move(ctx):
+    viking_fs = VikingFS.__new__(VikingFS)
+    viking_fs._async_agfs = AsyncMock()
+    temp_uri = viking_fs.create_temp_uri(ctx=ctx)
+    viking_fs._ensure_atomic_bundle_write_allowed = AsyncMock()
+    viking_fs._ensure_parent_dirs = AsyncMock()
+    target_uri = "viking://resources/scene"
+
+    await viking_fs.persist_temp_tree(
+        temp_uri,
+        target_uri,
+        ctx=ctx,
+        _allow_atomic_bundle_write=True,
+    )
+
+    viking_fs._async_agfs.mv.assert_awaited_once_with(
+        viking_fs._uri_to_path(temp_uri, ctx=ctx),
+        viking_fs._uri_to_path(target_uri, ctx=ctx),
+        fs_ctx={"account_id": ctx.account_id},
+    )
+    viking_fs._async_agfs.cp.assert_not_awaited()
 
 
 @pytest.mark.asyncio

@@ -56,6 +56,7 @@ class SemanticMsg:
     is_code_repo: bool = False
     target_preexisting: Optional[bool] = None
     precomputed_semantics: bool = False
+    bundle_assembly: bool = False
     coalesce_key: str = ""
     coalesce_version: int = 0
     changes: Optional[Dict[str, List[str]]] = (
@@ -78,6 +79,7 @@ class SemanticMsg:
         is_code_repo: bool = False,
         target_preexisting: Optional[bool] = None,
         precomputed_semantics: bool = False,
+        bundle_assembly: bool = False,
         coalesce_key: str = "",
         coalesce_version: int = 0,
         changes: Optional[Dict[str, List[str]]] = None,
@@ -97,6 +99,7 @@ class SemanticMsg:
         self.is_code_repo = is_code_repo
         self.target_preexisting = target_preexisting
         self.precomputed_semantics = precomputed_semantics
+        self.bundle_assembly = bundle_assembly
         self.coalesce_key = coalesce_key
         self.coalesce_version = coalesce_version
         self.changes = changes
@@ -141,6 +144,7 @@ class SemanticMsg:
             is_code_repo=data.get("is_code_repo", False),
             target_preexisting=data.get("target_preexisting"),
             precomputed_semantics=data.get("precomputed_semantics", False),
+            bundle_assembly=data.get("bundle_assembly", False),
             coalesce_key=data.get("coalesce_key", ""),
             coalesce_version=data.get("coalesce_version", 0),
             changes=data.get("changes"),

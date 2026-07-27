@@ -282,3 +282,36 @@ async def test_semantic_processor_lock_error_requeues_without_circuit_breaker(mo
     assert requeue_called is True
     assert success_called is True
     assert error_called is False
+
+
+@pytest.mark.asyncio
+async def test_bundle_semantic_error_is_terminal_without_requeue(monkeypatch):
+    processor = SemanticProcessor()
+    reenqueue_calls = []
+    errors = []
+    processor.set_callbacks(
+        lambda: None,
+        lambda: None,
+        lambda message, _data=None: errors.append(message),
+    )
+
+    async def _reenqueue(msg):
+        reenqueue_calls.append(msg.uri)
+
+    monkeypatch.setattr(processor, "_reenqueue_semantic_msg", _reenqueue)
+    monkeypatch.setattr(
+        "openviking.storage.queuefs.semantic_processor.SemanticLockScope.resolve",
+        lambda *args, **kwargs: (_ for _ in ()).throw(LockAcquisitionError("lock unavailable")),
+    )
+
+    await processor.on_dequeue(
+        SemanticMsg(
+            uri="viking://temp/job/plan_dwg",
+            context_type="resource",
+            recursive=True,
+            bundle_assembly=True,
+        ).to_dict()
+    )
+
+    assert reenqueue_calls == []
+    assert errors == ["lock unavailable"]
