@@ -9,19 +9,19 @@ An explicitly marked, opt-in resource directory that represents one source asset
 _Avoid_: atomic folder, leaf node, leaf folder
 
 **Bundle Manifest**:
-The required immutable root-level `manifest.json` of an atomic resource bundle. It marks the bundle, acts as the source asset card, and carries a Manifest Schema, exactly one Resource Kind, and the original asset's path, hash, and ingestion time.
-_Avoid_: optional metadata file, directory-name convention
+The required root-level `manifest.json` that marks an atomic resource bundle and inventories the sealed package. It carries a Manifest Schema, exactly one Resource Kind, source identity, and each derived artifact's role, path, schema, and hash.
+_Avoid_: optional metadata file, source-only card, directory-name convention
 
 **Bundle Boundary**:
 The complete subtree rooted at an atomic resource bundle. It may contain ordinary directories but cannot contain another Bundle Manifest.
 _Avoid_: nested bundle, package hierarchy
 
 **Bundle Ingestion**:
-The opt-in creation of an immutable atomic resource bundle through `add-resource(bundle=true)`. The target URI names the bundle root; ingestion derives the Resource Kind from the original artifact's suffix, rejecting an extensionless source, then creates its Bundle Manifest and original artifact without running a parser.
-_Avoid_: separate bundle upload API, implicit bundle creation
+The opt-in creation of an immutable atomic resource bundle through `add-resource(bundle=true)`. The target URI names the bundle root; ingestion preserves the original artifact and may run its format parser to add derived artifacts before publishing the bundle.
+_Avoid_: separate bundle upload API, implicit bundle creation, parser-free bundle
 
 **Bundle Snapshot**:
-The immutable source manifest and artifact inventory created by Bundle Ingestion. Replacing content creates a new bundle; move and removal operate on the complete Bundle Boundary.
+The source manifest and artifact inventory sealed by Bundle Ingestion. Replacing content creates a new bundle; move and removal operate on the complete Bundle Boundary.
 _Avoid_: mutable resource package, partial bundle update
 
 **Index Tag**:
@@ -44,8 +44,12 @@ _Avoid_: resource discovery, model download
 An artifact that can be reliably text-interpreted, including JSON or STEP; a binary artifact needs a deterministic text projection before it is searchable. V1 uses ordinary `grep` over the bundle root.
 _Avoid_: text sidecar
 
+**STEP Evidence**:
+A deterministic JSON artifact derived only from the complete geometry and header of one STEP source. It excludes neighboring modeling-history files and experimental benchmark outputs.
+_Avoid_: timeline evidence, STEP summary, benchmark evidence pack
+
 **Manifest Schema**:
-The versioned identifier for a manifest's machine-readable layout. The initial Bundle Manifest uses `openviking.resource-bundle/v1`.
+The versioned identifier for a manifest's machine-readable layout. New Bundle Manifests use `openviking.resource-bundle/v2`; readers retain compatibility with `v1`.
 _Avoid_: implicit JSON shape, parser version
 
 **Resource Kind**:

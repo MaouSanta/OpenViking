@@ -49,6 +49,7 @@ _PORTABLE_SCALAR_FIELDS = frozenset(
         "name",
         "description",
         "tags",
+        "search_tags",
         "abstract",
     }
 )
@@ -555,6 +556,7 @@ async def vectorize_file(
 async def index_resource(
     uri: str,
     ctx: RequestContext,
+    scalar_override: Optional[Dict[str, Any]] = None,
 ) -> None:
     """
     Build vector index for a resource directory.
@@ -589,7 +591,17 @@ async def index_resource(
         overview = content.decode("utf-8") if isinstance(content, bytes) else content
 
     if abstract or overview:
-        await vectorize_directory_meta(uri, abstract, overview, context_type=context_type, ctx=ctx)
+        await vectorize_directory_meta(
+            uri,
+            abstract,
+            overview,
+            context_type=context_type,
+            ctx=ctx,
+            scalar_overrides={
+                int(ContextLevel.ABSTRACT.value): scalar_override or {},
+                int(ContextLevel.OVERVIEW.value): scalar_override or {},
+            },
+        )
 
     # 2. Index Files
     try:
@@ -615,6 +627,7 @@ async def index_resource(
                 parent_uri=uri,
                 context_type=context_type,
                 ctx=ctx,
+                scalar_override=scalar_override,
             )
 
     except Exception as e:

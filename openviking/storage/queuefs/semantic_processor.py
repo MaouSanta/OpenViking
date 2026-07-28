@@ -336,6 +336,14 @@ class SemanticProcessor(DequeueHandlerBase):
             try:
                 self._circuit_breaker.check()
             except CircuitBreakerOpen:
+                if msg.bundle_assembly:
+                    error = RuntimeError("Semantic generation circuit breaker is open")
+                    self._merge_request_stats(msg.telemetry_id, error_count=1)
+                    get_request_wait_tracker().mark_semantic_failed(
+                        msg.telemetry_id, msg.id, str(error)
+                    )
+                    self.report_error(str(error), data)
+                    return None
                 logger.warning(
                     f"Circuit breaker is open, re-enqueueing semantic message: {msg.uri}"
                 )
@@ -450,7 +458,7 @@ class SemanticProcessor(DequeueHandlerBase):
                                 run_uri,
                                 executor.get_stats(),
                             )
-                            if not executor.stale:
+                            if not executor.stale and not msg.bundle_assembly:
                                 await self._enqueue_parent_refresh(msg, target_uri or msg.uri)
                     finally:
                         if not lock_transferred:
@@ -464,6 +472,12 @@ class SemanticProcessor(DequeueHandlerBase):
                     reset_root_observability_context(root_context_token)
 
         except Exception as e:
+            if msg is not None and msg.bundle_assembly:
+                logger.error("Bundle semantic assembly failed without retry: %s", e, exc_info=True)
+                self._merge_request_stats(msg.telemetry_id, error_count=1)
+                get_request_wait_tracker().mark_semantic_failed(msg.telemetry_id, msg.id, str(e))
+                self.report_error(str(e), data)
+                return None
             if isinstance(e, LockAcquisitionError):
                 logger.warning(
                     "Lock error processing semantic message, re-enqueueing without "

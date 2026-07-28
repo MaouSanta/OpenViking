@@ -24,6 +24,7 @@ from openviking.parse.parsers.markdown import MarkdownParser
 from openviking.parse.parsers.media import AudioParser, ImageParser, VideoParser
 from openviking.parse.parsers.pdf import PDFParser
 from openviking.parse.parsers.powerpoint import PowerPointParser
+from openviking.parse.parsers.step import STEPParser
 from openviking.parse.parsers.text import TextParser
 from openviking.parse.parsers.word import WordParser
 from openviking.parse.parsers.zip_parser import ZipParser
@@ -74,6 +75,7 @@ class ParserRegistry:
         self.register("epub", EPubParser(config=self._parser_configs.get("epub")))
         self.register("zip", ZipParser())
         self.register("directory", DirectoryParser())
+        self.register("step", STEPParser())
 
         self.register("image", ImageParser(config=self._parser_configs.get("image")))
         self.register("audio", AudioParser())
