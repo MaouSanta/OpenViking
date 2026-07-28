@@ -821,6 +821,7 @@ const zhCN = {
       imageFailed: '图片加载失败。',
       imageLoading: '正在加载图片...',
       largeFileSkipped: '文件较大，默认不自动加载。',
+      loadFormattedText: '加载格式化文本',
       loadingContent: '正在读取内容...',
       loadingEditor: '加载编辑器...',
       markdownPreview: '预览',

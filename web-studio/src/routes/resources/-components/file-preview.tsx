@@ -19,6 +19,7 @@ import {
   beautifyJson,
   formatSize,
   normalizeReadContent,
+  shouldAutoRead,
 } from '../-lib/normalize'
 import { fetchDirectoryLevelContent, saveFileContent } from '../-lib/api'
 import {
@@ -1028,19 +1029,21 @@ export function FilePreview({
   showCloseButton = true,
 }: FilePreviewProps) {
   const { t } = useTranslation('resources')
+  const codeLanguage = detectCodeLanguage(file?.name || '')
+  const isJsonFile = codeLanguage === 'json'
   const previewQuery = useVikingFilePreview(
     file,
     {
       maxAutoReadBytes: 2 * 1024 * 1024,
       defaultReadLimit: -1,
+      requireKnownSize: isJsonFile,
     },
     {
       raw: true,
     },
   )
   const preview = previewQuery.preview
-  const codeLanguage = detectCodeLanguage(file?.name || '')
-  const isJson = preview?.fileType === 'code' && codeLanguage === 'json'
+  const isJson = preview?.fileType === 'code' && isJsonFile
   const displayContent = useMemo(() => {
     const content = memoryFieldsDisplayContent(preview?.content || '')
     return isJson ? beautifyJson(content) : content
@@ -1054,13 +1057,18 @@ export function FilePreview({
   >(new Set(['abstract', 'overview']))
   const [editing, setEditing] = useState(false)
   const [jsonHighlight, setJsonHighlight] = useState(false)
+  const [jsonManuallyLoaded, setJsonManuallyLoaded] = useState(false)
   const [saving, setSaving] = useState(false)
   const editorRef = useRef<CodeEditorHandle>(null)
   const { invalidatePreview } = useInvalidateVikingFs()
+  const jsonPreviewReady =
+    isJson && (preview.shouldAutoRead || jsonManuallyLoaded)
 
   const canEdit =
-    !file?.isDir &&
-    preview?.shouldAutoRead &&
+    !!file &&
+    !file.isDir &&
+    !!preview &&
+    shouldAutoRead(file).shouldRead &&
     (preview.fileType === 'code' ||
       preview.fileType === 'markdown' ||
       preview.fileType === 'jsonl' ||
@@ -1070,6 +1078,7 @@ export function FilePreview({
     setMarkdownMode('preview')
     setEditing(false)
     setJsonHighlight(false)
+    setJsonManuallyLoaded(false)
     setActiveDirectoryLevels(new Set(['abstract', 'overview']))
   }, [file?.uri])
 
@@ -1090,7 +1099,7 @@ export function FilePreview({
   const [highlightedCodeHtml, setHighlightedCodeHtml] = useState('')
 
   const needsHighlight =
-    (preview?.fileType === 'code' && !isJson) ||
+    (preview?.fileType === 'code' && (!isJson || jsonHighlight)) ||
     (preview?.fileType === 'markdown' && markdownMode === 'source')
 
   useEffect(() => {
@@ -1198,6 +1207,19 @@ export function FilePreview({
     }
   }
 
+  const handleEdit = async () => {
+    if (!preview?.shouldAutoRead) {
+      const result = await previewQuery.refetch()
+      if (!result.isSuccess) return
+    }
+    setEditing(true)
+  }
+
+  const handleLoadJson = async () => {
+    const result = await previewQuery.refetch()
+    if (result.isSuccess) setJsonManuallyLoaded(true)
+  }
+
   if (!file) {
     return (
       <div className="flex h-full items-center justify-center text-sm text-muted-foreground">
@@ -1260,7 +1282,17 @@ export function FilePreview({
               </div>
             ) : (
               <div className="flex items-center gap-1">
-                {isJson && preview.shouldAutoRead ? (
+                {canEdit ? (
+                  <Button
+                    size="sm"
+                    variant="ghost"
+                    onClick={() => void handleEdit()}
+                  >
+                    <Pencil className="mr-1 size-3.5" />
+                    {t('filePreview.edit')}
+                  </Button>
+                ) : null}
+                {jsonPreviewReady ? (
                   <Button
                     size="sm"
                     variant="ghost"
@@ -1271,16 +1303,6 @@ export function FilePreview({
                         ? 'filePreview.plainText'
                         : 'filePreview.highlight',
                     )}
-                  </Button>
-                ) : null}
-                {canEdit ? (
-                  <Button
-                    size="sm"
-                    variant="ghost"
-                    onClick={() => setEditing(true)}
-                  >
-                    <Pencil className="mr-1 size-3.5" />
-                    {t('filePreview.edit')}
                   </Button>
                 ) : null}
               </div>
@@ -1314,24 +1336,6 @@ export function FilePreview({
               initialContent={preview.content}
               filename={file.name}
               isDark={isDark}
-            />
-          </Suspense>
-        </div>
-      ) : jsonHighlight && isJson && preview.shouldAutoRead ? (
-        <div className="h-full min-h-0 p-2">
-          <Suspense
-            fallback={
-              <div className="flex h-full items-center justify-center text-sm text-muted-foreground">
-                <Loader2 className="mr-2 size-4 animate-spin" />
-                {t('filePreview.loadingEditor')}
-              </div>
-            }
-          >
-            <LazyCodeEditor
-              initialContent={displayContent}
-              filename={file.name}
-              isDark={isDark}
-              readOnly
             />
           </Suspense>
         </div>
@@ -1488,11 +1492,27 @@ export function FilePreview({
             preview &&
             !file.isDir &&
             preview.fileType !== 'image' &&
-            !preview.shouldAutoRead ? (
-              <div className="text-sm text-muted-foreground">
-                {preview.reason === 'binary'
-                  ? t('filePreview.unsupportedBinary')
-                  : t('filePreview.largeFileSkipped')}
+            !preview.shouldAutoRead &&
+            !(isJson && jsonManuallyLoaded) ? (
+              <div className="space-y-2 text-sm text-muted-foreground">
+                <div>
+                  {preview.reason === 'binary'
+                    ? t('filePreview.unsupportedBinary')
+                    : t('filePreview.largeFileSkipped')}
+                </div>
+                {isJson ? (
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    disabled={previewQuery.isFetching}
+                    onClick={() => void handleLoadJson()}
+                  >
+                    {previewQuery.isFetching ? (
+                      <Loader2 className="mr-1 size-3.5 animate-spin" />
+                    ) : null}
+                    {t('filePreview.loadFormattedText')}
+                  </Button>
+                ) : null}
               </div>
             ) : null}
 
@@ -1555,9 +1575,9 @@ export function FilePreview({
 
             {!previewQuery.isLoading &&
             preview?.fileType === 'code' &&
-            preview.shouldAutoRead ? (
+            (preview.shouldAutoRead || jsonPreviewReady) ? (
               <pre className="overflow-auto whitespace-pre-wrap break-words rounded-md border bg-muted/20 p-3 text-xs leading-6">
-                {isJson ? (
+                {isJson && !jsonHighlight ? (
                   displayContent || emptyFileText
                 ) : (
                   <code

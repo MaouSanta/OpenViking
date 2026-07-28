@@ -850,6 +850,7 @@ const en = {
       imageFailed: 'Image failed to load.',
       imageLoading: 'Loading image...',
       largeFileSkipped: 'This file is large and was not loaded automatically.',
+      loadFormattedText: 'Load formatted text',
       loadingContent: 'Reading content...',
       loadingEditor: 'Loading editor...',
       markdownPreview: 'Preview',

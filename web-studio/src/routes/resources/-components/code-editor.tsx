@@ -99,14 +99,10 @@ interface CodeEditorProps {
   initialContent: string
   filename: string
   isDark?: boolean
-  readOnly?: boolean
 }
 
 export const CodeEditor = forwardRef<CodeEditorHandle, CodeEditorProps>(
-  function CodeEditor(
-    { initialContent, filename, isDark = false, readOnly = false },
-    ref,
-  ) {
+  function CodeEditor({ initialContent, filename, isDark = false }, ref) {
     const containerRef = useRef<HTMLDivElement>(null)
     const viewRef = useRef<EditorView | null>(null)
 
@@ -133,8 +129,6 @@ export const CodeEditor = forwardRef<CodeEditorHandle, CodeEditorProps>(
           autocompletion(),
           highlightSelectionMatches(),
           syntaxHighlighting(defaultHighlightStyle, { fallback: true }),
-          EditorState.readOnly.of(readOnly),
-          EditorView.editable.of(!readOnly),
           keymap.of([
             ...closeBracketsKeymap,
             ...defaultKeymap,
@@ -190,7 +184,7 @@ export const CodeEditor = forwardRef<CodeEditorHandle, CodeEditorProps>(
         viewRef.current?.destroy()
         viewRef.current = null
       }
-    }, [filename, isDark, initialContent, readOnly])
+    }, [filename, isDark, initialContent])
 
     return (
       <div
