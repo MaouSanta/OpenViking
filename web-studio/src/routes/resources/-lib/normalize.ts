@@ -46,6 +46,7 @@ const IMAGE_EXTS = [
   'avif',
 ]
 const MARKDOWN_EXTS = ['md', 'markdown', 'mdx']
+const MODEL3D_EXTS = ['step', 'stp']
 const JSONL_EXTS = ['jsonl', 'ndjson']
 const DRAWING_2D_EXTS = ['dwg']
 const CODE_EXTS = [
@@ -255,6 +256,9 @@ export function detectFileType(uri: string): VikingFileType {
   if (IMAGE_EXTS.includes(ext)) {
     return 'image'
   }
+  if (MODEL3D_EXTS.includes(ext)) {
+    return 'model3d'
+  }
   if (MARKDOWN_EXTS.includes(ext)) {
     return 'markdown'
   }
@@ -299,7 +303,11 @@ export function shouldAutoRead(
   }
 
   const fileType = detectFileType(entry.uri)
-  if (fileType === 'image' || isLikelyBinary(entry.uri)) {
+  if (
+    fileType === 'image' ||
+    fileType === 'model3d' ||
+    isLikelyBinary(entry.uri)
+  ) {
     return { shouldRead: false, reason: 'binary' }
   }
 

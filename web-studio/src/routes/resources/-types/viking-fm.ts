@@ -1,6 +1,7 @@
 export type VikingFileType =
   | 'directory'
   | 'image'
+  | 'model3d'
   | 'markdown'
   | 'jsonl'
   | 'drawing2d'
