@@ -892,10 +892,6 @@ class ResourceService:
         """
         self._ensure_initialized()
         self._validate_add_resource_tag_policy(tags=tags, tag_mode=tag_mode)
-        ingest_tag_kwargs = self._add_resource_ingest_tag_kwargs(
-            tags=tags,
-            tag_mode=tag_mode,
-        )
         normalized_args = self._normalize_add_resource_args(args, watch_interval=watch_interval)
         kwargs.update(normalized_args.processor_kwargs)
         if watch_interval > 0 and kwargs.get("temp_file_id"):
@@ -934,14 +930,13 @@ class ResourceService:
             watch_interval=watch_interval,
             connector_args=args or {},
             kwargs=kwargs,
+            tags=tags,
         ):
             return await self._add_resource_via_connector(
                 path=path,
                 ctx=ctx,
                 to=to,
                 reason=reason,
-                tags=tags,
-                tag_mode=tag_mode,
                 connector_args=args or {},
                 **kwargs,
             )
@@ -1020,6 +1015,10 @@ class ResourceService:
         request_wait_tracker = get_request_wait_tracker()
         job_enqueued = False
         deferred_lock: LockLease = NO_LOCK
+        ingest_tag_kwargs = self._add_resource_ingest_tag_kwargs(
+            tags=tags,
+            tag_mode=tag_mode,
+        )
         if telemetry_id:
             request_wait_tracker.register_request(telemetry_id)
         watch_manager = self._get_watch_manager()
@@ -1474,6 +1473,7 @@ class ResourceService:
         watch_interval: float = 0,
         connector_args: Optional[Dict[str, Any]] = None,
         kwargs: Optional[Dict[str, Any]] = None,
+        tags: Optional[List[str]] = None,
     ) -> bool:
         """Decide whether a top-level resource path belongs to Connector.
 
@@ -1561,6 +1561,7 @@ class ResourceService:
             kwargs=kwargs or {},
             to=to,
             parent=parent,
+            tags=tags,
         )
         if not unsupported:
             return True
@@ -1591,6 +1592,7 @@ class ResourceService:
         kwargs: Dict[str, Any],
         to: Optional[str] = None,
         parent: Optional[str] = None,
+        tags: Optional[List[str]] = None,
     ) -> List[str]:
         """add_resource params the Connector delegation cannot honor.
 
@@ -1631,6 +1633,8 @@ class ResourceService:
             unsupported.append("directly_upload_media=false")
         if kwargs.get("source_name"):
             unsupported.append("source_name")
+        if tags is not None:
+            unsupported.append("tags (Connector imports cannot apply ingestion tags yet)")
         supported_args = CONNECTOR_SUPPORTED_ARGS.get(
             add_type, frozenset()
         ) | CONNECTOR_CREDENTIAL_ARGS.get(add_type, frozenset())
@@ -1648,8 +1652,6 @@ class ResourceService:
         ctx: RequestContext,
         to: Optional[str],
         reason: str = "",
-        tags: Optional[List[str]] = None,
-        tag_mode: str = "replace",
         connector_args: Optional[Dict[str, Any]] = None,
         **kwargs: Any,
     ) -> Dict[str, Any]:
@@ -1792,8 +1794,6 @@ class ResourceService:
             ctx=ctx,
             reason=reason,
             link_root_uri=task_resource_id or "viking://resources",
-            tags=tags,
-            tag_mode=tag_mode,
         )
 
         background = asyncio.create_task(monitor)
@@ -1819,8 +1819,6 @@ class ResourceService:
         ctx: RequestContext,
         reason: str = "",
         link_root_uri: str = "",
-        tags: Optional[List[str]] = None,
-        tag_mode: str = "replace",
     ) -> Dict[str, Any]:
         """Poll the Connector task until terminal state, then update OV TaskRecord.
 
