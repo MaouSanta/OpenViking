@@ -328,9 +328,9 @@ class AsyncOpenViking:
         summarize: bool = False,
         watch_interval: float = 0,
         args: Optional[Dict[str, Any]] = None,
+        telemetry: TelemetryRequest = False,
         tags: Optional[List[str]] = None,
         tag_mode: str = "replace",
-        telemetry: TelemetryRequest = False,
         **kwargs,
     ) -> Dict[str, Any]:
         """
