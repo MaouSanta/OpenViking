@@ -161,7 +161,13 @@ def test_bundle_marker_reads_v1_and_requires_a_v2_artifact_inventory():
                 "sha256": "a" * 64,
                 "ingested_at": "2026-07-23T00:00:00+00:00",
             },
-            "artifacts": {"source": {"path": "model.step", "schema": "step", "sha256": "a" * 64}},
+            "artifacts": {
+                "source": {
+                    "path": "model.step",
+                    "schema": "application/step",
+                    "sha256": "a" * 64,
+                }
+            },
         }
     )
 
@@ -175,13 +181,13 @@ def test_bundle_kind_tag_is_applied_to_each_embedding_message():
 
 
 @pytest.mark.asyncio
-async def test_add_resource_bundle_writes_only_source_and_manifest(
+async def test_add_raw_resource_bundle_writes_only_source_and_manifest(
     tmp_path,
     monkeypatch,
     ctx,
 ):
-    source = tmp_path / "gear.stp"
-    source.write_bytes(b"solid gear")
+    source = tmp_path / "gear.glb"
+    source.write_bytes(b"glTF gear")
     viking_fs = _BundleFS()
     service = _bundle_service(viking_fs)
     lock = _lease()
@@ -205,23 +211,23 @@ async def test_add_resource_bundle_writes_only_source_and_manifest(
     )
 
     assert result["root_uri"] == "viking://resources/gear"
-    assert result["kind"] == "step"
+    assert result["kind"] == "glb"
     assert result["semantic_status"] == "skipped"
     assert result["vector_status"] == "skipped"
     assert set(viking_fs.files) == {
-        "viking://resources/gear/gear.stp",
+        "viking://resources/gear/gear.glb",
         "viking://resources/gear/manifest.json",
     }
-    assert viking_fs.files["viking://resources/gear/gear.stp"] == b"solid gear"
+    assert viking_fs.files["viking://resources/gear/gear.glb"] == b"glTF gear"
     manifest = json.loads(viking_fs.files["viking://resources/gear/manifest.json"])
     assert manifest["schema"] == "openviking.resource-bundle/v2"
-    assert manifest["kind"] == "step"
-    assert manifest["source"]["path"] == "gear.stp"
-    assert manifest["source"]["sha256"] == hashlib.sha256(b"solid gear").hexdigest()
+    assert manifest["kind"] == "glb"
+    assert manifest["source"]["path"] == "gear.glb"
+    assert manifest["source"]["sha256"] == hashlib.sha256(b"glTF gear").hexdigest()
     assert manifest["artifacts"]["source"] == {
-        "path": "gear.stp",
-        "schema": "step",
-        "sha256": hashlib.sha256(b"solid gear").hexdigest(),
+        "path": "gear.glb",
+        "schema": "glb",
+        "sha256": hashlib.sha256(b"glTF gear").hexdigest(),
     }
     service._release_lock_ref.assert_awaited_once_with(lock)
 
@@ -375,8 +381,8 @@ async def test_bundle_indexes_every_searchable_artifact(
 
 @pytest.mark.asyncio
 async def test_bundle_keeps_its_snapshot_if_indexing_fails(tmp_path, monkeypatch, ctx):
-    source = tmp_path / "gear.stp"
-    source.write_bytes(b"solid gear")
+    source = tmp_path / "gear.glb"
+    source.write_bytes(b"glTF gear")
     viking_fs = _BundleFS()
     service = _bundle_service(viking_fs)
     lock = _lease()
@@ -401,10 +407,94 @@ async def test_bundle_keeps_its_snapshot_if_indexing_fails(tmp_path, monkeypatch
         )
 
     assert set(viking_fs.files) == {
-        "viking://resources/gear/gear.stp",
+        "viking://resources/gear/gear.glb",
         "viking://resources/gear/manifest.json",
     }
     assert viking_fs.removed == []
+    service._release_lock_ref.assert_awaited_once_with(lock)
+
+
+@pytest.mark.asyncio
+async def test_step_bundle_publishes_flat_evidence_and_six_views(
+    tmp_path,
+    monkeypatch,
+    ctx,
+):
+    source = tmp_path / "gear.stp"
+    source.write_bytes(b"step snapshot")
+    viking_fs = _BundleFS()
+    service = _bundle_service(viking_fs)
+    lock = _lease()
+    service._plan_resource_target = AsyncMock(
+        return_value=("viking://resources/gear", lock)
+    )
+    service._summarize_bundle_staging = AsyncMock(return_value={})
+
+    async def no_parent_bundle(*_args, **_kwargs):
+        return None
+
+    async def parse_step(_parser, _source, **_kwargs):
+        staging = "viking://temp/job/gear_step"
+        files = {
+            "gear.stp": b"step snapshot",
+            "evidence.json": b'{"schema":"openviking.step-evidence/v1"}',
+            ".abstract.md": b"gear abstract",
+            ".overview.md": b"gear overview",
+            "front.png": b"front",
+            "top.png": b"top",
+            "right.png": b"right",
+            "iso_front_top.png": b"iso_front_top",
+            "iso_back_top.png": b"iso_back_top",
+            "iso_front_bottom.png": b"iso_front_bottom",
+        }
+        for name, content in files.items():
+            viking_fs.files[f"{staging}/{name}"] = content
+        return SimpleNamespace(
+            temp_dir_path="viking://temp/job",
+            meta={"temp_root_uri": staging},
+        )
+
+    monkeypatch.setattr(resource_service_module, "find_resource_bundle_root", no_parent_bundle)
+    monkeypatch.setattr("openviking.parse.parsers.step.STEPParser.parse", parse_step)
+
+    result = await service.add_resource(
+        path=str(source),
+        ctx=ctx,
+        to="viking://resources/gear",
+        bundle=True,
+        build_index=False,
+    )
+
+    assert result["semantic_status"] == "complete"
+    root = "viking://resources/gear"
+    assert {path.removeprefix(f"{root}/") for path in viking_fs.files} == {
+        "gear.stp",
+        "evidence.json",
+        ".abstract.md",
+        ".overview.md",
+        "front.png",
+        "top.png",
+        "right.png",
+        "iso_front_top.png",
+        "iso_back_top.png",
+        "iso_front_bottom.png",
+        "manifest.json",
+    }
+    manifest = json.loads(viking_fs.files[f"{root}/manifest.json"])
+    assert manifest["schema"] == "openviking.resource-bundle/v2"
+    assert set(manifest["artifacts"]) == {
+        "source",
+        "evidence",
+        "abstract",
+        "overview",
+        "view_front",
+        "view_top",
+        "view_right",
+        "view_iso_front_top",
+        "view_iso_back_top",
+        "view_iso_front_bottom",
+    }
+    assert manifest["artifacts"]["evidence"]["schema"] == "openviking.step-evidence/v1"
     service._release_lock_ref.assert_awaited_once_with(lock)
 
 

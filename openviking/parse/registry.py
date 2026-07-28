@@ -27,6 +27,7 @@ from openviking.parse.parsers.media import AudioParser, ImageParser, VideoParser
 from openviking.parse.parsers.media.utils import is_mpeg_ts, read_mpeg_ts_probe
 from openviking.parse.parsers.pdf import PDFParser
 from openviking.parse.parsers.powerpoint import PowerPointParser
+from openviking.parse.parsers.step import STEPParser
 from openviking.parse.parsers.text import TextParser
 from openviking.parse.parsers.word import WordParser
 from openviking.parse.parsers.zip_parser import ZipParser
@@ -71,6 +72,7 @@ class ParserRegistry:
         self._register("zip", ZipParser())
         self._register("directory", DirectoryParser())
         self._register("dwg", DWGParser())
+        self._register("step", STEPParser())
 
         self._register("image", ImageParser(config=self._parser_configs.get("image")))
         self._register("audio", AudioParser())

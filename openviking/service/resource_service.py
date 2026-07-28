@@ -794,23 +794,22 @@ class ResourceService:
                 tracker.cleanup(telemetry_id)
                 unregister_telemetry(telemetry_id)
 
-    async def _dwg_bundle_artifacts(
+    async def _parsed_bundle_artifacts(
         self,
         staging_uri: str,
         *,
         source_name: str,
         source_sha256: str,
+        kind: str,
+        derived: Dict[str, tuple[str, str]],
         ctx: RequestContext,
     ) -> Dict[str, Dict[str, str]]:
         specs = {
-            "source": (source_name, "dwg"),
-            "beam_topology": ("beam_topology.json", "deterministic-dwg-topology-v2"),
-            "drawing_text": ("drawing_text.json", "deterministic-dwg-text-v1"),
+            "source": (source_name, kind),
+            **derived,
             "abstract": (".abstract.md", "openviking.semantic/l0"),
             "overview": (".overview.md", "openviking.semantic/l1"),
         }
-        if await self._viking_fs.exists(f"{staging_uri}/preview.png", ctx=ctx):
-            specs["preview"] = ("preview.png", "png")
         artifacts = {}
         for role, (name, schema) in specs.items():
             content = await self._viking_fs.read_file_bytes(f"{staging_uri}/{name}", ctx=ctx)
@@ -820,7 +819,9 @@ class ResourceService:
                 "sha256": hashlib.sha256(content).hexdigest(),
             }
         if artifacts["source"]["sha256"] != source_sha256:
-            raise RuntimeError("Parsed DWG source snapshot does not match the bundle source")
+            raise RuntimeError(
+                f"Parsed {kind.upper()} source snapshot does not match the bundle source"
+            )
         return artifacts
 
     async def _add_atomic_resource_bundle(
@@ -895,32 +896,53 @@ class ResourceService:
 
             source_uri = f"{root_uri}/{stored_name}"
             manifest_uri = f"{root_uri}/{RESOURCE_BUNDLE_MANIFEST}"
-            if kind == "dwg":
-                from openviking.parse.parsers.dwg import DWGParser
+            if kind in {"dwg", "step"}:
+                if kind == "dwg":
+                    from openviking.parse.parsers.dwg import DWGParser
+
+                    parser = DWGParser()
+                    derived = {
+                        "beam_topology": (
+                            "beam_topology.json",
+                            "deterministic-dwg-topology-v2",
+                        ),
+                        "drawing_text": (
+                            "drawing_text.json",
+                            "deterministic-dwg-text-v1",
+                        ),
+                    }
+                else:
+                    from openviking.parse.parsers.step import (
+                        STEP_EVIDENCE_SCHEMA,
+                        VIEWS,
+                        STEPParser,
+                    )
+
+                    parser = STEPParser()
+                    derived = {
+                        "evidence": ("evidence.json", STEP_EVIDENCE_SCHEMA),
+                        **{f"view_{name}": (f"{name}.png", "png") for name in VIEWS},
+                    }
 
                 with self._viking_fs.bind_request_context(ctx):
-                    parsed = await DWGParser().parse(source_file, source_name=stored_name)
+                    parsed = await parser.parse(source_file, source_name=stored_name)
                 staging_parent = parsed.temp_dir_path
                 staging_uri = str(parsed.meta.get("temp_root_uri") or "")
                 if not staging_parent or not staging_uri:
-                    raise RuntimeError("DWG parser did not produce a staging bundle")
+                    raise RuntimeError(
+                        f"{kind.upper()} parser did not produce a staging bundle"
+                    )
                 await self._summarize_bundle_staging(staging_uri, ctx=ctx, timeout=timeout)
-                artifacts = await self._dwg_bundle_artifacts(
+                if kind == "dwg" and await self._viking_fs.exists(
+                    f"{staging_uri}/preview.png", ctx=ctx
+                ):
+                    derived["preview"] = ("preview.png", "png")
+                artifacts = await self._parsed_bundle_artifacts(
                     staging_uri,
                     source_name=stored_name,
                     source_sha256=source_sha256,
-                    ctx=ctx,
-                )
-                manifest = build_manifest(
                     kind=kind,
-                    source_path=stored_name,
-                    sha256=source_sha256,
-                    ingested_at=ingested_at,
-                    artifacts=artifacts,
-                )
-                await self._viking_fs.write_file(
-                    f"{staging_uri}/{RESOURCE_BUNDLE_MANIFEST}",
-                    serialize_manifest(manifest),
+                    derived=derived,
                     ctx=ctx,
                 )
                 semantic_status = "complete"
@@ -932,13 +954,6 @@ class ResourceService:
                         "sha256": source_sha256,
                     }
                 }
-                manifest = build_manifest(
-                    kind=kind,
-                    source_path=stored_name,
-                    sha256=source_sha256,
-                    ingested_at=ingested_at,
-                    artifacts=artifacts,
-                )
                 staging_parent = self._viking_fs.create_temp_uri(ctx=ctx)
                 staging_uri = f"{staging_parent}/bundle"
                 await self._viking_fs.mkdir(staging_uri, ctx=ctx)
@@ -947,11 +962,18 @@ class ResourceService:
                     source_bytes,
                     ctx=ctx,
                 )
-                await self._viking_fs.write_file(
-                    f"{staging_uri}/{RESOURCE_BUNDLE_MANIFEST}",
-                    serialize_manifest(manifest),
-                    ctx=ctx,
-                )
+            manifest = build_manifest(
+                kind=kind,
+                source_path=stored_name,
+                sha256=source_sha256,
+                ingested_at=ingested_at,
+                artifacts=artifacts,
+            )
+            await self._viking_fs.write_file(
+                f"{staging_uri}/{RESOURCE_BUNDLE_MANIFEST}",
+                serialize_manifest(manifest),
+                ctx=ctx,
+            )
             await self._viking_fs.persist_temp_tree(
                 staging_uri,
                 root_uri,

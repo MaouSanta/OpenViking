@@ -17,8 +17,8 @@ The complete subtree rooted at an atomic resource bundle. It may contain ordinar
 _Avoid_: nested bundle, package hierarchy
 
 **Bundle Ingestion**:
-The explicit creation of an atomic resource bundle through `add-resource(bundle=true)`. The target URI names the bundle root; ingestion preserves the original artifact and may run its format parser to add derived artifacts before publishing the bundle.
-_Avoid_: raw-only upload, parser-free bundle
+The explicit, opt-in creation of an immutable atomic resource bundle through `add-resource(bundle=true)`. The target URI names the bundle root; ingestion preserves the original artifact and may run its format parser to add derived artifacts before publishing the bundle.
+_Avoid_: separate bundle upload API, implicit bundle creation, raw-only upload, parser-free bundle
 
 **Bundle Snapshot**:
 The source manifest and artifact inventory sealed by Bundle Ingestion. Replacing content creates a new bundle; move and removal operate on the complete Bundle Boundary.
@@ -51,6 +51,10 @@ _Avoid_: drawing summary, VLM navigation, OCR transcript
 **Searchable Artifact**:
 An artifact that can be reliably text-interpreted, including JSON or STEP; a binary artifact needs a deterministic text projection before it is searchable. V1 uses ordinary `grep` over the bundle root.
 _Avoid_: text sidecar
+
+**STEP Evidence**:
+A deterministic JSON artifact derived only from the complete geometry and header of one STEP source. It excludes neighboring modeling-history files and experimental benchmark outputs.
+_Avoid_: timeline evidence, STEP summary, benchmark evidence pack
 
 **Manifest Schema**:
 The versioned identifier for a manifest's machine-readable layout. New Bundle Manifests use `openviking.resource-bundle/v2`; readers retain compatibility with `v1`.

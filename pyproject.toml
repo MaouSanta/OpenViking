@@ -45,6 +45,7 @@ dependencies = [
     "charset-normalizer>=3.4,<4",
     "python-docx>=1.0.0",
     "olefile>=0.47",
+    "cadquery>=2.6.1",
     "xlrd>=2.0.1",
     "python-pptx>=1.0.0",
     "openpyxl>=3.0.0",
