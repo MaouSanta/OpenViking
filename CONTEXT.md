@@ -40,6 +40,14 @@ _Avoid_: resource discovery, model download
 A resource processed by its extension parser, which may persist derived artifacts and semantic navigation. It may also be an Atomic Resource Bundle when those artifacts must be discovered and managed as one resource unit.
 _Avoid_: raw-only resource
 
+**DWG Source**:
+The unchanged `.dwg` file inside a DWG Atomic Resource Bundle. Its exact child URI, rather than a filename reconstructed from the bundle root, identifies the bytes used for download and preview.
+_Avoid_: generated drawing, bundle URI, preview artifact
+
+**Drawing Preview**:
+A transient, read-only browser rendering of a DWG Source for visual verification. It may report missing fonts, images, or external references and never replaces the DWG Source or becomes a Bundle artifact.
+_Avoid_: CAD editor, source of truth, derived bundle artifact
+
 **Beam Topology Index**:
 A deterministic derived DWG artifact that binds beam labels to available geometric and dimensional evidence while preserving confidence states and source-object references. It covers beam topology only, not the complete drawing.
 _Avoid_: DWG topology, complete drawing model, source of truth

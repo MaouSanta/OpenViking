@@ -1,0 +1,161 @@
+{
+  "schema": "openviking.dwg-preview-corpus/v1",
+  "paths_relative_to": "external AutoCAD corpus root",
+  "selected_at": "2026-08-01",
+  "selection_rules": [
+    "Split by SHA-256 so fidelity and heldout drawings never share bytes.",
+    "Fidelity covers every ACAD header family present in the corpus.",
+    "Heldout covers size extremes, non-ASCII paths, and two distinct drawings with the same basename."
+  ],
+  "acceptance": {
+    "all": [
+      "No uncaught error, page crash, or blank-success state.",
+      "Finish as ready or a visible error within 120 seconds.",
+      "Never persist converted preview data or mutate the Resource Bundle."
+    ],
+    "fidelity": [
+      "Open read-only and produce a non-empty canvas.",
+      "Pan, wheel zoom, and fit-to-drawing remain usable.",
+      "A trusted CAD application screenshot must be manually approved before claiming visual fidelity."
+    ],
+    "heldout": [
+      "Keep file identity by URI and SHA-256 even when basenames collide.",
+      "Report missing fonts, images, or external references as incomplete, not correct."
+    ]
+  },
+  "fidelity": [
+    {
+      "id": "F01",
+      "path": "AutoCAD - Project B/B图纸/B图纸/生产厂房1电气/A-11-PL-JDB_t3.dwg",
+      "bytes": 17476823,
+      "sha256": "f748807fcec03027c770d0d3c089b5aa0f38d67e4284bcfcedfd35eb5b40595c",
+      "acad_header": "AC1015",
+      "acad_family": "AutoCAD 2000/2000i/2002",
+      "golden_reference": null
+    },
+    {
+      "id": "F02",
+      "path": "AutoCAD - Project B/B项目施工设计图/土建/B设计结构施工图-20220812.dwg",
+      "bytes": 6224847,
+      "sha256": "2a5271cf43830fa7bc46fb3d5a6158b9d4476654dfe4c13b4169d12968c2b963",
+      "acad_header": "AC1018",
+      "acad_family": "AutoCAD 2004/2005/2006",
+      "golden_reference": null
+    },
+    {
+      "id": "F03",
+      "path": "AutoCAD - Project B/B图纸/B图纸/生产厂房1电气/11 系统图 配电.dwg",
+      "bytes": 14318848,
+      "sha256": "f2e409f4c31a673933f16cebc397a396f44eccf5c436d642df9cf744164a499e",
+      "acad_header": "AC1021",
+      "acad_family": "AutoCAD 2007/2008/2009",
+      "golden_reference": null
+    },
+    {
+      "id": "F04",
+      "path": "AutoCAD - Project B/B图纸/B2图纸/结构-生产厂房1.dwg",
+      "bytes": 6240548,
+      "sha256": "a61510975873c612ddc63c4ff907a6f732a455866b7d2c415ad1799cdb7bdf11",
+      "acad_header": "AC1024",
+      "acad_family": "AutoCAD 2010/2011/2012",
+      "golden_reference": null
+    },
+    {
+      "id": "F05",
+      "path": "AutoCAD - Project B/B图纸/B建筑图/B图纸/建筑-生产厂房一_JDB_t3.dwg",
+      "bytes": 23291525,
+      "sha256": "046380f1f4fe06ddfcd8256f49362fd40935492ec9048b68f74623d5b81901be",
+      "acad_header": "AC1027",
+      "acad_family": "AutoCAD 2013-2017",
+      "golden_reference": null
+    },
+    {
+      "id": "F06",
+      "path": "AutoCAD - Project A/CAD/A项目结构结构施工图.dwg",
+      "bytes": 2245501,
+      "sha256": "413bd73b7ec3e8cd83c13b1467535390514f1e286fcb56d403bc66d55a4c27ef",
+      "acad_header": "AC1032",
+      "acad_family": "AutoCAD 2018+",
+      "golden_reference": null
+    }
+  ],
+  "heldout": [
+    {
+      "id": "H01",
+      "path": "AutoCAD - Project B/B图纸/B图纸/建筑-生产厂房一_JDB_t3.dwg",
+      "bytes": 92618641,
+      "sha256": "ab8760314f635e9d15e8332782957adcb039b2029d5e8814dc2de1ca1d9ea862",
+      "acad_header": "AC1015",
+      "acad_family": "AutoCAD 2000/2000i/2002"
+    },
+    {
+      "id": "H02",
+      "path": "AutoCAD - Project B/B图纸/B图纸/供氢站建筑.dwg",
+      "bytes": 393818,
+      "sha256": "278c2b8cef98c6e0cf9bcaf5ff55348daeaa2326af138bbd15185ce8baa38582",
+      "acad_header": "AC1018",
+      "acad_family": "AutoCAD 2004/2005/2006"
+    },
+    {
+      "id": "H03",
+      "path": "AutoCAD - Project A/CAD/260603【视频监控及二次安防】A.dwg",
+      "bytes": 3269105,
+      "sha256": "eec3c596e6726aee5f3542ae48a8ed5bcd60c754bdd6cf3e7d0e484c3762a126",
+      "acad_header": "AC1018",
+      "acad_family": "AutoCAD 2004/2005/2006"
+    },
+    {
+      "id": "H04",
+      "path": "AutoCAD - Project A/CAD/1234栋 楼梯5-20 修1（208）.dwg",
+      "bytes": 663136,
+      "sha256": "54483f8d20106a9830fa394c72c56638c83c1e7849a71277434b58fd59c1b4ef",
+      "acad_header": "AC1021",
+      "acad_family": "AutoCAD 2007/2008/2009"
+    },
+    {
+      "id": "H05",
+      "path": "AutoCAD - Project B/B图纸/B2图纸/生产厂房2电气/12-SP.dwg",
+      "bytes": 4718528,
+      "sha256": "986076e05a2f7d1c89d15793e605ce2c58a1b123e4d46c3697aa0716a98102d1",
+      "acad_header": "AC1021",
+      "acad_family": "AutoCAD 2007/2008/2009"
+    },
+    {
+      "id": "H06",
+      "path": "AutoCAD - Project B/B图纸/B图纸/暖通-DWG-HV-12.dwg",
+      "bytes": 32275980,
+      "sha256": "14833ff05381616766d7d4331282138880212dcafea8a75acd144990e0b0bfb6",
+      "acad_header": "AC1027",
+      "acad_family": "AutoCAD 2013-2017"
+    },
+    {
+      "id": "H07",
+      "path": "AutoCAD - Project B/B图纸/B配电系统图/（终改）11#厂房一次系统图.dwg",
+      "bytes": 21722322,
+      "sha256": "229a6dc49cd4ada35be18b7590c3d4caea788615969eb7c7eb3c4b429ac1390c",
+      "acad_header": "AC1027",
+      "acad_family": "AutoCAD 2013-2017"
+    },
+    {
+      "id": "H08",
+      "path": "AutoCAD - Project B/B图纸/电缆铺设图/变电站10kV配电装置布局.dwg",
+      "bytes": 732033,
+      "sha256": "2f157f63292b5df615559a86136b46c023aba13620be703cd17b51043dc6384c",
+      "acad_header": "AC1027",
+      "acad_family": "AutoCAD 2013-2017"
+    },
+    {
+      "id": "H09",
+      "path": "AutoCAD - Project B/B图纸/B配电系统图/变电站10kV配电装置布局.dwg",
+      "bytes": 651681,
+      "sha256": "cf1121db7acae8008b03bbd14f26ecdfa659bf8eba48b169f84125a52ac796ee",
+      "acad_header": "AC1027",
+      "acad_family": "AutoCAD 2013-2017"
+    }
+  ],
+  "split_validation": {
+    "fidelity_unique_sha256": 6,
+    "heldout_unique_sha256": 9,
+    "cross_set_sha256_overlap": 0
+  }
+}

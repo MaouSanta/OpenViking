@@ -865,6 +865,21 @@ const en = {
       save: 'Save',
       selectDirectoryContext: 'Select a chip to show folder context.',
       unsupportedBinary: 'Binary files do not support text preview.',
+      dwg: {
+        canvas: 'Interactive DWG drawing',
+        disabled: 'DWG preview is not enabled in this build.',
+        failed: 'This DWG drawing could not be previewed.',
+        fit: 'Fit drawing',
+        incomplete:
+          'Some fonts, images, or external references are missing. The preview may be incomplete.',
+        loading: 'Loading, parsing, and rendering DWG drawing...',
+        ready: 'Drag to pan · scroll to zoom',
+        reload:
+          'A previous DWG parser did not stop. Refresh the page before previewing another drawing.',
+        timeout: 'DWG preview timed out before rendering completed.',
+        tooLarge: 'DWG files larger than 25 MiB cannot be previewed safely.',
+        workers: 'The DWG preview workers are unavailable.',
+      },
       jsonl: {
         collapse: 'Collapse',
         dialogMode: 'Dialog',

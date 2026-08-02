@@ -47,6 +47,7 @@ const IMAGE_EXTS = [
 ]
 const MARKDOWN_EXTS = ['md', 'markdown', 'mdx']
 const JSONL_EXTS = ['jsonl', 'ndjson']
+const DRAWING_2D_EXTS = ['dwg']
 const CODE_EXTS = [
   'js',
   'ts',
@@ -260,6 +261,9 @@ export function detectFileType(uri: string): VikingFileType {
   if (JSONL_EXTS.includes(ext)) {
     return 'jsonl'
   }
+  if (DRAWING_2D_EXTS.includes(ext)) {
+    return 'drawing2d'
+  }
   if (CODE_EXTS.includes(ext)) {
     return 'code'
   }
@@ -279,7 +283,7 @@ export function isLikelyBinary(uri: string): boolean {
   const name = fileNameFromUri(uri).toLowerCase()
   const ext = name.includes('.') ? name.split('.').pop() || '' : ''
 
-  return BINARY_EXTS.includes(ext)
+  return DRAWING_2D_EXTS.includes(ext) || BINARY_EXTS.includes(ext)
 }
 
 export function shouldAutoRead(

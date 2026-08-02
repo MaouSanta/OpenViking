@@ -3,6 +3,7 @@ export type VikingFileType =
   | 'image'
   | 'markdown'
   | 'jsonl'
+  | 'drawing2d'
   | 'code'
   | 'text'
   | 'binary'
