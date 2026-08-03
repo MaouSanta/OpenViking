@@ -867,17 +867,33 @@ const en = {
       unsupportedBinary: 'Binary files do not support text preview.',
       dwg: {
         canvas: 'Interactive DWG drawing',
+        checkingSize: 'Checking DWG file size...',
         disabled: 'DWG preview is not enabled in this build.',
         failed: 'This DWG drawing could not be previewed.',
         fit: 'Fit drawing',
         incomplete:
           'Some fonts, images, or external references are missing. The preview may be incomplete.',
         loading: 'Loading, parsing, and rendering DWG drawing...',
+        manualLoad: 'Load anyway',
+        manualLoadDescription:
+          'The file exceeds the 5 MiB automatic preview limit or its size is unknown. DWG complexity cannot be predicted reliably from file size; continuing may use several GiB of memory and temporarily make the page unresponsive.',
+        manualLoadTitle: 'This drawing will not load automatically',
+        partial:
+          'The preview is incomplete; currently available content remains visible.',
+        progress: {
+          convert: 'Converting drawing data...',
+          download: 'Downloading the original DWG...',
+          font: 'Loading drawing fonts...',
+          parse: 'Parsing DWG...',
+          render:
+            'Generating graphics; completed content is already visible...',
+        },
         ready: 'Drag to pan · scroll to zoom',
         reload:
           'A previous DWG parser did not stop. Refresh the page before previewing another drawing.',
         timeout: 'DWG preview timed out before rendering completed.',
-        tooLarge: 'DWG files larger than 25 MiB cannot be previewed safely.',
+        tooLarge:
+          'DWG files larger than the 25 MiB hard limit cannot be loaded in this viewer.',
         workers: 'The DWG preview workers are unavailable.',
       },
       jsonl: {
