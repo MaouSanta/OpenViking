@@ -3940,12 +3940,29 @@ class VikingFS:
             )
         src_path = self._uri_to_path(temp_uri, ctx=ctx)
         dst_path = self._uri_to_path(target_uri, ctx=ctx)
-        fs_ctx = self._pathlock_fs_ctx(ctx, lease_ref)
         await self._ensure_parent_dirs(dst_path, ctx=ctx, lease_ref=lease_ref)
-        fs_ctx = fs_ctx or {"account_id": self._ctx_or_default(ctx).account_id}
         if _allow_atomic_bundle_write:
-            await self._async_agfs.mv(src_path, dst_path, fs_ctx=fs_ctx)
+            # Keep the tree-lock marker outside the subtree renamed into the bundle root.
+            src_lock_path = src_path.rstrip("/").rsplit("/", 1)[0] or "/"
+            publish_lease = await self._async_agfs.pathlock_acquire_batch(
+                [
+                    {"path": src_lock_path, "kind": "tree"},
+                    {"path": dst_path, "kind": "exact"},
+                ],
+                owner_lease_ref=lease_ref,
+            )
+            try:
+                await self._async_agfs.mv(
+                    src_path,
+                    dst_path,
+                    fs_ctx=self._pathlock_fs_ctx(ctx, publish_lease),
+                )
+            finally:
+                await self._async_agfs.pathlock_release(publish_lease)
         else:
+            fs_ctx = self._pathlock_fs_ctx(ctx, lease_ref) or {
+                "account_id": self._ctx_or_default(ctx).account_id
+            }
             await self._async_agfs.cp(src_path, dst_path, recursive=True, fs_ctx=fs_ctx)
 
     async def delete_temp(

@@ -42,7 +42,6 @@ class BaseClient(ABC):
         instruction: str = "",
         wait: bool = False,
         timeout: Optional[float] = None,
-        bundle: bool = False,
         watch_interval: float = 0,
         processing_mode: str = "semantic_and_vectors",
         args: Optional[Dict[str, Any]] = None,
@@ -50,6 +49,7 @@ class BaseClient(ABC):
         add_type: Optional[str] = None,
         tags: Optional[List[str]] = None,
         tag_mode: str = "replace",
+        bundle: bool = False,
     ) -> Dict[str, Any]:
         """Add resource to OpenViking.
 

@@ -1114,7 +1114,6 @@ class ResourceService:
         build_index: bool = True,
         summarize: bool = False,
         processing_mode: ProcessingMode = DEFAULT_PROCESSING_MODE,
-        bundle: bool = False,
         watch_interval: float = 0,
         tags: Optional[List[str]] = None,
         tag_mode: str = "replace",
@@ -1122,6 +1121,7 @@ class ResourceService:
         enforce_public_remote_targets: bool = False,
         add_type: Optional[str] = None,
         args: Optional[Dict[str, Any]] = None,
+        bundle: bool = False,
         **kwargs,
     ) -> Dict[str, Any]:
         """Accept and route a new resource-add request."""
@@ -1209,7 +1209,6 @@ class ResourceService:
         build_index: bool = True,
         summarize: bool = False,
         processing_mode: ProcessingMode = DEFAULT_PROCESSING_MODE,
-        bundle: bool = False,
         watch_interval: float = 0,
         manage_watch: bool = True,
         tags: Optional[List[str]] = None,
@@ -1217,6 +1216,7 @@ class ResourceService:
         allow_local_path_resolution: bool = True,
         enforce_public_remote_targets: bool = False,
         args: Optional[Dict[str, Any]] = None,
+        bundle: bool = False,
         **kwargs,
     ) -> Dict[str, Any]:
         """Validate and route one resource ingestion request.

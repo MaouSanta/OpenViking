@@ -642,7 +642,6 @@ class AsyncHTTPClient:
         exclude: Optional[str] = None,
         directly_upload_media: bool = True,
         preserve_structure: Optional[bool] = None,
-        bundle: bool = False,
         watch_interval: float = 0,
         args: Optional[Dict[str, Any]] = None,
         telemetry: Any = False,
@@ -650,6 +649,7 @@ class AsyncHTTPClient:
         add_type: Optional[str] = None,
         tags: Optional[List[str]] = None,
         tag_mode: str = "replace",
+        bundle: bool = False,
     ) -> Dict[str, Any]:
         if add_type is not None:
             add_type = add_type.strip() or None
@@ -1888,7 +1888,6 @@ class SyncHTTPClient:
         exclude: Optional[str] = None,
         directly_upload_media: bool = True,
         preserve_structure: Optional[bool] = None,
-        bundle: bool = False,
         watch_interval: float = 0,
         args: Optional[Dict[str, Any]] = None,
         telemetry: Any = False,
@@ -1896,6 +1895,7 @@ class SyncHTTPClient:
         add_type: Optional[str] = None,
         tags: Optional[List[str]] = None,
         tag_mode: str = "replace",
+        bundle: bool = False,
     ) -> Dict[str, Any]:
         return run_async(
             self._async_client.add_resource(

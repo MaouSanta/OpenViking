@@ -840,23 +840,39 @@ async def test_persist_temp_tree_runs_preflight_then_uses_raw_copy(ctx):
 async def test_persist_atomic_bundle_uses_native_move(ctx):
     viking_fs = VikingFS.__new__(VikingFS)
     viking_fs._async_agfs = AsyncMock()
-    temp_uri = viking_fs.create_temp_uri(ctx=ctx)
+    reservation_lease = _lease("bundle-reservation")
+    publish_lease = _lease("bundle-publish")
+    viking_fs._async_agfs.pathlock_acquire_batch.return_value = publish_lease
+    staging_uri = viking_fs.create_temp_uri(ctx=ctx)
+    temp_uri = f"{staging_uri}/bundle"
     viking_fs._ensure_atomic_bundle_write_allowed = AsyncMock()
     viking_fs._ensure_parent_dirs = AsyncMock()
     target_uri = "viking://resources/scene"
+    temp_path = viking_fs._uri_to_path(temp_uri, ctx=ctx)
+    staging_path = viking_fs._uri_to_path(staging_uri, ctx=ctx)
+    target_path = viking_fs._uri_to_path(target_uri, ctx=ctx)
 
     await viking_fs.persist_temp_tree(
         temp_uri,
         target_uri,
         ctx=ctx,
+        lease_ref=reservation_lease,
         _allow_atomic_bundle_write=True,
     )
 
-    viking_fs._async_agfs.mv.assert_awaited_once_with(
-        viking_fs._uri_to_path(temp_uri, ctx=ctx),
-        viking_fs._uri_to_path(target_uri, ctx=ctx),
-        fs_ctx={"account_id": ctx.account_id},
+    viking_fs._async_agfs.pathlock_acquire_batch.assert_awaited_once_with(
+        [
+            {"path": staging_path, "kind": "tree"},
+            {"path": target_path, "kind": "exact"},
+        ],
+        owner_lease_ref=reservation_lease,
     )
+    viking_fs._async_agfs.mv.assert_awaited_once_with(
+        temp_path,
+        target_path,
+        fs_ctx={"account_id": ctx.account_id, "lease_ref": publish_lease["lease_ref"]},
+    )
+    viking_fs._async_agfs.pathlock_release.assert_awaited_once_with(publish_lease)
     viking_fs._async_agfs.cp.assert_not_awaited()
 
 

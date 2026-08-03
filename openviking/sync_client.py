@@ -239,13 +239,13 @@ class SyncOpenViking:
         timeout: float = None,
         build_index: bool = True,
         summarize: bool = False,
-        bundle: bool = False,
         args: Optional[Dict[str, Any]] = None,
         telemetry: TelemetryRequest = False,
         processing_mode: str = "semantic_and_vectors",
         add_type: Optional[str] = None,
         tags: Optional[List[str]] = None,
         tag_mode: str = "replace",
+        bundle: bool = False,
         **kwargs,
     ) -> Dict[str, Any]:
         """Add resource to OpenViking (resources scope only)

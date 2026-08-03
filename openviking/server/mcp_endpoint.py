@@ -571,7 +571,6 @@ async def add_resource(
     temp_file_id: str = "",
     add_type: str = "",
     description: str = "",
-    bundle: bool = False,
     watch_interval: float = 0,
     processing_mode: ProcessingMode = DEFAULT_PROCESSING_MODE,
     to: str = "",
@@ -579,6 +578,7 @@ async def add_resource(
     tags: Optional[list[str]] = None,
     tag_mode: str = "replace",
     args: Optional[dict[str, Any]] = None,
+    bundle: bool = False,
 ) -> str:
     """Add a resource to OpenViking. Asynchronous — processing happens in the background.
 

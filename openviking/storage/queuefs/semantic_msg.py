@@ -10,6 +10,7 @@ from uuid import uuid4
 
 from openviking.utils.ingest_options import IngestOptions
 
+
 def build_semantic_coalesce_key(
     *,
     context_type: str,

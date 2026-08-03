@@ -326,7 +326,6 @@ class AsyncOpenViking:
         timeout: float = None,
         build_index: bool = True,
         summarize: bool = False,
-        bundle: bool = False,
         watch_interval: float = 0,
         args: Optional[Dict[str, Any]] = None,
         telemetry: TelemetryRequest = False,
@@ -334,6 +333,7 @@ class AsyncOpenViking:
         add_type: Optional[str] = None,
         tags: Optional[List[str]] = None,
         tag_mode: str = "replace",
+        bundle: bool = False,
         **kwargs,
     ) -> Dict[str, Any]:
         """
