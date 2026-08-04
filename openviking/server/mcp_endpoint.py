@@ -756,6 +756,7 @@ async def add_resource(
         processing_mode=processing_mode,
         tags=tags,
         tag_mode=tag_mode,
+        args=args,
     )
     base_url, url_source = _resolve_public_base_url()
     upload_url = f"{base_url}/api/v1/resources/temp_upload?token={quote(token, safe='')}"

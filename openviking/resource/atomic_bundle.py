@@ -84,7 +84,7 @@ def build_manifest(
     source_path: str,
     sha256: str,
     ingested_at: Any,
-    artifacts: dict[str, dict[str, str]],
+    artifacts: dict[str, dict[str, Any]],
 ) -> dict[str, Any]:
     """Build the V2 bundle identity and artifact inventory."""
     return {

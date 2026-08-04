@@ -528,6 +528,27 @@ async def test_add_resource_local_path_returns_upload_instruction(service):
     upload_token_store.clear()
 
 
+async def test_add_resource_local_path_binds_parser_args_to_upload_token(service, monkeypatch):
+    from openviking.server.upload_token_store import upload_token_store
+
+    captured = {}
+
+    def issue(*_args, **kwargs):
+        captured.update(kwargs)
+        return "ABC123", 2_000_000_000.0
+
+    monkeypatch.setattr(upload_token_store, "issue", issue)
+    result = await add_resource(
+        path="/tmp/drawing.png",
+        bundle=True,
+        args={"image_mode": "technical_drawing"},
+    )
+
+    assert "/api/v1/resources/temp_upload?token=ABC123" in result
+    assert captured["bundle"] is True
+    assert captured["args"] == {"image_mode": "technical_drawing"}
+
+
 async def test_add_resource_local_path_uses_env_var_when_set(service, monkeypatch):
     from openviking.server.upload_token_store import upload_token_store
 

@@ -1,0 +1,47 @@
+metadata:
+  id: "vision.technical_drawing_regions"
+  name: "Technical Drawing Region Recognition"
+  description: "Locate view-level semantic regions in a raster technical drawing"
+  version: "1.0.0"
+  language: "en"
+  category: "vision"
+
+variables: []
+
+template: |
+  Locate the view-level semantic regions in this raster technical engineering drawing sheet.
+
+  Allowed region types are exactly:
+  - view: an orthographic or otherwise unspecified drawing view
+  - section: a section or sectional view
+  - detail: an enlarged detail view
+  - isometric: an isometric or perspective view
+  - title_block: the drawing title block
+  - notes: a general notes area
+
+  Include the view geometry and the dimensions or leader notes that visibly belong to that
+  view. Regions may overlap. Do not split a view merely to avoid overlap, and do not mask or
+  remove neighboring pixels. Do not return individual dimensions, arrows, symbols, text
+  labels, the sheet border, or grid-zone cells as regions.
+
+  Every bbox must use normalized integer coordinates on a 0..1000 scale over the complete
+  source image: [x1, y1, x2, y2], with 0 <= x1 < x2 <= 1000 and
+  0 <= y1 < y2 <= 1000. Return at most 32 regions. label must be a short visible view label
+  such as "DETAIL A" or "SECTION B-B", or null when none is visible.
+
+  Return strict JSON with exactly this shape and no additional fields:
+  {
+    "regions": [
+      {
+        "type": "view",
+        "label": null,
+        "bbox": [100, 100, 400, 400]
+      }
+    ]
+  }
+
+  Output JSON only. Do not use Markdown fences and do not explain.
+
+llm_config:
+  temperature: 0.0
+  supports_vision: true

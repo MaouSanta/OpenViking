@@ -162,9 +162,9 @@ async def temp_upload(
     stored and its ``temp_file_id`` returned (used by the CLI and ``import_ovpack``). With a
     signed ``?token=`` — minted by the MCP ``add_resource`` tool for local-file paths — the
     server additionally finishes ingestion in-request: it resolves the upload, calls
-    ``add_resource`` with the token-bound ``to``/``reason``, and returns the final result, so
-    the agent never needs a second call. The ``?token=`` query param is consumed by the auth
-    dependency.
+    ``add_resource`` with the token-bound ``to``/``reason``/``args``, and returns the final
+    result, so the agent never needs a second call. The ``?token=`` query param is consumed
+    by the auth dependency.
     """
     signed = getattr(request.state, "signed_upload", None)
     effective_upload_mode = upload_mode or request.app.state.config.temp_upload.default_mode
@@ -184,6 +184,7 @@ async def temp_upload(
             tags=signed.tags,
             tag_mode=signed.tag_mode,
             bundle=signed.bundle,
+            args=signed.args,
         )
 
     try:

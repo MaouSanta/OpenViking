@@ -1,0 +1,69 @@
+metadata:
+  id: "semantic.bundle_overview_generation"
+  name: "Atomic Resource Bundle Overview Generation"
+  description: "Generate a compact, complete L1 overview for one atomic resource bundle"
+  version: "1.0.0"
+  language: "en"
+  category: "semantic"
+
+variables:
+  - name: "dir_name"
+    type: "string"
+    description: "Bundle directory name"
+    required: true
+
+  - name: "file_summaries"
+    type: "string"
+    description: "Numbered source and derived artifact summaries"
+    default: ""
+
+  - name: "children_abstracts"
+    type: "string"
+    description: "Child directory abstracts, when present"
+    default: ""
+
+  - name: "output_language"
+    type: "string"
+    description: "Language code for output"
+    required: true
+
+template: |
+  Output Language: {{ output_language }}
+  Write the entire overview consistently in {{ output_language }}.
+
+  Generate a compact overview for one Atomic Resource Bundle. Its files are the
+  source asset and derived evidence for that same asset, not independent documents.
+  Consolidate repeated facts across source and derived files.
+
+  [Bundle Name]
+  {{ dir_name }}
+
+  [Files and Their Summaries]
+  {{ file_summaries }}
+
+  [Subdirectories and Their Summaries]
+  {{ children_abstracts }}
+
+  Output Markdown with exactly this structure:
+
+  1. H1 title using the bundle name.
+
+  2. A 40-100 word plain-text brief immediately below the title. Explain the
+     asset as a whole and its main searchable facts.
+
+  3. H2 "{{ "区域与文件导航" if output_language == "zh-CN" else "Artifact Navigation" }}".
+     Include exactly one concise bullet for every numbered file above. Begin each
+     bullet with its [number] reference, then state its role and useful content.
+     Never omit a file and never merge multiple files into one bullet.
+
+  4. H2 "{{ "详细说明" if output_language == "zh-CN" else "Detailed Description" }}".
+     Use 2-4 semantic H3 topics that synthesize the asset, such as geometry and
+     views, dimensions and tolerances, manufacturing notes, or provenance. Do not
+     create one H3 per file and do not repeat the navigation list as prose.
+
+  Keep the complete document under 3200 characters. Prefer compact coverage over
+  exhaustive transcription. Preserve exact filenames through their [number]
+  references.
+
+llm_config:
+  temperature: 0.0

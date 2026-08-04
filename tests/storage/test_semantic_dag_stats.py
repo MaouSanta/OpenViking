@@ -21,16 +21,26 @@ class _FakeVikingFS:
     def __init__(self, tree):
         self._tree = tree
         self.writes = []
+        self._async_agfs = _FakePathLock()
 
     async def ls(self, uri, node_limit=None, ctx=None):
         del node_limit
         return self._tree.get(uri, [])
 
-    async def write_file(self, path, content, ctx=None, lock_handle=None):
+    async def write_file(self, path, content, ctx=None, lease_ref=None):
+        del ctx, lease_ref
         self.writes.append((path, content))
 
     def _uri_to_path(self, uri, ctx=None):
         return uri.replace("viking://", "/local/acc1/")
+
+
+class _FakePathLock:
+    async def pathlock_acquire_exact_batch(self, paths):
+        return {"paths": paths}
+
+    async def pathlock_release(self, lease):
+        del lease
 
 
 class _FakeProcessor:
@@ -48,8 +58,16 @@ class _FakeProcessor:
         return overview, "abstract"
 
     async def _vectorize_directory(
-        self, uri, context_type, abstract, overview, ctx=None, semantic_msg_id=None
+        self,
+        uri,
+        context_type,
+        abstract,
+        overview,
+        ctx=None,
+        semantic_msg_id=None,
+        ingest_options=None,
     ):
+        del context_type, abstract, overview, ctx, semantic_msg_id, ingest_options
         self.vectorized_dirs.append(uri)
 
     async def _vectorize_single_file(
@@ -61,7 +79,17 @@ class _FakeProcessor:
         ctx=None,
         semantic_msg_id=None,
         use_summary=False,
+        ingest_options=None,
     ):
+        del (
+            parent_uri,
+            context_type,
+            summary_dict,
+            ctx,
+            semantic_msg_id,
+            use_summary,
+            ingest_options,
+        )
         self.vectorized_files.append(file_path)
 
     async def _vectorize_directory_simple(self, uri, context_type, abstract, overview, ctx=None):
@@ -82,6 +110,29 @@ class _TrackingProcessor(_FakeProcessor):
             return {"name": file_path.split("/")[-1], "summary": "summary"}
         finally:
             self.active_summaries -= 1
+
+
+class _BundleProcessor(_FakeProcessor):
+    def __init__(self, generated_overview, normalized_overview=None):
+        super().__init__()
+        self.generated_overview = generated_overview
+        self.normalized_overview = normalized_overview or generated_overview
+        self.bundle_flags = []
+
+    async def _generate_overview(
+        self,
+        dir_uri,
+        file_summaries,
+        children_abstracts,
+        bundle_assembly=False,
+    ):
+        del dir_uri, file_summaries, children_abstracts
+        self.bundle_flags.append(bundle_assembly)
+        return self.generated_overview
+
+    def _normalize_overview_generation(self, overview):
+        del overview
+        return self.normalized_overview, "abstract"
 
 
 class _DummyTracker:
@@ -326,6 +377,81 @@ async def test_semantic_dag_skip_vectorization_does_not_schedule_tasks(monkeypat
     assert processor.vectorized_dirs == []
     assert processor.vectorized_files == []
     assert tracker.register_calls == []
+
+
+@pytest.mark.asyncio
+async def test_bundle_overview_writes_only_when_all_artifacts_fit(monkeypatch):
+    root_uri = "viking://resources/drawing"
+    tree = {
+        root_uri: [
+            {"name": "source.png", "isDir": False},
+            {"name": "region_001.png", "isDir": False},
+        ],
+    }
+    fake_fs = _FakeVikingFS(tree)
+    monkeypatch.setattr("openviking.storage.queuefs.semantic_dag.get_viking_fs", lambda: fake_fs)
+    processor = _BundleProcessor("# drawing\n\nsource.png\nregion_001.png")
+    ctx = RequestContext(user=UserIdentifier("acc1", "user1"), role=Role.USER)
+    executor = SemanticDagExecutor(
+        processor=processor,
+        context_type="resource",
+        max_concurrent_llm=2,
+        ctx=ctx,
+        skip_vectorization=True,
+        bundle_assembly=True,
+    )
+
+    await executor.run(root_uri)
+
+    assert processor.bundle_flags == [True]
+    assert fake_fs.writes == [
+        (f"{root_uri}/.overview.md", "# drawing\n\nsource.png\nregion_001.png"),
+        (f"{root_uri}/.abstract.md", "abstract"),
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("generated", "normalized", "error"),
+    [
+        ("source.png", "source.png", "omitted artifacts: region_001.png"),
+        (
+            "source.png\nregion_001.png\ntail",
+            "source.png\nregion_001.png",
+            "exceeds the configured size limit",
+        ),
+    ],
+)
+async def test_bundle_overview_rejects_missing_or_truncated_artifacts(
+    monkeypatch,
+    generated,
+    normalized,
+    error,
+):
+    root_uri = "viking://resources/drawing"
+    tree = {
+        root_uri: [
+            {"name": "source.png", "isDir": False},
+            {"name": "region_001.png", "isDir": False},
+        ],
+    }
+    fake_fs = _FakeVikingFS(tree)
+    monkeypatch.setattr("openviking.storage.queuefs.semantic_dag.get_viking_fs", lambda: fake_fs)
+    processor = _BundleProcessor(generated, normalized)
+    ctx = RequestContext(user=UserIdentifier("acc1", "user1"), role=Role.USER)
+    executor = SemanticDagExecutor(
+        processor=processor,
+        context_type="resource",
+        max_concurrent_llm=2,
+        ctx=ctx,
+        skip_vectorization=True,
+        bundle_assembly=True,
+    )
+
+    with pytest.raises(RuntimeError, match=error):
+        await executor.run(root_uri)
+
+    assert fake_fs.writes == []
 
 
 if __name__ == "__main__":

@@ -3,13 +3,16 @@
 """Focused coverage for atomic resource bundles."""
 
 import hashlib
+import io
 import json
 from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, call
 
 import pytest
+from PIL import Image
 
+from openviking.parse.vlm import TechnicalDrawingRecognitionError, TechnicalDrawingRegion
 from openviking.resource.atomic_bundle import is_resource_bundle_manifest
 from openviking.server.identity import RequestContext, Role
 from openviking.service import resource_service as resource_service_module
@@ -19,7 +22,7 @@ from openviking.service.resource_service import ResourceService
 from openviking.service.search_service import SearchService
 from openviking.storage.viking_fs import LS_ALL_NODES, VikingFS
 from openviking.utils.embedding_utils import _apply_scalar_overrides
-from openviking_cli.exceptions import FailedPreconditionError, InvalidURIError
+from openviking_cli.exceptions import FailedPreconditionError, InvalidArgumentError, InvalidURIError
 from openviking_cli.retrieve.types import ContextType, FindResult, MatchedContext
 from openviking_cli.session.user_id import UserIdentifier
 
@@ -108,6 +111,10 @@ def _bundle_service(viking_fs):
     )
     service._release_lock_ref = AsyncMock()
     return service
+
+
+def _write_test_drawing(path, size=(200, 100)):
+    Image.new("RGB", size, "white").save(path, format="PNG")
 
 
 def test_bundle_marker_reads_v1_and_requires_a_v2_artifact_inventory():
@@ -224,6 +231,344 @@ async def test_add_resource_bundle_writes_only_source_and_manifest(
         "sha256": hashlib.sha256(b"solid gear").hexdigest(),
     }
     service._release_lock_ref.assert_awaited_once_with(lock)
+
+
+@pytest.mark.asyncio
+async def test_plain_image_bundle_remains_source_only(tmp_path, monkeypatch, ctx):
+    source = tmp_path / "photo.png"
+    _write_test_drawing(source)
+    viking_fs = _BundleFS()
+    service = _bundle_service(viking_fs)
+    lock = _lease()
+    root = "viking://resources/photo"
+    service._plan_resource_target = AsyncMock(return_value=(root, lock))
+
+    async def no_parent_bundle(*_args, **_kwargs):
+        return None
+
+    recognize = AsyncMock()
+    monkeypatch.setattr(resource_service_module, "find_resource_bundle_root", no_parent_bundle)
+    monkeypatch.setattr(
+        "openviking.parse.vlm.VLMProcessor.recognize_technical_drawing_regions",
+        recognize,
+    )
+
+    result = await service.add_resource(
+        path=str(source),
+        ctx=ctx,
+        to=root,
+        bundle=True,
+        build_index=False,
+    )
+
+    assert result["semantic_status"] == "skipped"
+    assert "recognition_status" not in result
+    assert {path.removeprefix(f"{root}/") for path in viking_fs.files} == {
+        "photo.png",
+        "manifest.json",
+    }
+    manifest = json.loads(viking_fs.files[f"{root}/manifest.json"])
+    assert "recognition" not in manifest
+    assert set(manifest["artifacts"]) == {"source"}
+    recognize.assert_not_awaited()
+    service._release_lock_ref.assert_awaited_once_with(lock)
+
+
+@pytest.mark.asyncio
+async def test_technical_drawing_bundle_publishes_flat_deterministic_regions(
+    tmp_path,
+    monkeypatch,
+    ctx,
+):
+    source = tmp_path / "drawing.png"
+    _write_test_drawing(source)
+    viking_fs = _BundleFS()
+    service = _bundle_service(viking_fs)
+    lock = _lease()
+    root = "viking://resources/drawing"
+    service._plan_resource_target = AsyncMock(return_value=(root, lock))
+
+    async def no_parent_bundle(*_args, **_kwargs):
+        return None
+
+    # Return bottom region first to prove filenames are assigned in reading order.
+    recognize = AsyncMock(
+        return_value=[
+            TechnicalDrawingRegion("detail", "DETAIL A", (50, 600, 400, 900)),
+            TechnicalDrawingRegion("section", "SECTION B-B", (500, 100, 900, 500)),
+        ]
+    )
+
+    async def summarize_staging(staging_uri, **_kwargs):
+        viking_fs.files[f"{staging_uri}/.abstract.md"] = b"drawing abstract"
+        viking_fs.files[f"{staging_uri}/.overview.md"] = b"drawing overview"
+        return {}
+
+    service._summarize_bundle_staging = AsyncMock(side_effect=summarize_staging)
+    monkeypatch.setattr(resource_service_module, "find_resource_bundle_root", no_parent_bundle)
+    monkeypatch.setattr(
+        "openviking.parse.vlm.VLMProcessor.recognize_technical_drawing_regions",
+        recognize,
+    )
+
+    result = await service.add_resource(
+        path=str(source),
+        ctx=ctx,
+        to=root,
+        bundle=True,
+        args={"image_mode": "technical_drawing"},
+        build_index=False,
+    )
+
+    assert result["recognition_status"] == "complete"
+    assert result["semantic_status"] == "complete"
+    assert {path.removeprefix(f"{root}/") for path in viking_fs.files} == {
+        "drawing.png",
+        "region_001.png",
+        "region_002.png",
+        ".abstract.md",
+        ".overview.md",
+        "manifest.json",
+    }
+    manifest = json.loads(viking_fs.files[f"{root}/manifest.json"])
+    assert is_resource_bundle_manifest(manifest)
+    assert manifest["recognition"] == {
+        "schema": "openviking.technical-drawing-regions/v1",
+        "status": "complete",
+        "source_width": 200,
+        "source_height": 100,
+    }
+    assert manifest["artifacts"]["region_001"]["metadata"] == {
+        "type": "section",
+        "label": "SECTION B-B",
+        "bbox": [98, 8, 182, 52],
+    }
+    assert manifest["artifacts"]["region_002"]["metadata"] == {
+        "type": "detail",
+        "label": "DETAIL A",
+        "bbox": [8, 58, 82, 92],
+    }
+    assert set(manifest["artifacts"]) == {
+        "source",
+        "region_001",
+        "region_002",
+        "abstract",
+        "overview",
+    }
+    assert (
+        manifest["artifacts"]["source"]["sha256"] == hashlib.sha256(source.read_bytes()).hexdigest()
+    )
+    assert (
+        manifest["artifacts"]["region_001"]["sha256"]
+        == hashlib.sha256(viking_fs.files[f"{root}/region_001.png"]).hexdigest()
+    )
+    with Image.open(io.BytesIO(viking_fs.files[f"{root}/region_001.png"])) as crop:
+        assert crop.format == "PNG"
+        assert crop.size == (84, 44)
+    recognize.assert_awaited_once_with(source)
+    service._release_lock_ref.assert_awaited_once_with(lock)
+
+
+@pytest.mark.asyncio
+async def test_technical_drawing_recognition_failure_publishes_source_only(
+    tmp_path,
+    monkeypatch,
+    ctx,
+):
+    source = tmp_path / "drawing.png"
+    _write_test_drawing(source)
+    viking_fs = _BundleFS()
+    service = _bundle_service(viking_fs)
+    lock = _lease()
+    root = "viking://resources/drawing"
+    service._plan_resource_target = AsyncMock(return_value=(root, lock))
+    service._summarize_bundle_staging = AsyncMock()
+
+    async def no_parent_bundle(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(resource_service_module, "find_resource_bundle_root", no_parent_bundle)
+    monkeypatch.setattr(
+        "openviking.parse.vlm.VLMProcessor.recognize_technical_drawing_regions",
+        AsyncMock(side_effect=TechnicalDrawingRecognitionError("invalid_response")),
+    )
+
+    result = await service.add_resource(
+        path=str(source),
+        ctx=ctx,
+        to=root,
+        bundle=True,
+        args={"image_mode": "technical_drawing"},
+        build_index=False,
+    )
+
+    assert result["recognition_status"] == "failed"
+    assert result["semantic_status"] == "skipped"
+    assert {path.removeprefix(f"{root}/") for path in viking_fs.files} == {
+        "drawing.png",
+        "manifest.json",
+    }
+    manifest = json.loads(viking_fs.files[f"{root}/manifest.json"])
+    assert manifest["recognition"] == {
+        "schema": "openviking.technical-drawing-regions/v1",
+        "status": "failed",
+        "reason": "invalid_response",
+    }
+    assert set(manifest["artifacts"]) == {"source"}
+    service._summarize_bundle_staging.assert_not_awaited()
+    service._release_lock_ref.assert_awaited_once_with(lock)
+
+
+@pytest.mark.asyncio
+async def test_technical_drawing_crop_write_failure_leaves_no_bundle(
+    tmp_path,
+    monkeypatch,
+    ctx,
+):
+    source = tmp_path / "drawing.png"
+    _write_test_drawing(source)
+    viking_fs = _BundleFS()
+    service = _bundle_service(viking_fs)
+    lock = _lease()
+    root = "viking://resources/drawing"
+    service._plan_resource_target = AsyncMock(return_value=(root, lock))
+
+    async def no_parent_bundle(*_args, **_kwargs):
+        return None
+
+    original_write = viking_fs.write_file_bytes
+
+    async def fail_region_write(uri, content, **kwargs):
+        if uri.endswith("/region_001.png"):
+            raise RuntimeError("crop write failed")
+        await original_write(uri, content, **kwargs)
+
+    viking_fs.write_file_bytes = fail_region_write
+    monkeypatch.setattr(resource_service_module, "find_resource_bundle_root", no_parent_bundle)
+    monkeypatch.setattr(
+        "openviking.parse.vlm.VLMProcessor.recognize_technical_drawing_regions",
+        AsyncMock(return_value=[TechnicalDrawingRegion("view", None, (100, 100, 900, 900))]),
+    )
+
+    with pytest.raises(RuntimeError, match="crop write failed"):
+        await service.add_resource(
+            path=str(source),
+            ctx=ctx,
+            to=root,
+            bundle=True,
+            args={"image_mode": "technical_drawing"},
+            build_index=False,
+        )
+
+    assert not any(path.startswith(root) for path in viking_fs.files)
+    assert not any(path.startswith("viking://temp/staging") for path in viking_fs.files)
+    service._release_lock_ref.assert_awaited_once_with(lock)
+
+
+@pytest.mark.asyncio
+async def test_technical_drawing_semantic_failure_leaves_no_bundle(
+    tmp_path,
+    monkeypatch,
+    ctx,
+):
+    source = tmp_path / "drawing.png"
+    _write_test_drawing(source)
+    viking_fs = _BundleFS()
+    service = _bundle_service(viking_fs)
+    lock = _lease()
+    root = "viking://resources/drawing"
+    service._plan_resource_target = AsyncMock(return_value=(root, lock))
+    service._summarize_bundle_staging = AsyncMock(side_effect=RuntimeError("semantic failed"))
+
+    async def no_parent_bundle(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(resource_service_module, "find_resource_bundle_root", no_parent_bundle)
+    monkeypatch.setattr(
+        "openviking.parse.vlm.VLMProcessor.recognize_technical_drawing_regions",
+        AsyncMock(return_value=[TechnicalDrawingRegion("view", None, (100, 100, 900, 900))]),
+    )
+
+    with pytest.raises(RuntimeError, match="semantic failed"):
+        await service.add_resource(
+            path=str(source),
+            ctx=ctx,
+            to=root,
+            bundle=True,
+            args={"image_mode": "technical_drawing"},
+            build_index=False,
+        )
+
+    assert not any(path.startswith(root) for path in viking_fs.files)
+    assert not any(path.startswith("viking://temp/staging") for path in viking_fs.files)
+    service._release_lock_ref.assert_awaited_once_with(lock)
+
+
+@pytest.mark.asyncio
+async def test_technical_drawing_mode_requires_bundle_and_raster_source(tmp_path, ctx):
+    source = tmp_path / "drawing.png"
+    _write_test_drawing(source)
+    service = _bundle_service(_BundleFS())
+
+    with pytest.raises(
+        InvalidArgumentError,
+        match="requires bundle=true",
+    ):
+        await service.add_resource(
+            path=str(source),
+            ctx=ctx,
+            to="not-a-viking-uri",
+            args={"image_mode": "technical_drawing"},
+        )
+
+    non_raster = tmp_path / "drawing.glb"
+    non_raster.write_bytes(b"glTF")
+    service._plan_resource_target = AsyncMock()
+    with pytest.raises(InvalidArgumentError, match="requires a raster source"):
+        await service.add_resource(
+            path=str(non_raster),
+            ctx=ctx,
+            to="viking://resources/drawing",
+            bundle=True,
+            args={"image_mode": "technical_drawing"},
+            build_index=False,
+        )
+    service._plan_resource_target.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_technical_drawing_rejects_multiframe_raster(tmp_path):
+    source = tmp_path / "drawing.tiff"
+    first = Image.new("RGB", (20, 20), "white")
+    second = Image.new("RGB", (20, 20), "black")
+    first.save(source, format="TIFF", save_all=True, append_images=[second])
+
+    with pytest.raises(InvalidArgumentError, match="not a valid raster image"):
+        await ResourceService._validate_technical_drawing_source(source)
+
+
+@pytest.mark.asyncio
+async def test_technical_drawing_bundle_indexes_kind_and_image_mode(monkeypatch, ctx):
+    service = _bundle_service(_BundleFS())
+    index = AsyncMock()
+    monkeypatch.setattr(resource_service_module, "index_resource", index)
+
+    queue_status, vector_status = await service._index_atomic_resource_bundle(
+        root_uri="viking://resources/drawing",
+        kind="jpg",
+        image_mode="technical_drawing",
+        ctx=ctx,
+        wait=False,
+        timeout=None,
+    )
+
+    assert queue_status is None
+    assert vector_status == "queued"
+    index.assert_awaited_once_with(
+        "viking://resources/drawing",
+        ctx,
+        scalar_override={"search_tags": ["kind=jpg", "image_mode=technical_drawing"]},
+    )
 
 
 @pytest.mark.asyncio

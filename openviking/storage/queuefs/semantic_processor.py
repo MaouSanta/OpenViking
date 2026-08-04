@@ -31,7 +31,6 @@ from openviking.parse.parsers.media.utils import (
     get_media_type,
 )
 from openviking.prompts import render_prompt
-from openviking.utils.ingest_options import IngestOptions
 from openviking.server.identity import RequestContext, Role
 from openviking.storage.errors import LockAcquisitionError
 from openviking.storage.queuefs.named_queue import DequeueHandlerBase
@@ -49,6 +48,7 @@ from openviking.utils.circuit_breaker import (
     CircuitBreakerOpen,
     classify_api_error,
 )
+from openviking.utils.ingest_options import IngestOptions
 from openviking.utils.model_retry import ERROR_CLASS_INPUT_TOO_LARGE, ERROR_CLASS_PERMANENT
 from openviking_cli.session.user_id import UserIdentifier
 from openviking_cli.utils import VikingURI
@@ -461,6 +461,7 @@ class SemanticProcessor(DequeueHandlerBase):
                                     changes=changes,
                                     skip_vectorization=msg.skip_vectorization,
                                     ingest_options=msg.ingest_options,
+                                    bundle_assembly=msg.bundle_assembly,
                                     coalesce_key=msg.coalesce_key,
                                     coalesce_version=msg.coalesce_version,
                                 )
@@ -1370,6 +1371,7 @@ class SemanticProcessor(DequeueHandlerBase):
         file_summaries: List[Dict[str, str]],
         children_abstracts: List[Dict[str, str]],
         llm_sem: Optional[asyncio.Semaphore] = None,
+        bundle_assembly: bool = False,
     ) -> str:
         """Generate raw directory overview model output.
 
@@ -1442,6 +1444,7 @@ class SemanticProcessor(DequeueHandlerBase):
                 file_index_map,
                 llm_sem=llm_sem,
                 output_language=output_language,
+                bundle_assembly=bundle_assembly,
             )
         elif over_budget:
             # Few files but long summaries → truncate summaries to fit budget
@@ -1464,6 +1467,7 @@ class SemanticProcessor(DequeueHandlerBase):
                 children_abstracts_str,
                 file_index_map,
                 output_language=output_language,
+                bundle_assembly=bundle_assembly,
             )
         else:
             overview = await self._single_generate_overview(
@@ -1472,6 +1476,7 @@ class SemanticProcessor(DequeueHandlerBase):
                 children_abstracts_str,
                 file_index_map,
                 output_language=output_language,
+                bundle_assembly=bundle_assembly,
             )
 
         return overview
@@ -1483,6 +1488,7 @@ class SemanticProcessor(DequeueHandlerBase):
         children_abstracts_str: str,
         file_index_map: Dict[int, str],
         output_language: str = "en",
+        bundle_assembly: bool = False,
     ) -> str:
         """Generate overview from a single prompt (small directories)."""
         config = get_openviking_config()
@@ -1490,7 +1496,11 @@ class SemanticProcessor(DequeueHandlerBase):
 
         try:
             prompt = render_prompt(
-                "semantic.overview_generation",
+                (
+                    "semantic.bundle_overview_generation"
+                    if bundle_assembly
+                    else "semantic.overview_generation"
+                ),
                 {
                     "dir_name": dir_uri.split("/")[-1],
                     "file_summaries": file_summaries_str,
@@ -1521,6 +1531,7 @@ class SemanticProcessor(DequeueHandlerBase):
         file_index_map: Dict[int, str],
         llm_sem: Optional[asyncio.Semaphore] = None,
         output_language: str = "en",
+        bundle_assembly: bool = False,
     ) -> str:
         """Generate overview by batching file and subdirectory summaries.
 
@@ -1558,7 +1569,11 @@ class SemanticProcessor(DequeueHandlerBase):
                     child_lines.append(f"- {item['name']}/: {item['abstract']}")
 
             prompt = render_prompt(
-                "semantic.overview_generation",
+                (
+                    "semantic.bundle_overview_generation"
+                    if bundle_assembly
+                    else "semantic.overview_generation"
+                ),
                 {
                     "dir_name": dir_name,
                     "file_summaries": "\n".join(batch_lines) or "None",
@@ -1595,7 +1610,11 @@ class SemanticProcessor(DequeueHandlerBase):
         combined = "\n\n---\n\n".join(partial_overviews)
         try:
             prompt = render_prompt(
-                "semantic.overview_generation",
+                (
+                    "semantic.bundle_overview_generation"
+                    if bundle_assembly
+                    else "semantic.overview_generation"
+                ),
                 {
                     "dir_name": dir_name,
                     "file_summaries": combined,

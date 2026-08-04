@@ -4,7 +4,9 @@
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Union
+from typing import Annotated, Any, Dict, List, Literal, Optional, Union
+
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
 from openviking.prompts import render_prompt
 from openviking_cli.utils.extractor import ImageInfo, TableInfo
@@ -12,6 +14,68 @@ from openviking_cli.utils.llm import parse_json_from_response
 from openviking_cli.utils.logger import get_logger
 
 logger = get_logger(__name__)
+
+TechnicalDrawingRegionType = Literal[
+    "view",
+    "section",
+    "detail",
+    "isometric",
+    "title_block",
+    "notes",
+]
+TechnicalDrawingRecognitionReason = Literal[
+    "vlm_unavailable",
+    "model_error",
+    "invalid_response",
+    "no_regions",
+]
+_NormalizedCoordinate = Annotated[int, Field(strict=True, ge=0, le=1000)]
+
+
+class _TechnicalDrawingRegionPayload(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    type: TechnicalDrawingRegionType
+    label: Optional[str] = Field(default=None, max_length=80)
+    bbox: List[_NormalizedCoordinate] = Field(min_length=4, max_length=4)
+
+    @field_validator("bbox")
+    @classmethod
+    def validate_bbox_order(cls, bbox: List[int]) -> List[int]:
+        x1, y1, x2, y2 = bbox
+        if x1 >= x2 or y1 >= y2:
+            raise ValueError("bbox must satisfy x1 < x2 and y1 < y2")
+        return bbox
+
+
+class _TechnicalDrawingPayload(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    regions: List[_TechnicalDrawingRegionPayload]
+
+
+@dataclass(frozen=True)
+class TechnicalDrawingRegion:
+    """One validated semantic region in normalized 0..1000 coordinates."""
+
+    type: TechnicalDrawingRegionType
+    label: Optional[str]
+    bbox: tuple[int, int, int, int]
+
+
+class TechnicalDrawingRecognitionError(RuntimeError):
+    """Stable failure returned by technical drawing recognition."""
+
+    def __init__(self, reason: TechnicalDrawingRecognitionReason):
+        self.reason = reason
+        super().__init__(reason)
+
+
+def _normalize_technical_drawing_label(label: Optional[str]) -> Optional[str]:
+    if label is None:
+        return None
+    normalized = " ".join(label.split())
+    return normalized or None
 
 
 @dataclass
@@ -93,6 +157,64 @@ class VLMProcessor:
             overview="Image understanding failed",
             detail_text="[Image content]",
         )
+
+    async def recognize_technical_drawing_regions(
+        self,
+        image: Union[Path, bytes],
+    ) -> List[TechnicalDrawingRegion]:
+        """Recognize validated view-level regions in one technical drawing sheet."""
+        try:
+            vlm = self._get_vlm()
+            if not vlm.is_available():
+                raise TechnicalDrawingRecognitionError("vlm_unavailable")
+        except TechnicalDrawingRecognitionError:
+            raise
+        except Exception as exc:
+            raise TechnicalDrawingRecognitionError("vlm_unavailable") from exc
+
+        try:
+            prompt = render_prompt("vision.technical_drawing_regions", {})
+            response = await vlm.get_vision_completion_async(
+                prompt=prompt,
+                images=[image],
+                thinking=False,
+            )
+        except Exception as exc:
+            raise TechnicalDrawingRecognitionError("model_error") from exc
+
+        try:
+            data = parse_json_from_response(response)
+        except Exception as exc:
+            raise TechnicalDrawingRecognitionError("invalid_response") from exc
+        if data is None:
+            raise TechnicalDrawingRecognitionError("invalid_response")
+        try:
+            payload = _TechnicalDrawingPayload.model_validate(data)
+        except ValidationError as exc:
+            raise TechnicalDrawingRecognitionError("invalid_response") from exc
+
+        regions: List[TechnicalDrawingRegion] = []
+        seen = set()
+        for item in payload.regions:
+            label = _normalize_technical_drawing_label(item.label)
+            bbox = tuple(item.bbox)
+            dedupe_key = (item.type, (label or "").casefold(), bbox)
+            if dedupe_key in seen:
+                continue
+            seen.add(dedupe_key)
+            regions.append(
+                TechnicalDrawingRegion(
+                    type=item.type,
+                    label=label,
+                    bbox=bbox,
+                )
+            )
+
+        if not regions:
+            raise TechnicalDrawingRecognitionError("no_regions")
+        if len(regions) > 32:
+            raise TechnicalDrawingRecognitionError("invalid_response")
+        return regions
 
     async def understand_table(
         self,

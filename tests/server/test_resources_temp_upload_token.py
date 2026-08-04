@@ -35,6 +35,7 @@ def _issue(
     actor_peer_id: str = "",
     tags: list[str] | None = None,
     tag_mode: str = "replace",
+    args: dict | None = None,
 ):
     token, _ = upload_token_store.issue(
         account_id,
@@ -46,6 +47,7 @@ def _issue(
         actor_peer_id=actor_peer_id,
         tags=tags,
         tag_mode=tag_mode,
+        args=args,
     )
     return token
 
@@ -63,6 +65,7 @@ def _stub_ingest(service, monkeypatch, root_uri: str = "viking://resources/uploa
         captured["bundle"] = kwargs.get("bundle")
         captured["tags"] = kwargs.get("tags")
         captured["tag_mode"] = kwargs.get("tag_mode")
+        captured["args"] = kwargs.get("args")
         captured["allow_local_path_resolution"] = kwargs.get("allow_local_path_resolution")
         return {"root_uri": root_uri}
 
@@ -133,6 +136,22 @@ async def test_token_upload_forwards_bundle_mode(
     )
     assert resp.status_code == 200, resp.text
     assert captured["bundle"] is True
+
+
+async def test_token_upload_forwards_parser_args(
+    client: httpx.AsyncClient, service, upload_temp_dir: Path, monkeypatch
+):
+    captured = _stub_ingest(service, monkeypatch)
+    parser_args = {"image_mode": "technical_drawing"}
+    token = _issue(bundle=True, args=parser_args)
+    resp = await client.post(
+        "/api/v1/resources/temp_upload",
+        params={"token": token},
+        files={"file": ("drawing.png", b"png", "image/png")},
+    )
+
+    assert resp.status_code == 200, resp.text
+    assert captured["args"] == parser_args
 
 
 async def test_token_upload_uses_token_identity_ignoring_spoofed_headers(

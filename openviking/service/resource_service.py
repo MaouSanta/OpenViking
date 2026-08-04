@@ -10,7 +10,9 @@ import asyncio
 import contextlib
 import hashlib
 import inspect
+import io
 import json
+import math
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -79,11 +81,17 @@ from openviking_cli.utils import get_logger
 if TYPE_CHECKING:
     from openviking.connector.delegate import ConnectorDelegate
     from openviking.parse.accessors.base import LocalResource
+    from openviking.parse.vlm import TechnicalDrawingRegion
     from openviking.resource.watch_manager import WatchManager
     from openviking.resource.watch_scheduler import WatchScheduler
     from openviking.service.resource_memory_link_service import ResourceMemoryLinkService
 
 logger = get_logger(__name__)
+
+
+_TECHNICAL_DRAWING_IMAGE_MODE = "technical_drawing"
+_TECHNICAL_DRAWING_KINDS = frozenset({"jpg", "png", "webp", "tif", "bmp"})
+_TECHNICAL_DRAWING_RECOGNITION_SCHEMA = "openviking.technical-drawing-regions/v1"
 
 
 _ADD_RESOURCE_ARGS_RESERVED_FIELDS = frozenset(
@@ -794,22 +802,23 @@ class ResourceService:
                 tracker.cleanup(telemetry_id)
                 unregister_telemetry(telemetry_id)
 
-    async def _dwg_bundle_artifacts(
+    async def _parsed_bundle_artifacts(
         self,
         staging_uri: str,
         *,
         source_name: str,
         source_sha256: str,
+        kind: str,
+        derived: Dict[str, tuple[str, str]],
         ctx: RequestContext,
-    ) -> Dict[str, Dict[str, str]]:
+    ) -> Dict[str, Dict[str, Any]]:
         specs = {
-            "source": (source_name, "dwg"),
-            "beam_topology": ("beam_topology.json", "deterministic-dwg-topology-v2"),
-            "drawing_text": ("drawing_text.json", "deterministic-dwg-text-v1"),
+            "source": (source_name, kind),
+            **derived,
             "abstract": (".abstract.md", "openviking.semantic/l0"),
             "overview": (".overview.md", "openviking.semantic/l1"),
         }
-        if await self._viking_fs.exists(f"{staging_uri}/preview.png", ctx=ctx):
+        if kind == "dwg" and await self._viking_fs.exists(f"{staging_uri}/preview.png", ctx=ctx):
             specs["preview"] = ("preview.png", "png")
         artifacts = {}
         for role, (name, schema) in specs.items():
@@ -820,8 +829,89 @@ class ResourceService:
                 "sha256": hashlib.sha256(content).hexdigest(),
             }
         if artifacts["source"]["sha256"] != source_sha256:
-            raise RuntimeError("Parsed DWG source snapshot does not match the bundle source")
+            raise RuntimeError("Parsed source snapshot does not match the bundle source")
         return artifacts
+
+    @staticmethod
+    async def _validate_technical_drawing_source(source_file: Path) -> tuple[int, int]:
+        """Validate one raster source before sending it to the recognition model."""
+
+        def _read_size() -> tuple[int, int]:
+            from PIL import Image
+
+            with Image.open(source_file) as image:
+                if getattr(image, "n_frames", 1) != 1:
+                    raise ValueError("technical drawing source must contain exactly one frame")
+                image.load()
+                return image.size
+
+        try:
+            return await asyncio.to_thread(_read_size)
+        except Exception as exc:
+            raise InvalidArgumentError(
+                f"technical drawing source is not a valid raster image: {source_file.name}"
+            ) from exc
+
+    @staticmethod
+    async def _build_technical_drawing_crops(
+        source_file: Path,
+        regions: List["TechnicalDrawingRegion"],
+    ) -> List[Dict[str, Any]]:
+        """Map normalized regions to source pixels and encode deterministic PNG crops."""
+
+        def _build() -> List[Dict[str, Any]]:
+            from PIL import Image
+
+            with Image.open(source_file) as image:
+                image.load()
+                width, height = image.size
+                padding = max(1, round(min(width, height) * 0.02))
+                prepared = []
+                for region in regions:
+                    left, top, right, bottom = region.bbox
+                    pixel_bbox = (
+                        max(0, math.floor(left * width / 1000) - padding),
+                        max(0, math.floor(top * height / 1000) - padding),
+                        min(width, math.ceil(right * width / 1000) + padding),
+                        min(height, math.ceil(bottom * height / 1000) + padding),
+                    )
+                    prepared.append((pixel_bbox, region))
+
+                prepared.sort(
+                    key=lambda item: (
+                        item[0][1],
+                        item[0][0],
+                        item[0][3],
+                        item[0][2],
+                        item[1].type,
+                        item[1].label or "",
+                    )
+                )
+
+                crops = []
+                for index, (bbox, region) in enumerate(prepared, start=1):
+                    crop = image.crop(bbox)
+                    if crop.mode not in {"1", "L", "LA", "P", "RGB", "RGBA"}:
+                        crop = crop.convert("RGB")
+                    output = io.BytesIO()
+                    crop.save(output, format="PNG")
+                    metadata: Dict[str, Any] = {
+                        "type": region.type,
+                        "bbox": list(bbox),
+                    }
+                    if region.label:
+                        metadata["label"] = region.label
+                    crops.append(
+                        {
+                            "role": f"region_{index:03d}",
+                            "path": f"region_{index:03d}.png",
+                            "content": output.getvalue(),
+                            "metadata": metadata,
+                        }
+                    )
+                return crops
+
+        return await asyncio.to_thread(_build)
 
     async def _add_atomic_resource_bundle(
         self,
@@ -836,6 +926,7 @@ class ResourceService:
         watch_interval: float,
         allow_local_path_resolution: bool,
         source_name: Optional[str],
+        image_mode: Optional[str],
     ) -> Dict[str, Any]:
         """Assemble, seal, and publish one immutable atomic resource bundle."""
         del summarize
@@ -860,6 +951,17 @@ class ResourceService:
                 f"bundle source file name is reserved: {RESOURCE_BUNDLE_MANIFEST}"
             )
         kind = kind_from_source_name(stored_name)
+        if image_mode is not None:
+            if image_mode != _TECHNICAL_DRAWING_IMAGE_MODE:
+                raise InvalidArgumentError(
+                    "bundle=true supports args.image_mode only when it is "
+                    f"'{_TECHNICAL_DRAWING_IMAGE_MODE}'"
+                )
+            if kind not in _TECHNICAL_DRAWING_KINDS:
+                raise InvalidArgumentError(
+                    "args.image_mode='technical_drawing' requires a raster source with one of "
+                    "these formats: jpg, jpeg, png, webp, tif, tiff, bmp"
+                )
         source_bytes, source_sha256 = await read_source_and_sha256(source_file)
         ingested_at = datetime.now(timezone.utc)
 
@@ -880,6 +982,7 @@ class ResourceService:
         created_root = False
         staging_parent: Optional[str] = None
         semantic_status = "skipped"
+        recognition: Optional[Dict[str, Any]] = None
         try:
             parent_bundle = await find_resource_bundle_root(
                 self._viking_fs,
@@ -895,8 +998,84 @@ class ResourceService:
 
             source_uri = f"{root_uri}/{stored_name}"
             manifest_uri = f"{root_uri}/{RESOURCE_BUNDLE_MANIFEST}"
-            if kind == "dwg":
+            if image_mode == _TECHNICAL_DRAWING_IMAGE_MODE:
+                from openviking.parse.vlm import (
+                    TechnicalDrawingRecognitionError,
+                    VLMProcessor,
+                )
+
+                width, height = await self._validate_technical_drawing_source(source_file)
+                staging_parent = self._viking_fs.create_temp_uri(ctx=ctx)
+                staging_uri = f"{staging_parent}/bundle"
+                await self._viking_fs.mkdir(staging_uri, ctx=ctx)
+                await self._viking_fs.write_file_bytes(
+                    f"{staging_uri}/{stored_name}",
+                    source_bytes,
+                    ctx=ctx,
+                )
+                try:
+                    regions = await VLMProcessor().recognize_technical_drawing_regions(source_file)
+                except TechnicalDrawingRecognitionError as exc:
+                    recognition = {
+                        "schema": _TECHNICAL_DRAWING_RECOGNITION_SCHEMA,
+                        "status": "failed",
+                        "reason": exc.reason,
+                    }
+                    artifacts = {
+                        "source": {
+                            "path": stored_name,
+                            "schema": kind,
+                            "sha256": source_sha256,
+                        }
+                    }
+                else:
+                    crops = await self._build_technical_drawing_crops(source_file, regions)
+                    derived: Dict[str, tuple[str, str]] = {}
+                    crop_metadata: Dict[str, Dict[str, Any]] = {}
+                    for crop in crops:
+                        await self._viking_fs.write_file_bytes(
+                            f"{staging_uri}/{crop['path']}",
+                            crop["content"],
+                            ctx=ctx,
+                        )
+                        derived[crop["role"]] = (crop["path"], "png")
+                        crop_metadata[crop["role"]] = crop["metadata"]
+
+                    await self._summarize_bundle_staging(
+                        staging_uri,
+                        ctx=ctx,
+                        timeout=timeout,
+                    )
+                    artifacts = await self._parsed_bundle_artifacts(
+                        staging_uri,
+                        source_name=stored_name,
+                        source_sha256=source_sha256,
+                        kind=kind,
+                        derived=derived,
+                        ctx=ctx,
+                    )
+                    for role, metadata in crop_metadata.items():
+                        artifacts[role]["metadata"] = metadata
+                    recognition = {
+                        "schema": _TECHNICAL_DRAWING_RECOGNITION_SCHEMA,
+                        "status": "complete",
+                        "source_width": width,
+                        "source_height": height,
+                    }
+                    semantic_status = "complete"
+            elif kind == "dwg":
                 from openviking.parse.parsers.dwg import DWGParser
+
+                derived = {
+                    "beam_topology": (
+                        "beam_topology.json",
+                        "deterministic-dwg-topology-v2",
+                    ),
+                    "drawing_text": (
+                        "drawing_text.json",
+                        "deterministic-dwg-text-v1",
+                    ),
+                }
 
                 with self._viking_fs.bind_request_context(ctx):
                     parsed = await DWGParser().parse(source_file, source_name=stored_name)
@@ -905,22 +1084,12 @@ class ResourceService:
                 if not staging_parent or not staging_uri:
                     raise RuntimeError("DWG parser did not produce a staging bundle")
                 await self._summarize_bundle_staging(staging_uri, ctx=ctx, timeout=timeout)
-                artifacts = await self._dwg_bundle_artifacts(
+                artifacts = await self._parsed_bundle_artifacts(
                     staging_uri,
                     source_name=stored_name,
                     source_sha256=source_sha256,
-                    ctx=ctx,
-                )
-                manifest = build_manifest(
                     kind=kind,
-                    source_path=stored_name,
-                    sha256=source_sha256,
-                    ingested_at=ingested_at,
-                    artifacts=artifacts,
-                )
-                await self._viking_fs.write_file(
-                    f"{staging_uri}/{RESOURCE_BUNDLE_MANIFEST}",
-                    serialize_manifest(manifest),
+                    derived=derived,
                     ctx=ctx,
                 )
                 semantic_status = "complete"
@@ -932,13 +1101,6 @@ class ResourceService:
                         "sha256": source_sha256,
                     }
                 }
-                manifest = build_manifest(
-                    kind=kind,
-                    source_path=stored_name,
-                    sha256=source_sha256,
-                    ingested_at=ingested_at,
-                    artifacts=artifacts,
-                )
                 staging_parent = self._viking_fs.create_temp_uri(ctx=ctx)
                 staging_uri = f"{staging_parent}/bundle"
                 await self._viking_fs.mkdir(staging_uri, ctx=ctx)
@@ -947,11 +1109,20 @@ class ResourceService:
                     source_bytes,
                     ctx=ctx,
                 )
-                await self._viking_fs.write_file(
-                    f"{staging_uri}/{RESOURCE_BUNDLE_MANIFEST}",
-                    serialize_manifest(manifest),
-                    ctx=ctx,
-                )
+            manifest = build_manifest(
+                kind=kind,
+                source_path=stored_name,
+                sha256=source_sha256,
+                ingested_at=ingested_at,
+                artifacts=artifacts,
+            )
+            if recognition is not None:
+                manifest["recognition"] = recognition
+            await self._viking_fs.write_file(
+                f"{staging_uri}/{RESOURCE_BUNDLE_MANIFEST}",
+                serialize_manifest(manifest),
+                ctx=ctx,
+            )
             await self._viking_fs.persist_temp_tree(
                 staging_uri,
                 root_uri,
@@ -989,10 +1160,13 @@ class ResourceService:
             "semantic_status": semantic_status,
             "vector_status": "skipped",
         }
+        if recognition is not None:
+            result["recognition_status"] = recognition["status"]
         if build_index:
             queue_status, vector_status = await self._index_atomic_resource_bundle(
                 root_uri=root_uri,
                 kind=kind,
+                image_mode=image_mode,
                 ctx=ctx,
                 wait=wait,
                 timeout=timeout,
@@ -1007,15 +1181,19 @@ class ResourceService:
         *,
         root_uri: str,
         kind: str,
+        image_mode: Optional[str],
         ctx: RequestContext,
         wait: bool,
         timeout: Optional[float],
     ) -> tuple[Optional[Dict[str, Any]], str]:
         """Index every searchable bundle artifact with the bundle's kind tag."""
+        search_tags = [f"kind={kind}"]
+        if image_mode == _TECHNICAL_DRAWING_IMAGE_MODE:
+            search_tags.append("image_mode=technical_drawing")
         await index_resource(
             root_uri,
             ctx,
-            scalar_override={"search_tags": [f"kind={kind}"]},
+            scalar_override={"search_tags": search_tags},
         )
         if not wait:
             return None, "queued"
@@ -1246,6 +1424,9 @@ class ResourceService:
         self._validate_add_resource_tag_policy(tags=tags, tag_mode=tag_mode)
         normalized_args = self._normalize_add_resource_args(args, watch_interval=watch_interval)
         kwargs.update(normalized_args.processor_kwargs)
+        image_mode = kwargs.get("image_mode")
+        if image_mode == _TECHNICAL_DRAWING_IMAGE_MODE and not bundle:
+            raise InvalidArgumentError("args.image_mode='technical_drawing' requires bundle=true")
         if watch_interval > 0 and kwargs.get("temp_file_id"):
             # Fail fast, before any ingestion: an uploaded source is a one-time
             # snapshot, so a watch on it can never observe the live source (see the
@@ -1289,6 +1470,7 @@ class ResourceService:
                 watch_interval=watch_interval,
                 allow_local_path_resolution=allow_local_path_resolution,
                 source_name=kwargs.get("source_name"),
+                image_mode=image_mode,
             )
 
         if self._connector.should_delegate(

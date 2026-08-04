@@ -59,3 +59,36 @@ async def test_children_only_oversized_overview_is_batched(monkeypatch):
     assert "child-2" not in vlm.prompts[0]
     assert "child-2" in vlm.prompts[1]
     assert all(f"child-{index}" not in vlm.prompts[2] for index in range(3))
+
+
+@pytest.mark.asyncio
+async def test_bundle_overview_uses_compact_prompt_for_single_and_batched_generation(
+    monkeypatch,
+):
+    vlm = RecordingVLM()
+    prompt_ids = []
+    config = SimpleNamespace(
+        vlm=vlm,
+        semantic=SimpleNamespace(
+            max_overview_prompt_chars=20,
+            overview_batch_size=2,
+        ),
+        output_language_override="en",
+    )
+    monkeypatch.setattr(semantic_processor_module, "get_openviking_config", lambda: config)
+
+    def render(prompt_id, values):
+        prompt_ids.append(prompt_id)
+        return f"files={values['file_summaries']}|children={values['children_abstracts']}"
+
+    monkeypatch.setattr(semantic_processor_module, "render_prompt", render)
+    files = [{"name": f"region_{index:03d}.png", "summary": "x" * 20} for index in range(3)]
+
+    await SemanticProcessor()._generate_overview(
+        "viking://resources/drawing",
+        file_summaries=files,
+        children_abstracts=[],
+        bundle_assembly=True,
+    )
+
+    assert prompt_ids == ["semantic.bundle_overview_generation"] * 3

@@ -176,6 +176,7 @@ class SemanticDagExecutor:
         changes: Optional[Dict[str, List[str]]] = None,
         skip_vectorization: bool = False,
         ingest_options: IngestOptions | None = None,
+        bundle_assembly: bool = False,
         coalesce_key: str = "",
         coalesce_version: int = 0,
     ):
@@ -192,6 +193,7 @@ class SemanticDagExecutor:
         self._changes = changes or {}
         self._skip_vectorization = skip_vectorization
         self._ingest_options = IngestOptions.from_value(ingest_options)
+        self._bundle_assembly = bundle_assembly
         self._coalesce_key = coalesce_key
         self._coalesce_version = coalesce_version
         self._task_context = get_task_context()
@@ -839,10 +841,30 @@ class SemanticDagExecutor:
                     file_summaries = self._finalize_file_summaries(node)
                     children_abstracts = await self._finalize_children_abstracts(node)
                 async with self._llm_sem:
-                    overview = await self._processor._generate_overview(
-                        dir_uri, file_summaries, children_abstracts
-                    )
-                overview, abstract = self._processor._normalize_overview_generation(overview)
+                    if self._bundle_assembly and dir_uri == self._root_uri:
+                        generated_overview = await self._processor._generate_overview(
+                            dir_uri,
+                            file_summaries,
+                            children_abstracts,
+                            bundle_assembly=True,
+                        )
+                    else:
+                        generated_overview = await self._processor._generate_overview(
+                            dir_uri, file_summaries, children_abstracts
+                        )
+                overview, abstract = self._processor._normalize_overview_generation(
+                    generated_overview
+                )
+                if self._bundle_assembly and dir_uri == self._root_uri:
+                    if overview != generated_overview:
+                        raise RuntimeError("Bundle overview exceeds the configured size limit")
+                    missing = [
+                        item["name"] for item in file_summaries if item["name"] not in overview
+                    ]
+                    if missing:
+                        raise RuntimeError(
+                            "Bundle overview omitted artifacts: " + ", ".join(missing)
+                        )
 
             if self._closed:
                 return
@@ -851,8 +873,12 @@ class SemanticDagExecutor:
             try:
                 wrote = await self._write_directory_semantics(dir_uri, overview, abstract)
                 if not wrote:
+                    if self._bundle_assembly and dir_uri == self._root_uri:
+                        raise RuntimeError("Bundle overview sidecars were not written")
                     need_vectorize = False
             except Exception:
+                if self._bundle_assembly and dir_uri == self._root_uri:
+                    raise
                 logger.info(f"[SemanticDag] {dir_uri} write failed, skipping")
 
             try:
@@ -873,6 +899,8 @@ class SemanticDagExecutor:
 
         except Exception as e:
             logger.error(f"Failed to generate overview for {dir_uri}: {e}", exc_info=True)
+            if self._bundle_assembly and dir_uri == self._root_uri:
+                self.fail(e)
         finally:
             self._stats.done_nodes += 1
             self._stats.in_progress_nodes = max(0, self._stats.in_progress_nodes - 1)

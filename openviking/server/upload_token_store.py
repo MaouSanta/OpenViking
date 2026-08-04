@@ -9,7 +9,7 @@ key, no on-disk state, no replay-set bookkeeping. ``dict.pop`` doubles as the
 consume-and-burn primitive.
 
 The token carries the identity bound at issue time (account/user), the caller's actor peer
-scope (``actor_peer_id``), and the business params (``to``/``reason``) so the server can
+scope (``actor_peer_id``), and the business params (``to``/``reason``/``args``) so the server can
 finish ingestion automatically once the file lands — the caller does not re-invoke
 ``add_resource``, and the ingest keeps the original peer scope. The ``temp_file_id`` is minted by
 :class:`openviking.server.temp_upload_store.TempUploadStore` at upload time, so the token
@@ -27,7 +27,7 @@ import secrets
 import string
 import time
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import Any, Optional, Tuple
 
 from openviking.resource.processing_mode import DEFAULT_PROCESSING_MODE, ProcessingMode
 
@@ -50,6 +50,7 @@ class _TokenInfo:
     processing_mode: ProcessingMode
     tags: Optional[list[str]]
     tag_mode: str
+    args: Optional[dict[str, Any]]
     expires_at: float
 
 
@@ -66,6 +67,7 @@ class ConsumedUploadToken:
     processing_mode: ProcessingMode
     tags: Optional[list[str]]
     tag_mode: str
+    args: Optional[dict[str, Any]]
 
 
 class UploadTokenStore:
@@ -85,6 +87,7 @@ class UploadTokenStore:
         processing_mode: ProcessingMode = DEFAULT_PROCESSING_MODE,
         tags: Optional[list[str]] = None,
         tag_mode: str = "replace",
+        args: Optional[dict[str, Any]] = None,
     ) -> Tuple[str, float]:
         """Mint a fresh token bound to (account, user) plus ``to``/``reason``/``actor_peer_id``.
 
@@ -105,6 +108,7 @@ class UploadTokenStore:
             processing_mode,
             tags,
             tag_mode,
+            dict(args) if args is not None else None,
             expires_at,
         )
         for _ in range(8):
@@ -133,6 +137,7 @@ class UploadTokenStore:
             info.processing_mode,
             info.tags,
             info.tag_mode,
+            info.args,
         )
 
     def peek(self, token: str) -> Optional[_TokenInfo]:

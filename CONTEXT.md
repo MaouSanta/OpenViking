@@ -59,3 +59,25 @@ _Avoid_: implicit JSON shape, parser version
 **Resource Kind**:
 A single canonical source-format family, such as `step`, `glb`, or `gltf`, that classifies a bundle's original asset. Bundle Ingestion derives it from the original artifact's suffix, normalizing known aliases such as `.stp` to `step`; it rejects only sources whose type cannot be inferred because they have no suffix. It is recorded in the Bundle Manifest and projected as the required `kind=<value>` Index Tag, while auxiliary files do not change it.
 _Avoid_: broad 3D category, raw file extension
+
+## Raster Technical Drawing Language
+
+**Technical Drawing Sheet**:
+A user-declared raster image containing one engineering drawing sheet. It is the authoritative visual source from which drawing regions are derived; OpenViking does not infer this identity from an arbitrary image in the first version.
+_Avoid_: Drawing Preview, ordinary image, tile set
+
+**Drawing Recognition**:
+The derivation of semantic drawing regions from a Technical Drawing Sheet. It does not mean classifying arbitrary images or guaranteeing exact transcription of dimensions and engineering annotations.
+_Avoid_: image classification, annotation extraction, OCR
+
+**Semantic Drawing Region**:
+A model-proposed rectangular area on a Technical Drawing Sheet with one of six V1 types: `view`, `section`, `detail`, `isometric`, `title_block`, or `notes`. An optional label preserves source names such as `DETAIL A` or `SECTION B-B`; V1 does not infer orthographic direction or parent/child relations. A region is independent navigation evidence, may overlap another region, and is not authoritative geometry.
+_Avoid_: tile, component mask, source geometry
+
+**Drawing View Crop**:
+A padded rectangular copy of a Semantic Drawing Region that preserves the source pixels and may include neighboring content. Its source linkage uses integer `xyxy` coordinates in the original sheet's pixel space, with a top-left origin. It is derived input for semantic indexing, not an isolated or masked source of truth.
+_Avoid_: clean view, segmentation mask, tile
+
+**Technical Drawing Bundle**:
+An Atomic Resource Bundle whose source is a Technical Drawing Sheet and whose derived image artifacts are source-linked Drawing View Crops. Its Bundle Manifest records the drawing-recognition outcome and the provenance of each crop.
+_Avoid_: image directory, tile set, source-only image bundle
