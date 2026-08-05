@@ -869,6 +869,7 @@ const en = {
         canvas: 'Interactive DWG drawing',
         checkingSize: 'Checking DWG file size...',
         disabled: 'DWG preview is not enabled in this build.',
+        dismissWarning: 'Dismiss notice',
         failed: 'This DWG drawing could not be previewed.',
         fit: 'Fit drawing',
         incomplete:

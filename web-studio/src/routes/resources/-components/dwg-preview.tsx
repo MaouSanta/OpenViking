@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next'
-import { AlertTriangle, Loader2, Scan } from 'lucide-react'
+import { AlertTriangle, Loader2, Scan, X } from 'lucide-react'
 import {
   AcApDocManager,
   AcApSettingManager,
@@ -64,6 +64,17 @@ function hasRecoverablePartialContent(manager: AcApDocManager) {
     : !database.extents.isEmpty()
 }
 
+function scopeViewerHiddenRule() {
+  for (const style of document.head.querySelectorAll('style')) {
+    if (!style.textContent.includes('.ml-cli-container')) continue
+    for (const rule of Array.from(style.sheet?.cssRules ?? [])) {
+      if (rule instanceof CSSStyleRule && rule.selectorText === '.hidden') {
+        rule.selectorText = '.ml-cli-container .hidden'
+      }
+    }
+  }
+}
+
 export function DwgPreview({ file }: { file: VikingFsEntry }) {
   const { t } = useTranslation('resources')
   const containerRef = useRef<HTMLDivElement>(null)
@@ -74,6 +85,7 @@ export function DwgPreview({ file }: { file: VikingFsEntry }) {
   const [partial, setPartial] = useState(false)
   const [ready, setReady] = useState(false)
   const [warning, setWarning] = useState(false)
+  const [warningDismissed, setWarningDismissed] = useState(false)
   const [approvedUri, setApprovedUri] = useState<string | null>(null)
   const [sizeProbe, setSizeProbe] = useState<{
     sizeBytes: number | null
@@ -190,6 +202,7 @@ export function DwgPreview({ file }: { file: VikingFsEntry }) {
       setPartial(false)
       setReady(false)
       setWarning(false)
+      setWarningDismissed(false)
 
       if (
         previewSizeBytes !== null &&
@@ -259,6 +272,7 @@ export function DwgPreview({ file }: { file: VikingFsEntry }) {
           useMainThreadDraw: true,
           webworkerFileUrls: WORKER_URLS,
         })
+        scopeViewerHiddenRule()
         if (!createdManager) {
           await fail('failed')
           return
@@ -401,7 +415,7 @@ export function DwgPreview({ file }: { file: VikingFsEntry }) {
   }
 
   return (
-    <div className="relative h-full min-h-[360px] overflow-hidden rounded-md border bg-black">
+    <div className="relative isolate h-full min-h-[360px] overflow-hidden rounded-md border bg-black">
       <div
         ref={containerRef}
         className="absolute inset-0"
@@ -461,14 +475,26 @@ export function DwgPreview({ file }: { file: VikingFsEntry }) {
         </div>
       ) : null}
 
-      {partial || warning ? (
+      {(partial || warning) && !warningDismissed ? (
         <div
-          className="absolute bottom-3 left-3 right-3 z-10 rounded-md border border-amber-500/40 bg-background/90 px-3 py-2 text-xs text-amber-700 shadow-sm backdrop-blur dark:text-amber-300"
+          className="absolute bottom-3 left-3 right-3 z-10 flex items-center gap-2 rounded-md border border-amber-500/40 bg-background/90 px-3 py-2 text-xs text-amber-700 shadow-sm backdrop-blur dark:text-amber-300"
           role="status"
         >
-          {t(
-            partial ? 'filePreview.dwg.partial' : 'filePreview.dwg.incomplete',
-          )}
+          <span className="min-w-0 flex-1">
+            {t(
+              partial
+                ? 'filePreview.dwg.partial'
+                : 'filePreview.dwg.incomplete',
+            )}
+          </span>
+          <Button
+            size="icon-sm"
+            variant="ghost"
+            aria-label={t('filePreview.dwg.dismissWarning')}
+            onClick={() => setWarningDismissed(true)}
+          >
+            <X className="size-4" />
+          </Button>
         </div>
       ) : null}
     </div>

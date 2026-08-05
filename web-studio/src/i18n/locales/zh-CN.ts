@@ -839,6 +839,7 @@ const zhCN = {
         canvas: 'DWG 交互式图纸',
         checkingSize: '正在检查 DWG 文件大小…',
         disabled: '此构建未启用 DWG 预览。',
+        dismissWarning: '关闭提示',
         failed: '无法预览该 DWG 图纸。',
         fit: '适配视野',
         incomplete: '部分字体、图片或外部参照缺失，预览内容可能不完整。',

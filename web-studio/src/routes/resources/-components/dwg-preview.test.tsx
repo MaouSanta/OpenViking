@@ -131,6 +131,11 @@ describe('DwgPreview', () => {
     const view = render(<DwgPreview file={file} />)
 
     expect(await screen.findByText('filePreview.dwg.ready')).toBeTruthy()
+    expect(
+      screen
+        .getByLabelText('filePreview.dwg.canvas')
+        .parentElement?.classList.contains('isolate'),
+    ).toBe(true)
     expect(mocks.download).toHaveBeenCalledWith({
       query: { uri: file.uri },
       onDownloadProgress: expect.any(Function),
@@ -150,6 +155,31 @@ describe('DwgPreview', () => {
     fireEvent.click(screen.getByRole('button', { name: 'filePreview.dwg.fit' }))
     expect(mocks.fit).toHaveBeenCalledTimes(1)
 
+    view.unmount()
+    await waitFor(() => expect(mocks.destroy).toHaveBeenCalledTimes(1))
+  })
+
+  it('keeps the viewer hidden rule scoped to its command line', async () => {
+    const manager = mocks.createInstance()
+    const style = document.createElement('style')
+    style.textContent =
+      '.ml-cli-container {} .hidden { display: none !important; }'
+    mocks.createInstance.mockClear().mockImplementationOnce(() => {
+      document.head.appendChild(style)
+      return manager
+    })
+
+    const view = render(<DwgPreview file={file} />)
+
+    expect(await screen.findByText('filePreview.dwg.ready')).toBeTruthy()
+    expect(
+      Array.from(style.sheet?.cssRules ?? []).find(
+        (rule) =>
+          rule instanceof CSSStyleRule && rule.selectorText.includes('hidden'),
+      )?.selectorText,
+    ).toBe('.ml-cli-container .hidden')
+
+    style.remove()
     view.unmount()
     await waitFor(() => expect(mocks.destroy).toHaveBeenCalledTimes(1))
   })
@@ -449,6 +479,12 @@ describe('DwgPreview', () => {
     const view = render(<DwgPreview file={file} />)
 
     expect(await screen.findByText('filePreview.dwg.partial')).toBeTruthy()
+    fireEvent.click(
+      screen.getByRole('button', {
+        name: 'filePreview.dwg.dismissWarning',
+      }),
+    )
+    expect(screen.queryByText('filePreview.dwg.partial')).toBeNull()
     expect(screen.queryByRole('alert')).toBeNull()
     expect(
       screen.getByRole('button', {
