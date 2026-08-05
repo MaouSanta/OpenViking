@@ -12,6 +12,7 @@ from PIL import Image
 
 from openviking.parse.parsers.base_parser import BaseParser
 from openviking.parse.parsers.dwg import DWGParser, _normalize_libredwg_json
+from openviking.parse.parsers.dwg_extract import build_drawing_text_chunks
 from openviking.parse.registry import ParserRegistry
 
 
@@ -71,6 +72,20 @@ def _drawing_json():
                 "ins_pt": [50, 60],
                 "text_value": "KL1(1) 300x500",
             },
+            {
+                "entity": "TEXT",
+                "index": 103,
+                "ins_pt": [100, 10],
+                "height": 2,
+                "text_value": "2栋组串接线图",
+            },
+            {
+                "entity": "TEXT",
+                "index": 104,
+                "ins_pt": [150, 10],
+                "height": 2,
+                "text_value": "JDDL-FLLS-20",
+            },
             {"entity": "TEXT", "text_value": "125.4"},
             {"object": "PROXY_OBJECT"},
         ],
@@ -84,7 +99,7 @@ def _png_bytes():
 
 
 @pytest.mark.asyncio
-async def test_dwg_parser_writes_compact_deterministic_artifacts(tmp_path: Path, monkeypatch):
+async def test_dwg_parser_writes_small_deterministic_artifacts(tmp_path: Path, monkeypatch):
     source = tmp_path / "building-plan.dwg"
     source.write_bytes(b"fake-dwg")
     fake_fs = _FakeVikingFS()
@@ -105,16 +120,71 @@ async def test_dwg_parser_writes_compact_deterministic_artifacts(tmp_path: Path,
     topology = json.loads(
         next(value for uri, value in fake_fs.files.items() if uri.endswith("/beam_topology.json"))
     )
-    drawing_text = json.loads(
-        next(value for uri, value in fake_fs.files.items() if uri.endswith("/drawing_text.json"))
+    drawing_text_index = json.loads(
+        next(
+            value
+            for uri, value in fake_fs.files.items()
+            if uri.endswith("/drawing_text/index.json")
+        )
     )
+    drawing_text_chunk_bytes = [
+        value
+        for uri, value in fake_fs.files.items()
+        if "/drawing_text/" in uri and not uri.endswith("/index.json")
+    ]
+    drawing_text_chunks = [json.loads(value) for value in drawing_text_chunk_bytes]
     assert topology["schema_version"] == "deterministic-dwg-topology-v2"
     assert topology["records"][0]["beam_id"] == "KL1"
-    assert drawing_text["schema"] == "deterministic-dwg-text-v1"
-    assert any(record["txt"] == "项目名称：示例住宅" for record in drawing_text["records"])
+    assert drawing_text_index["schema"] == "deterministic-dwg-text-index-v1"
+    assert drawing_text_index["coverage"]["complete"] is True
+    assert drawing_text_chunks[0]["schema"] == "deterministic-dwg-text-chunk-v1"
+    assert b"\n" in drawing_text_chunk_bytes[0]
+    assert "2栋组串接线图" in drawing_text_chunks[0]["search_text"]
+    assert "JDDL-FLLS-20" in drawing_text_chunks[0]["search_text"]
+    assert not any(uri.endswith("/drawing_text.json") for uri in fake_fs.files)
+    assert not any(uri.endswith("/drawing_index.md") for uri in fake_fs.files)
     assert result.meta["source_sha256"]
     assert "No usable embedded DWG preview" in result.warnings
     assert any("proxy objects" in warning for warning in result.warnings)
+
+
+def test_spatial_chunk_halo_keeps_adjacent_text_across_a_partition_boundary():
+    def record(index, text, x):
+        return {
+            "i": index,
+            "h": [0, 0, index],
+            "t": "TEXT",
+            "l": "0",
+            "p": [x, 0.0],
+            "r": 0.0,
+            "z": 1.0,
+            "raw": text,
+            "txt": text,
+        }
+
+    drawing_text = {
+        "source": "plan.dwg",
+        "source_sha256": "abc",
+        "units": {"p": "DWG drawing units"},
+        "records": [
+            record(1, "2栋组串接线图", 0.0),
+            record(2, "JDDL-FLLS-20", 20.0),
+            record(3, "远处文字", 1000.0),
+        ],
+    }
+
+    index, chunks = build_drawing_text_chunks(
+        drawing_text,
+        max_core_records=1,
+        max_core_text_chars=1,
+        max_chunk_records=2,
+    )
+
+    assert index["coverage"] == {"source_records": 3, "core_records": 3, "complete": True}
+    assert any(
+        "2栋组串接线图" in chunk["search_text"] and "JDDL-FLLS-20" in chunk["search_text"]
+        for chunk in chunks
+    )
 
 
 @pytest.mark.asyncio

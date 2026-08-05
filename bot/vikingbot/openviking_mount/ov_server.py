@@ -780,6 +780,26 @@ class VikingClient:
             "target_uri": target_uri,
         }
 
+    async def find_resource(
+        self,
+        query: str,
+        target_uri: str | list[str] = "viking://resources/",
+        limit: int = 10,
+    ) -> Dict[str, Any]:
+        """Find atomic resource bundles, grouped by their best matching child."""
+        result = await self.client.find_resource(
+            query=query,
+            target_uri=target_uri,
+            limit=limit,
+        )
+        if isinstance(result, dict):
+            return result
+        resources = getattr(result, "resources", []) or []
+        return {
+            "resources": [item if isinstance(item, dict) else vars(item) for item in resources],
+            "total": getattr(result, "total", len(resources)),
+        }
+
     async def search_user_memory(self, query: str, user_id: str) -> list[Any]:
         effective_user_id = self._effective_user_id(user_id)
         uri_user_memory = self._memory_target_uri(effective_user_id)
@@ -1036,11 +1056,7 @@ class VikingClient:
                         "tool_input": tool_input,
                         "tool_output": result_str,
                         "tool_status": explicit_status
-                        or (
-                            "completed"
-                            if tool_info.get("execute_success", True)
-                            else "error"
-                        ),
+                        or ("completed" if tool_info.get("execute_success", True) else "error"),
                         "skill_uri": skill_uri,
                         "duration_ms": float(tool_info.get("duration", 0.0) or 0.0),
                         "prompt_tokens": tool_info.get("input_token"),

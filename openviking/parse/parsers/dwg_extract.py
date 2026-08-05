@@ -11,7 +11,9 @@ from collections import defaultdict
 from typing import Any
 
 BEAM_TOPOLOGY_SCHEMA = "deterministic-dwg-topology-v2"
-DRAWING_TEXT_SCHEMA = "deterministic-dwg-text-v1"
+DRAWING_TEXT_SCHEMA = "deterministic-dwg-text-v2"
+DRAWING_TEXT_INDEX_SCHEMA = "deterministic-dwg-text-index-v1"
+DRAWING_TEXT_CHUNK_SCHEMA = "deterministic-dwg-text-chunk-v1"
 BEAM_TOPOLOGY_ITERATION = "i2_pair_center"
 
 _BEAM_RE = re.compile(
@@ -659,49 +661,204 @@ def _text_rotation(record: dict[str, Any]) -> float:
     return 0.0
 
 
-def _text_chunks(records: list[dict[str, Any]], max_chars: int = 800):
-    groups = defaultdict(list)
-    for index, record in enumerate(records):
-        groups[record["l"]].append((index, record))
+def _records_bbox(records: list[dict[str, Any]], record_ids: list[int]) -> list[float]:
+    xs = [records[index]["p"][0] for index in record_ids]
+    ys = [records[index]["p"][1] for index in record_ids]
+    return [min(xs), min(ys), max(xs), max(ys)]
+
+
+def _partition_text_records(
+    records: list[dict[str, Any]],
+    record_ids: list[int],
+    *,
+    max_records: int,
+    max_text_chars: int,
+) -> list[list[int]]:
+    text_chars = sum(len(records[index]["txt"]) for index in record_ids)
+    if len(record_ids) <= max_records and (text_chars <= max_text_chars or len(record_ids) == 1):
+        return [record_ids]
+
+    bbox = _records_bbox(records, record_ids)
+    axis = 0 if bbox[2] - bbox[0] >= bbox[3] - bbox[1] else 1
+    ordered = sorted(
+        record_ids,
+        key=lambda index: (
+            records[index]["p"][axis],
+            records[index]["p"][1 - axis],
+            str(records[index]["i"]),
+        ),
+    )
+    middle = len(ordered) // 2
+    return [
+        *_partition_text_records(
+            records,
+            ordered[:middle],
+            max_records=max_records,
+            max_text_chars=max_text_chars,
+        ),
+        *_partition_text_records(
+            records,
+            ordered[middle:],
+            max_records=max_records,
+            max_text_chars=max_text_chars,
+        ),
+    ]
+
+
+def _point_bbox_distance(point: list[float], bbox: list[float]) -> float:
+    dx = max(bbox[0] - point[0], 0.0, point[0] - bbox[2])
+    dy = max(bbox[1] - point[1], 0.0, point[1] - bbox[3])
+    return math.hypot(dx, dy)
+
+
+def _chunk_filename(chunk_id: int, bbox: list[float]) -> str:
+    coordinates = [int(round(value)) for value in bbox]
+    return (
+        f"drawing_text/{chunk_id:04d}_x{coordinates[0]}_y{coordinates[1]}_"
+        f"x{coordinates[2]}_y{coordinates[3]}.json"
+    )
+
+
+def _vlm_text_record(record: dict[str, Any], record_index: int, core: bool) -> dict[str, Any]:
+    result = {
+        "source_record_index": record_index,
+        "core": core,
+        "text": record["txt"],
+        "entity": record["t"],
+        "layer": record["l"],
+        "position": record["p"],
+        "rotation_deg": record["r"],
+        "text_height": record["z"],
+        "object_index": record["i"],
+        "handle": record["h"],
+    }
+    if record["raw"] != record["txt"]:
+        result["raw_text"] = record["raw"]
+    if "refs" in record:
+        result["duplicate_refs"] = record["refs"]
+    return result
+
+
+def build_drawing_text_chunks(
+    drawing_text: dict[str, Any],
+    *,
+    max_core_records: int = 24,
+    max_core_text_chars: int = 1000,
+    max_chunk_records: int = 48,
+    max_chunk_text_chars: int = 3000,
+    halo_text_heights: float = 40.0,
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    """Partition coordinate text into bounded VLM-readable JSON files with spatial halo."""
+    records = drawing_text.get("records", [])
+    if not isinstance(records, list):
+        records = []
+    if records:
+        leaves = _partition_text_records(
+            records,
+            list(range(len(records))),
+            max_records=max_core_records,
+            max_text_chars=max_core_text_chars,
+        )
+        leaves.sort(
+            key=lambda ids: (-_records_bbox(records, ids)[3], _records_bbox(records, ids)[0])
+        )
+    else:
+        leaves = []
+
+    positive_heights = sorted(float(record["z"]) for record in records if record["z"] > 0)
+    global_height = positive_heights[len(positive_heights) // 2] if positive_heights else 1.0
     chunks = []
-    for layer in sorted(groups):
-        rows = groups[layer]
-        heights = sorted(record["z"] for _, record in rows if record["z"] > 0)
-        median = heights[len(heights) // 2] if heights else 1.0
-        distance_limit = max(100.0, median * 40.0)
-        rows.sort(key=lambda item: (-item[1]["p"][1], item[1]["p"][0], item[1]["i"]))
-        current: list[int] = []
-        characters = 0
-        previous = None
-        for record_index, record in rows:
-            position = record["p"]
-            gap = math.dist(position[:2], previous[:2]) if previous is not None else 0.0
-            added = len(record["txt"]) + (1 if current else 0)
-            if current and (gap > distance_limit or characters + added > max_chars):
-                chunks.append((layer, distance_limit, current))
-                current = []
-                characters = 0
-            current.append(record_index)
-            characters += len(record["txt"]) + (1 if len(current) > 1 else 0)
-            previous = position
-        if current:
-            chunks.append((layer, distance_limit, current))
-    result = []
-    for chunk_id, (layer, distance_limit, record_ids) in enumerate(chunks):
-        selected = [records[index] for index in record_ids]
-        xs = [record["p"][0] for record in selected]
-        ys = [record["p"][1] for record in selected]
-        result.append(
+    inventory = []
+    for chunk_id, core_ids in enumerate(leaves):
+        core_bbox = _records_bbox(records, core_ids)
+        core_set = set(core_ids)
+        core_heights = sorted(
+            float(records[index]["z"]) for index in core_ids if records[index]["z"] > 0
+        )
+        local_height = core_heights[len(core_heights) // 2] if core_heights else global_height
+        candidates = []
+        for record_index, record in enumerate(records):
+            if record_index in core_set:
+                continue
+            distance = _point_bbox_distance(record["p"], core_bbox)
+            normalized_distance = distance / max(local_height, float(record["z"]), 1.0)
+            if normalized_distance <= halo_text_heights:
+                candidates.append((normalized_distance, distance, record_index))
+        candidates.sort()
+
+        content_ids = list(core_ids)
+        text_chars = sum(len(records[index]["txt"]) for index in content_ids)
+        for _, _, record_index in candidates:
+            added_chars = len(records[record_index]["txt"])
+            if (
+                len(content_ids) >= max_chunk_records
+                or text_chars + added_chars > max_chunk_text_chars
+            ):
+                continue
+            content_ids.append(record_index)
+            text_chars += added_chars
+        content_ids.sort(
+            key=lambda index: (
+                -records[index]["p"][1],
+                records[index]["p"][0],
+                str(records[index]["i"]),
+            )
+        )
+
+        path = _chunk_filename(chunk_id, core_bbox)
+        content_bbox = _records_bbox(records, content_ids)
+        chunk = {
+            "schema": DRAWING_TEXT_CHUNK_SCHEMA,
+            "source": drawing_text.get("source", ""),
+            "source_sha256": drawing_text.get("source_sha256", ""),
+            "chunk": {
+                "id": chunk_id,
+                "path": path,
+                "core_bbox": core_bbox,
+                "content_bbox": content_bbox,
+                "core_record_count": len(core_ids),
+                "record_count": len(content_ids),
+                "halo_text_heights": halo_text_heights,
+            },
+            "search_text": "\n".join(records[index]["txt"] for index in content_ids),
+            "records": [
+                _vlm_text_record(records[index], index, index in core_set) for index in content_ids
+            ],
+        }
+        chunks.append(chunk)
+        inventory.append(
             {
                 "id": chunk_id,
-                "l": layer,
-                "b": [min(xs), min(ys), max(xs), max(ys)],
-                "r": record_ids,
-                "txt": "\n".join(record["txt"] for record in selected),
-                "rule": {"d": round(distance_limit, 9), "m": max_chars},
+                "path": path,
+                "core_bbox": core_bbox,
+                "content_bbox": content_bbox,
+                "core_record_count": len(core_ids),
+                "record_count": len(content_ids),
+                "text_chars": text_chars,
             }
         )
-    return result
+
+    index = {
+        "schema": DRAWING_TEXT_INDEX_SCHEMA,
+        "source": drawing_text.get("source", ""),
+        "source_sha256": drawing_text.get("source_sha256", ""),
+        "units": drawing_text.get("units", {}),
+        "partition": {
+            "method": "adaptive-kd-spatial-v1",
+            "max_core_records": max_core_records,
+            "max_core_text_chars": max_core_text_chars,
+            "max_chunk_records": max_chunk_records,
+            "max_chunk_text_chars": max_chunk_text_chars,
+            "halo_text_heights": halo_text_heights,
+        },
+        "coverage": {
+            "source_records": len(records),
+            "core_records": sum(len(ids) for ids in leaves),
+            "complete": sum(len(ids) for ids in leaves) == len(records),
+        },
+        "chunks": inventory,
+    }
+    return index, chunks
 
 
 def build_drawing_text(
@@ -797,10 +954,9 @@ def build_drawing_text(
                 "exact equality of type, layer, coordinate, rotation, height, raw and clean text"
             ),
             "chunking": (
-                "same layer; coordinate order; split when consecutive distance > "
-                "max(100,40*layer median text height) or text length would exceed 800 Unicode characters"
+                "published separately as adaptive spatial JSON chunks; every source record belongs "
+                "to one core and nearby records may repeat as halo context"
             ),
         },
         "records": records,
-        "chunks": _text_chunks(records),
     }

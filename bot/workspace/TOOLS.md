@@ -28,6 +28,7 @@ Available OpenViking tools may include:
 | Tool | Use it for |
 |------|------------|
 | `openviking_search` | Semantic retrieval across resources, memories, and skills |
+| `openviking_find_resource` | Finding atomic resource Bundle roots by their best matching child |
 | `openviking_multi_read` | Reading the complete content of one or more known Viking URIs |
 | `openviking_list` | Browsing a Viking URI hierarchy |
 | `openviking_grep` | Regex or exact-text search inside OpenViking content |
@@ -37,6 +38,10 @@ Available OpenViking tools may include:
 
 ### Retrieval Workflow
 
+- For a question about stored files or their contents, call `openviking_find_resource` first with the user's actual subject and requested fact, for example `2栋 组串图 图号`. Never search for helper filenames. It returns Bundle roots and the best `matched_uri` without mixing in user memories.
+- DWG text is stored as small spatial JSON chunks under `drawing_text/`. For an exact named-item lookup such as “2栋组串接线图的图号”, use the Bundle root from `openviking_find_resource`, call `openviking_grep` once with the longest literal subject phrase and that Bundle's `drawing_text/` URI, then read only the matching JSON chunk. Never grep the whole DWG Bundle.
+- For a conceptual DWG question, or when that exact grep has no match, read the small `matched_uri` chunk directly; nearby text is intentionally repeated as halo context so fields and values remain together.
+- If discovery returns only the Bundle root or `drawing_text/index.json`, call `openviking_search` once with the same user terms scoped to that Bundle, then read the best matching chunk. Do not batch unrelated chunks.
 - Use `openviking_search` when the request is conceptual or semantic. Search results contain URIs and summaries, not necessarily full content.
 - Use `openviking_multi_read` on the relevant result URIs before relying on details that are not present in the summary. Batch independent URIs in one call.
 - Use `openviking_grep` for known text or regex patterns, `openviking_glob` for path patterns, and `openviking_list` to explore a known directory.

@@ -19,7 +19,11 @@ from PIL import Image
 
 from openviking.parse.base import NodeType, ParseResult, ResourceNode
 from openviking.parse.parsers.base_parser import BaseParser
-from openviking.parse.parsers.dwg_extract import build_beam_topology, build_drawing_text
+from openviking.parse.parsers.dwg_extract import (
+    build_beam_topology,
+    build_drawing_text,
+    build_drawing_text_chunks,
+)
 from openviking_cli.utils.uri import VikingURI
 
 
@@ -64,21 +68,36 @@ class DWGParser(BaseParser):
             source_name=source_filename,
             source_sha256=source_sha256,
         )
+        drawing_text_index, drawing_text_chunks = build_drawing_text_chunks(drawing_text)
         topology_bytes = json.dumps(topology, ensure_ascii=False, separators=(",", ":")).encode(
             "utf-8"
         )
-        drawing_text_bytes = json.dumps(
-            drawing_text, ensure_ascii=False, separators=(",", ":")
+        drawing_text_index_bytes = json.dumps(
+            drawing_text_index, ensure_ascii=False, indent=0, separators=(",", ":")
         ).encode("utf-8")
+        drawing_text_chunk_bytes = [
+            (
+                chunk["chunk"]["path"],
+                json.dumps(
+                    chunk, ensure_ascii=False, indent=0, separators=(",", ":")
+                ).encode("utf-8"),
+            )
+            for chunk in drawing_text_chunks
+        ]
 
         viking_fs = self._get_viking_fs()
         temp_uri = viking_fs.create_temp_uri()
         root_uri = f"{temp_uri}/{root_name}"
         try:
             await viking_fs.mkdir(root_uri, exist_ok=True)
+            await viking_fs.mkdir(f"{root_uri}/drawing_text", exist_ok=True)
             await viking_fs.write_file_bytes(f"{root_uri}/{source_filename}", source_bytes)
             await viking_fs.write_file_bytes(f"{root_uri}/beam_topology.json", topology_bytes)
-            await viking_fs.write_file_bytes(f"{root_uri}/drawing_text.json", drawing_text_bytes)
+            await viking_fs.write_file_bytes(
+                f"{root_uri}/drawing_text/index.json", drawing_text_index_bytes
+            )
+            for chunk_path, chunk_bytes in drawing_text_chunk_bytes:
+                await viking_fs.write_file_bytes(f"{root_uri}/{chunk_path}", chunk_bytes)
             if preview_bytes is not None:
                 await viking_fs.write_file_bytes(f"{root_uri}/preview.png", preview_bytes)
         except BaseException:
@@ -100,10 +119,12 @@ class DWGParser(BaseParser):
                 "source_size_bytes": len(source_bytes),
                 "source_modified_at": source_mtime,
                 "beam_topology": "beam_topology.json",
-                "drawing_text": "drawing_text.json",
+                "drawing_text_index": "drawing_text/index.json",
+                "drawing_text_chunks": [path for path, _ in drawing_text_chunk_bytes],
                 "preview": "preview.png" if preview_bytes is not None else None,
                 "beam_label_count": topology["stats"]["beam_labels"],
                 "drawing_text_count": len(drawing_text["records"]),
+                "drawing_text_chunk_count": len(drawing_text_chunks),
                 "summary_info": _nonempty_mapping(summary_info),
                 "temp_root_uri": root_uri,
                 "warnings": warnings,

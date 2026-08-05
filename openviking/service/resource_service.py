@@ -899,6 +899,10 @@ class ResourceService:
             if kind in {"dwg", "step"}:
                 if kind == "dwg":
                     from openviking.parse.parsers.dwg import DWGParser
+                    from openviking.parse.parsers.dwg_extract import (
+                        DRAWING_TEXT_CHUNK_SCHEMA,
+                        DRAWING_TEXT_INDEX_SCHEMA,
+                    )
 
                     parser = DWGParser()
                     derived = {
@@ -906,9 +910,9 @@ class ResourceService:
                             "beam_topology.json",
                             "deterministic-dwg-topology-v2",
                         ),
-                        "drawing_text": (
-                            "drawing_text.json",
-                            "deterministic-dwg-text-v1",
+                        "drawing_text_index": (
+                            "drawing_text/index.json",
+                            DRAWING_TEXT_INDEX_SCHEMA,
                         ),
                     }
                 else:
@@ -929,8 +933,19 @@ class ResourceService:
                 staging_parent = parsed.temp_dir_path
                 staging_uri = str(parsed.meta.get("temp_root_uri") or "")
                 if not staging_parent or not staging_uri:
-                    raise RuntimeError(
-                        f"{kind.upper()} parser did not produce a staging bundle"
+                    raise RuntimeError(f"{kind.upper()} parser did not produce a staging bundle")
+                if kind == "dwg":
+                    chunk_paths = parsed.meta.get("drawing_text_chunks")
+                    if not isinstance(chunk_paths, list) or not chunk_paths:
+                        raise RuntimeError("DWG parser did not produce drawing text chunks")
+                    derived.update(
+                        {
+                            f"drawing_text_chunk_{index:04d}": (
+                                str(chunk_path),
+                                DRAWING_TEXT_CHUNK_SCHEMA,
+                            )
+                            for index, chunk_path in enumerate(chunk_paths)
+                        }
                     )
                 await self._summarize_bundle_staging(staging_uri, ctx=ctx, timeout=timeout)
                 if kind == "dwg" and await self._viking_fs.exists(
@@ -1034,11 +1049,14 @@ class ResourceService:
         timeout: Optional[float],
     ) -> tuple[Optional[Dict[str, Any]], str]:
         """Index every searchable bundle artifact with the bundle's kind tag."""
+        scalar_override = {"search_tags": [f"kind={kind}"]}
         await index_resource(
             root_uri,
             ctx,
-            scalar_override={"search_tags": [f"kind={kind}"]},
+            scalar_override=scalar_override,
         )
+        if kind == "dwg":
+            await index_resource(f"{root_uri}/drawing_text", ctx, scalar_override=scalar_override)
         if not wait:
             return None, "queued"
         queue_manager = get_queue_manager()

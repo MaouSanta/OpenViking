@@ -241,6 +241,66 @@ class VikingListTool(OVFileTool):
             await self._release_client(tool_context, client)
 
 
+class VikingFindResourceTool(OVFileTool):
+    """Find atomic resource bundles before inspecting their contents."""
+
+    @property
+    def name(self) -> str:
+        return "openviking_find_resource"
+
+    @property
+    def description(self) -> str:
+        return (
+            "Use this first when the answer should come from stored files or resources. "
+            "Pass the user's actual subject and requested fact as the query (for example, "
+            "'2栋 组串图 图号'); never query for helper filenames. It returns atomic Bundle "
+            "roots plus the best matched child URI. For an exact DWG label/value lookup, grep "
+            "the longest literal subject inside the Bundle's drawing_text/ subtree, then read "
+            "only the matching JSON chunk; otherwise read the matched_uri directly."
+        )
+
+    @property
+    def parameters(self) -> dict[str, Any]:
+        return {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "What resource to find"},
+                "target_uri": {
+                    "type": "string",
+                    "description": "Resource scope",
+                    "default": "viking://resources/",
+                },
+                "limit": {"type": "integer", "minimum": 1, "maximum": 20, "default": 10},
+            },
+            "required": ["query"],
+        }
+
+    async def execute(
+        self,
+        tool_context: "ToolContext",
+        query: str,
+        target_uri: str = "viking://resources/",
+        limit: int = 10,
+        **kwargs: Any,
+    ) -> str:
+        client = None
+        try:
+            client = await self._get_client(tool_context)
+            result = await client.find_resource(query, target_uri=target_uri, limit=limit)
+            resources = result.get("resources", []) if isinstance(result, dict) else []
+            if not resources:
+                return f"No resource bundles found for query: {query}"
+            return json.dumps(
+                {"count": len(resources), "resources": resources},
+                ensure_ascii=False,
+                indent=2,
+            )
+        except Exception as e:
+            return f"Error finding Viking resources: {str(e)}"
+        finally:
+            await self._release_client(tool_context, client)
+
+
 class VikingSearchTool(OVFileTool):
     """Tool to search Viking resources."""
 
@@ -561,8 +621,9 @@ class VikingGrepTool(OVFileTool):
     @property
     def description(self) -> str:
         return (
-            "Search Viking resources using a regex pattern (like grep)."
-            "Result: Only URIs and summaries are included here. To view the full content, use openviking_multi_read tool."
+            "Search exact text or a regex inside a known Viking resource. For DWG questions, "
+            "search the Bundle's drawing_text subtree, then read only the matching small JSON "
+            "chunk; never scan the whole DWG Bundle. "
             "Avoid duplicate calls with the same intent in the same turn."
         )
 
@@ -573,7 +634,7 @@ class VikingGrepTool(OVFileTool):
             "properties": {
                 "uri": {
                     "type": "string",
-                    "description": "Optional Viking URI to search within. Defaults to all visible OpenViking roots plus current peer memory.",
+                    "description": "Exact file or narrow subtree URI to search.",
                     "default": "viking://",
                 },
                 "pattern": {
@@ -880,7 +941,10 @@ class VikingMultiReadTool(OVFileTool):
 
     @property
     def description(self) -> str:
-        return "Read full content from multiple OpenViking resources concurrently. Returns complete content for all URIs with no truncation."
+        return (
+            "Read complete content from known small OpenViking files. DWG spatial chunks under "
+            "drawing_text/ are designed for direct reading; do not batch unrelated chunks."
+        )
 
     @property
     def parameters(self) -> dict[str, Any]:

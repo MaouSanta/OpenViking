@@ -250,7 +250,9 @@ async def test_dwg_bundle_publishes_complete_artifact_inventory(tmp_path, monkey
         files = {
             "plan.dwg": b"dwg snapshot",
             "beam_topology.json": b'{"schema":"deterministic-dwg-topology-v2"}',
-            "drawing_text.json": b'{"schema":"deterministic-dwg-text-v1"}',
+            "drawing_text/index.json": b'{"schema":"deterministic-dwg-text-index-v1"}',
+            "drawing_text/0000_x0_y0_x10_y10.json": b'{"schema":"deterministic-dwg-text-chunk-v1"}',
+            "drawing_text/0001_x10_y10_x20_y20.json": b'{"schema":"deterministic-dwg-text-chunk-v1"}',
             ".abstract.md": b"plan abstract",
             ".overview.md": b"plan overview",
             "preview.png": b"png",
@@ -259,7 +261,13 @@ async def test_dwg_bundle_publishes_complete_artifact_inventory(tmp_path, monkey
             viking_fs.files[f"{staging}/{name}"] = content
         return SimpleNamespace(
             temp_dir_path="viking://temp/job",
-            meta={"temp_root_uri": staging},
+            meta={
+                "temp_root_uri": staging,
+                "drawing_text_chunks": [
+                    "drawing_text/0000_x0_y0_x10_y10.json",
+                    "drawing_text/0001_x10_y10_x20_y20.json",
+                ],
+            },
         )
 
     monkeypatch.setattr(resource_service_module, "find_resource_bundle_root", no_parent_bundle)
@@ -278,7 +286,9 @@ async def test_dwg_bundle_publishes_complete_artifact_inventory(tmp_path, monkey
     assert set(viking_fs.files) == {
         f"{root}/plan.dwg",
         f"{root}/beam_topology.json",
-        f"{root}/drawing_text.json",
+        f"{root}/drawing_text/index.json",
+        f"{root}/drawing_text/0000_x0_y0_x10_y10.json",
+        f"{root}/drawing_text/0001_x10_y10_x20_y20.json",
         f"{root}/.abstract.md",
         f"{root}/.overview.md",
         f"{root}/preview.png",
@@ -288,7 +298,9 @@ async def test_dwg_bundle_publishes_complete_artifact_inventory(tmp_path, monkey
     assert set(manifest["artifacts"]) == {
         "source",
         "beam_topology",
-        "drawing_text",
+        "drawing_text_index",
+        "drawing_text_chunk_0000",
+        "drawing_text_chunk_0001",
         "abstract",
         "overview",
         "preview",
@@ -319,7 +331,10 @@ async def test_dwg_bundle_failure_leaves_no_published_tree(tmp_path, monkeypatch
         viking_fs.files[f"{staging}/plan.dwg"] = b"dwg snapshot"
         return SimpleNamespace(
             temp_dir_path="viking://temp/job",
-            meta={"temp_root_uri": staging},
+            meta={
+                "temp_root_uri": staging,
+                "drawing_text_chunks": ["drawing_text/0000_x0_y0_x0_y0.json"],
+            },
         )
 
     monkeypatch.setattr(resource_service_module, "find_resource_bundle_root", no_parent_bundle)
@@ -380,6 +395,27 @@ async def test_bundle_indexes_every_searchable_artifact(
 
 
 @pytest.mark.asyncio
+async def test_dwg_bundle_indexes_the_spatial_text_directory(monkeypatch, ctx):
+    service = _bundle_service(_BundleFS())
+    index = AsyncMock()
+    monkeypatch.setattr(resource_service_module, "index_resource", index)
+
+    queue_status, vector_status = await service._index_atomic_resource_bundle(
+        root_uri="viking://resources/plan",
+        kind="dwg",
+        ctx=ctx,
+        wait=False,
+        timeout=None,
+    )
+
+    assert (queue_status, vector_status) == (None, "queued")
+    assert [call.args[0] for call in index.await_args_list] == [
+        "viking://resources/plan",
+        "viking://resources/plan/drawing_text",
+    ]
+
+
+@pytest.mark.asyncio
 async def test_bundle_keeps_its_snapshot_if_indexing_fails(tmp_path, monkeypatch, ctx):
     source = tmp_path / "gear.glb"
     source.write_bytes(b"glTF gear")
@@ -425,9 +461,7 @@ async def test_step_bundle_publishes_flat_evidence_and_six_views(
     viking_fs = _BundleFS()
     service = _bundle_service(viking_fs)
     lock = _lease()
-    service._plan_resource_target = AsyncMock(
-        return_value=("viking://resources/gear", lock)
-    )
+    service._plan_resource_target = AsyncMock(return_value=("viking://resources/gear", lock))
     service._summarize_bundle_staging = AsyncMock(return_value={})
 
     async def no_parent_bundle(*_args, **_kwargs):
