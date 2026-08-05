@@ -1,6 +1,6 @@
 export const MAX_UPLOAD_FILES = 10
 export const MAX_UPLOAD_FILE_SIZE_BYTES = 10 * 1024 * 1024
-export const MAX_DWG_UPLOAD_FILE_SIZE_BYTES = 100 * 1024 * 1024
+export const MAX_CAD_UPLOAD_FILE_SIZE_BYTES = 100 * 1024 * 1024
 
 const BLOCKED_EXTENSIONS = new Set([
   '.pyc',
@@ -49,11 +49,11 @@ export function getUploadPolicy(name: string): {
   bundle: boolean
   maxSizeBytes: number
 } {
-  const bundle = getExtensionFromName(name) === 'dwg'
+  const bundle = ['dwg', 'stp', 'step'].includes(getExtensionFromName(name))
   return {
     bundle,
     maxSizeBytes: bundle
-      ? MAX_DWG_UPLOAD_FILE_SIZE_BYTES
+      ? MAX_CAD_UPLOAD_FILE_SIZE_BYTES
       : MAX_UPLOAD_FILE_SIZE_BYTES,
   }
 }
