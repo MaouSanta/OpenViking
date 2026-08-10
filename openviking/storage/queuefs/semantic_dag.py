@@ -179,6 +179,7 @@ class SemanticDagExecutor:
         changes: Optional[Dict[str, List[str]]] = None,
         skip_vectorization: bool = False,
         ingest_options: IngestOptions | None = None,
+        bundle_assembly: bool = False,
         coalesce_key: str = "",
         coalesce_version: int = 0,
     ):
@@ -195,6 +196,7 @@ class SemanticDagExecutor:
         self._changes = changes or {}
         self._skip_vectorization = skip_vectorization
         self._ingest_options = IngestOptions.from_value(ingest_options)
+        self._bundle_assembly = bundle_assembly
         self._coalesce_key = coalesce_key
         self._coalesce_version = coalesce_version
         self._task_context = get_task_context()
@@ -561,6 +563,8 @@ class SemanticDagExecutor:
 
             item_uri = VikingURI(uri).join(name).uri
             if entry.get("isDir", False):
+                if self._bundle_assembly and name == "drawing_text":
+                    continue
                 children_dirs.append(item_uri)
             else:
                 file_paths.append(item_uri)

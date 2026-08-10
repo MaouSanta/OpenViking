@@ -462,6 +462,7 @@ class SemanticProcessor(DequeueHandlerBase):
                                     changes=changes,
                                     skip_vectorization=msg.skip_vectorization,
                                     ingest_options=msg.ingest_options,
+                                    bundle_assembly=msg.bundle_assembly,
                                     coalesce_key=msg.coalesce_key,
                                     coalesce_version=msg.coalesce_version,
                                 )
