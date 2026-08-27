@@ -10,7 +10,11 @@ from unittest.mock import AsyncMock, call
 
 import pytest
 
-from openviking.resource.atomic_bundle import is_resource_bundle_manifest
+from openviking.resource.atomic_bundle import (
+    find_resource_bundle_owner_root,
+    find_resource_bundle_root,
+    is_resource_bundle_manifest,
+)
 from openviking.server.identity import RequestContext, Role
 from openviking.service import resource_service as resource_service_module
 from openviking.service import search_service as search_service_module
@@ -71,6 +75,10 @@ class _BundleFS:
         return "viking://temp/staging"
 
     async def read_file_bytes(self, uri, *, ctx=None):
+        del ctx
+        return self.files[uri]
+
+    async def read_file(self, uri, *, ctx=None):
         del ctx
         return self.files[uri]
 
@@ -141,6 +149,46 @@ def test_bundle_marker_reads_v1_and_requires_a_v2_artifact_inventory():
             },
         }
     )
+    assert is_resource_bundle_manifest(
+        {
+            "schema": "openviking.resource-bundle/v3",
+            "kind": "dwg-sheet",
+            "owner": {"document_id": "dwg-123"},
+            "sheet": {"id": "S001", "title": "一层平面图"},
+            "source_ref": {"path": "../../plan.dwg", "sha256": "a" * 64},
+            "artifacts": {
+                "content": {
+                    "path": "content.md",
+                    "schema": "text/markdown",
+                    "sha256": "b" * 64,
+                    "searchable": True,
+                },
+                "structure": {
+                    "path": "structure.json",
+                    "schema": "openviking.dwg-sheet-structure/v1",
+                    "sha256": "c" * 64,
+                    "searchable": False,
+                },
+            },
+        }
+    )
+    assert not is_resource_bundle_manifest(
+        {
+            "schema": "openviking.resource-bundle/v3",
+            "kind": "dwg-sheet",
+            "owner": {"document_id": "dwg-123"},
+            "sheet": {"id": "S001"},
+            "source_ref": {"path": "../../plan.dwg", "sha256": "a" * 64},
+            "artifacts": {
+                "structure": {
+                    "path": "structure.json",
+                    "schema": "openviking.dwg-sheet-structure/v1",
+                    "sha256": "c" * 64,
+                    "searchable": False,
+                }
+            },
+        }
+    )
     assert not is_resource_bundle_manifest(
         {
             "schema": "openviking.resource-bundle/v2",
@@ -178,6 +226,46 @@ def test_bundle_kind_tag_is_applied_to_each_embedding_message():
     _apply_scalar_overrides(message, {"search_tags": ["kind=dwg"]})
 
     assert message.context_data["search_tags"] == ["kind=dwg"]
+
+
+@pytest.mark.asyncio
+async def test_nested_sheet_searches_nearest_but_mutations_resolve_document_owner(ctx):
+    viking_fs = _BundleFS()
+    root = "viking://resources/plan"
+    sheet = f"{root}/sheets/S001"
+    viking_fs.files[f"{root}/manifest.json"] = json.dumps(
+        {
+            "schema": "openviking.resource-bundle/v2",
+            "kind": "dwg",
+            "source": {
+                "path": "plan.dwg",
+                "sha256": "a" * 64,
+                "ingested_at": "2026-08-27T00:00:00+00:00",
+            },
+            "artifacts": {"source": {"path": "plan.dwg", "schema": "dwg", "sha256": "a" * 64}},
+        }
+    ).encode()
+    viking_fs.files[f"{sheet}/manifest.json"] = json.dumps(
+        {
+            "schema": "openviking.resource-bundle/v3",
+            "kind": "dwg-sheet",
+            "owner": {"document_id": "dwg-doc-1"},
+            "sheet": {"id": "S001", "title": "一层平面图"},
+            "source_ref": {"path": "../../plan.dwg", "sha256": "a" * 64},
+            "artifacts": {
+                "content": {
+                    "path": "content.md",
+                    "schema": "text/markdown",
+                    "sha256": "b" * 64,
+                    "searchable": True,
+                }
+            },
+        }
+    ).encode()
+
+    content_uri = f"{sheet}/content.md"
+    assert await find_resource_bundle_root(viking_fs, content_uri, ctx=ctx) == sheet
+    assert await find_resource_bundle_owner_root(viking_fs, content_uri, ctx=ctx) == root
 
 
 @pytest.mark.asyncio
@@ -233,7 +321,7 @@ async def test_add_raw_resource_bundle_writes_only_source_and_manifest(
 
 
 @pytest.mark.asyncio
-async def test_dwg_bundle_publishes_complete_artifact_inventory(tmp_path, monkeypatch, ctx):
+async def test_dwg_bundle_publishes_document_and_nested_sheet_bundle(tmp_path, monkeypatch, ctx):
     source = tmp_path / "plan.dwg"
     source.write_bytes(b"dwg snapshot")
     viking_fs = _BundleFS()
@@ -249,12 +337,10 @@ async def test_dwg_bundle_publishes_complete_artifact_inventory(tmp_path, monkey
         staging = "viking://temp/job/plan_dwg"
         files = {
             "plan.dwg": b"dwg snapshot",
+            "document.json": b'{"schema":"openviking.dwg-document/v1","document_id":"dwg-doc-1"}',
             "beam_topology.json": b'{"schema":"deterministic-dwg-topology-v2"}',
-            "drawing_text/index.json": b'{"schema":"deterministic-dwg-text-index-v1"}',
-            "drawing_text/0000_x0_y0_x10_y10.json": b'{"schema":"deterministic-dwg-text-chunk-v1"}',
-            "drawing_text/0001_x10_y10_x20_y20.json": b'{"schema":"deterministic-dwg-text-chunk-v1"}',
-            ".abstract.md": b"plan abstract",
-            ".overview.md": b"plan overview",
+            "sheets/S001/content.md": "# 一层平面图\n\n生产辅助间".encode(),
+            "sheets/S001/structure.json": b'{"schema":"openviking.dwg-sheet-structure/v1"}',
             "preview.png": b"png",
         }
         for name, content in files.items():
@@ -263,9 +349,16 @@ async def test_dwg_bundle_publishes_complete_artifact_inventory(tmp_path, monkey
             temp_dir_path="viking://temp/job",
             meta={
                 "temp_root_uri": staging,
-                "drawing_text_chunks": [
-                    "drawing_text/0000_x0_y0_x10_y10.json",
-                    "drawing_text/0001_x10_y10_x20_y20.json",
+                "document_manifest": "document.json",
+                "beam_topology": "beam_topology.json",
+                "sheet_bundles": [
+                    {
+                        "sheet_id": "S001",
+                        "directory": "sheets/S001",
+                        "title": "一层平面图",
+                        "content_paths": ["sheets/S001/content.md"],
+                        "structure_path": "sheets/S001/structure.json",
+                    }
                 ],
             },
         )
@@ -283,33 +376,43 @@ async def test_dwg_bundle_publishes_complete_artifact_inventory(tmp_path, monkey
 
     root = "viking://resources/plan"
     assert result["semantic_status"] == "complete"
+    assert result["document_id"] == "dwg-doc-1"
+    assert result["sheet_uris"] == [f"{root}/sheets/S001"]
     assert set(viking_fs.files) == {
         f"{root}/plan.dwg",
+        f"{root}/document.json",
         f"{root}/beam_topology.json",
-        f"{root}/drawing_text/index.json",
-        f"{root}/drawing_text/0000_x0_y0_x10_y10.json",
-        f"{root}/drawing_text/0001_x10_y10_x20_y20.json",
-        f"{root}/.abstract.md",
-        f"{root}/.overview.md",
-        f"{root}/preview.png",
+        f"{root}/sheets/S001/content.md",
+        f"{root}/sheets/S001/structure.json",
+        f"{root}/sheets/S001/manifest.json",
         f"{root}/manifest.json",
     }
     manifest = json.loads(viking_fs.files[f"{root}/manifest.json"])
     assert set(manifest["artifacts"]) == {
         "source",
+        "document",
         "beam_topology",
-        "drawing_text_index",
-        "drawing_text_chunk_0000",
-        "drawing_text_chunk_0001",
-        "abstract",
-        "overview",
-        "preview",
+        "sheet_0000",
     }
     assert all(
         {"path", "schema", "sha256"} <= artifact.keys()
         for artifact in manifest["artifacts"].values()
     )
+    sheet_manifest = json.loads(viking_fs.files[f"{root}/sheets/S001/manifest.json"])
+    assert sheet_manifest["schema"] == "openviking.resource-bundle/v3"
+    assert sheet_manifest["kind"] == "dwg-sheet"
+    assert sheet_manifest["owner"] == {"document_id": "dwg-doc-1"}
+    assert sheet_manifest["source_ref"] == {
+        "path": "../../plan.dwg",
+        "sha256": hashlib.sha256(b"dwg snapshot").hexdigest(),
+    }
+    assert sheet_manifest["artifacts"]["content"]["searchable"] is True
+    assert sheet_manifest["artifacts"]["structure"]["searchable"] is False
     assert not any(path.endswith("libredwg.json") for path in viking_fs.files)
+    assert not any("preview" in path for path in viking_fs.files)
+    service._summarize_bundle_staging.assert_awaited_once_with(
+        "viking://temp/job/plan_dwg/sheets/S001", ctx=ctx, timeout=None
+    )
     service._release_lock_ref.assert_awaited_once_with(lock)
 
 
@@ -328,12 +431,29 @@ async def test_dwg_bundle_failure_leaves_no_published_tree(tmp_path, monkeypatch
 
     async def parse_dwg(_parser, _source, **_kwargs):
         staging = "viking://temp/job/plan_dwg"
-        viking_fs.files[f"{staging}/plan.dwg"] = b"dwg snapshot"
+        files = {
+            "plan.dwg": b"dwg snapshot",
+            "document.json": b'{"document_id":"dwg-doc-1"}',
+            "beam_topology.json": b"{}",
+            "sheets/S001/content.md": b"# Sheet",
+            "sheets/S001/structure.json": b"{}",
+        }
+        for name, content in files.items():
+            viking_fs.files[f"{staging}/{name}"] = content
         return SimpleNamespace(
             temp_dir_path="viking://temp/job",
             meta={
                 "temp_root_uri": staging,
-                "drawing_text_chunks": ["drawing_text/0000_x0_y0_x0_y0.json"],
+                "document_manifest": "document.json",
+                "beam_topology": "beam_topology.json",
+                "sheet_bundles": [
+                    {
+                        "sheet_id": "S001",
+                        "directory": "sheets/S001",
+                        "content_path": "sheets/S001/content.md",
+                        "structure_path": "sheets/S001/structure.json",
+                    }
+                ],
             },
         )
 
@@ -352,6 +472,52 @@ async def test_dwg_bundle_failure_leaves_no_published_tree(tmp_path, monkeypatch
     assert not any(path.startswith("viking://resources/plan") for path in viking_fs.files)
     assert not any(path.startswith("viking://temp/job") for path in viking_fs.files)
     service._release_lock_ref.assert_awaited_once_with(lock)
+
+
+@pytest.mark.asyncio
+async def test_dwg_sheet_directories_cannot_overlap(ctx):
+    viking_fs = _BundleFS()
+    service = _bundle_service(viking_fs)
+    service._summarize_bundle_staging = AsyncMock(return_value={})
+    staging = "viking://temp/job/plan_dwg"
+    files = {
+        "plan.dwg": b"dwg snapshot",
+        "document.json": b'{"document_id":"dwg-doc-1"}',
+        "beam_topology.json": b"{}",
+        "sheets/S001/content.md": b"# Sheet",
+        "sheets/S001/structure.json": b"{}",
+        "sheets/S001/detail/content.md": b"# Nested",
+        "sheets/S001/detail/structure.json": b"{}",
+    }
+    for name, content in files.items():
+        viking_fs.files[f"{staging}/{name}"] = content
+
+    with pytest.raises(RuntimeError, match="overlapping sheet directories"):
+        await service._assemble_dwg_sheet_bundles(
+            staging_uri=staging,
+            parsed_meta={
+                "document_manifest": "document.json",
+                "beam_topology": "beam_topology.json",
+                "sheet_bundles": [
+                    {
+                        "sheet_id": "S001",
+                        "directory": "sheets/S001",
+                        "content_path": "sheets/S001/content.md",
+                        "structure_path": "sheets/S001/structure.json",
+                    },
+                    {
+                        "sheet_id": "S002",
+                        "directory": "sheets/S001/detail",
+                        "content_path": "sheets/S001/detail/content.md",
+                        "structure_path": "sheets/S001/detail/structure.json",
+                    },
+                ],
+            },
+            stored_name="plan.dwg",
+            source_sha256=hashlib.sha256(b"dwg snapshot").hexdigest(),
+            ctx=ctx,
+            timeout=None,
+        )
 
 
 @pytest.mark.asyncio
@@ -395,7 +561,7 @@ async def test_bundle_indexes_every_searchable_artifact(
 
 
 @pytest.mark.asyncio
-async def test_dwg_bundle_indexes_the_spatial_text_directory(monkeypatch, ctx):
+async def test_dwg_bundle_indexes_only_sheet_markdown(monkeypatch, ctx):
     service = _bundle_service(_BundleFS())
     index = AsyncMock()
     monkeypatch.setattr(resource_service_module, "index_resource", index)
@@ -406,13 +572,25 @@ async def test_dwg_bundle_indexes_the_spatial_text_directory(monkeypatch, ctx):
         ctx=ctx,
         wait=False,
         timeout=None,
+        sheet_bundles=[
+            {
+                "directory": "sheets/S001",
+                "content_paths": [
+                    "sheets/S001/content_001.md",
+                    "sheets/S001/content_002.md",
+                ],
+            }
+        ],
     )
 
     assert (queue_status, vector_status) == (None, "queued")
-    assert [call.args[0] for call in index.await_args_list] == [
-        "viking://resources/plan",
-        "viking://resources/plan/drawing_text",
-    ]
+    index.assert_awaited_once_with(
+        "viking://resources/plan/sheets/S001",
+        ctx,
+        scalar_override={"search_tags": ["kind=dwg-sheet"]},
+        include_files={"content_001.md", "content_002.md"},
+        include_directory_meta=False,
+    )
 
 
 @pytest.mark.asyncio

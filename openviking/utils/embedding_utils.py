@@ -659,12 +659,16 @@ async def index_resource(
     ctx: RequestContext,
     ingest_options: IngestOptions | None = None,
     scalar_override: Optional[Dict[str, Any]] = None,
+    include_files: Optional[set[str]] = None,
+    include_directory_meta: bool = True,
 ) -> None:
     """
     Build vector index for a resource directory.
 
-    1. Reads .abstract.md and .overview.md and vectorizes them.
-    2. Scans files in the directory and vectorizes them.
+    1. Reads .abstract.md and .overview.md and vectorizes them unless
+       ``include_directory_meta`` is false.
+    2. Scans files in the directory and vectorizes them. ``include_files`` can
+       restrict this to explicitly model-readable direct children.
 
     The context_type is derived from the URI so that memory directories
     (``/memories/``) are indexed as ``"memory"`` rather than the default
@@ -684,15 +688,15 @@ async def index_resource(
     abstract = ""
     overview = ""
 
-    if await viking_fs.exists(abstract_uri, ctx=ctx):
+    if include_directory_meta and await viking_fs.exists(abstract_uri, ctx=ctx):
         content = await viking_fs.read_file(abstract_uri, ctx=ctx)
         abstract = content.decode("utf-8") if isinstance(content, bytes) else content
 
-    if await viking_fs.exists(overview_uri, ctx=ctx):
+    if include_directory_meta and await viking_fs.exists(overview_uri, ctx=ctx):
         content = await viking_fs.read_file(overview_uri, ctx=ctx)
         overview = content.decode("utf-8") if isinstance(content, bytes) else content
 
-    if abstract or overview:
+    if include_directory_meta and (abstract or overview):
         await vectorize_directory_meta(
             uri,
             abstract,
@@ -714,6 +718,9 @@ async def index_resource(
 
             # Skip hidden files (like .abstract.md)
             if file_name.startswith("."):
+                continue
+
+            if include_files is not None and file_name not in include_files:
                 continue
 
             if file_info.get("type") == "directory" or file_info.get("isDir"):

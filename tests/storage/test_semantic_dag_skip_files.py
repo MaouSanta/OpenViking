@@ -198,5 +198,37 @@ async def test_bundle_assembly_excludes_dwg_text_chunks(monkeypatch):
     assert not any(path.startswith(f"{chunk_dir}/") for path, _ in fake_fs.writes)
 
 
+@pytest.mark.asyncio
+async def test_bundle_assembly_excludes_machine_manifests(monkeypatch):
+    root_uri = "viking://temp/plan_dwg/sheets/S001"
+    tree = {
+        root_uri: [
+            {"name": "content.md", "isDir": False},
+            {"name": "structure.json", "isDir": False},
+            {"name": "document.json", "isDir": False},
+            {"name": "manifest.json", "isDir": False},
+        ]
+    }
+    fake_fs = _FakeVikingFS(tree)
+    monkeypatch.setattr("openviking.storage.queuefs.semantic_dag.get_viking_fs", lambda: fake_fs)
+    monkeypatch.setattr(
+        "openviking.storage.queuefs.embedding_tracker.EmbeddingTaskTracker.get_instance",
+        lambda: _DummyTracker(),
+    )
+
+    processor = _FakeProcessor()
+    ctx = RequestContext(user=UserIdentifier("acc1", "user1"), role=Role.USER)
+    executor = SemanticDagExecutor(
+        processor=processor,
+        context_type="resource",
+        max_concurrent_llm=2,
+        ctx=ctx,
+        bundle_assembly=True,
+    )
+    await executor.run(root_uri)
+
+    assert processor.summarized_files == [f"{root_uri}/content.md"]
+
+
 if __name__ == "__main__":
     pytest.main([__file__])

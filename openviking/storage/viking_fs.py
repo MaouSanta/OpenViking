@@ -515,9 +515,9 @@ class VikingFS:
         """Reject a mutation of a member of an immutable atomic resource bundle."""
         if allow_atomic_bundle_write:
             return
-        from openviking.resource.atomic_bundle import find_resource_bundle_root
+        from openviking.resource.atomic_bundle import find_resource_bundle_owner_root
 
-        root_uri = await find_resource_bundle_root(
+        root_uri = await find_resource_bundle_owner_root(
             self,
             uri,
             ctx=self._ctx_or_default(ctx),
@@ -622,9 +622,9 @@ class VikingFS:
         uri_is_directory: bool,
     ) -> None:
         """Allow deleting a bundle root, but never one of its members."""
-        from openviking.resource.atomic_bundle import find_resource_bundle_root
+        from openviking.resource.atomic_bundle import find_resource_bundle_owner_root
 
-        root_uri = await find_resource_bundle_root(
+        root_uri = await find_resource_bundle_owner_root(
             self,
             uri,
             ctx=self._ctx_or_default(ctx),
@@ -646,10 +646,10 @@ class VikingFS:
         source_is_directory: bool,
     ) -> bool:
         """Keep moves at bundle boundaries and prevent writes into an existing bundle."""
-        from openviking.resource.atomic_bundle import find_resource_bundle_root
+        from openviking.resource.atomic_bundle import find_resource_bundle_owner_root
 
         real_ctx = self._ctx_or_default(ctx)
-        source_root = await find_resource_bundle_root(
+        source_root = await find_resource_bundle_owner_root(
             self,
             old_uri,
             ctx=real_ctx,
@@ -662,7 +662,7 @@ class VikingFS:
                 details={"bundle_root": source_root, "uri": old_uri},
             )
 
-        destination_root = await find_resource_bundle_root(
+        destination_root = await find_resource_bundle_owner_root(
             self,
             new_uri,
             ctx=real_ctx,

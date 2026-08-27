@@ -26,6 +26,7 @@ logger = get_logger(__name__)
 # These are canonical archives (e.g. session transcripts) whose content provides
 # no additional retrieval value and would only waste tokens and add latency.
 _SKIP_FILENAMES = frozenset({"messages.jsonl"})
+_BUNDLE_MACHINE_FILENAMES = frozenset({"document.json", "manifest.json", "structure.json"})
 
 
 @dataclass
@@ -559,6 +560,8 @@ class SemanticDagExecutor:
         for entry in entries:
             name = entry.get("name", "")
             if not name or name.startswith(".") or name in [".", ".."] or name in _SKIP_FILENAMES:
+                continue
+            if self._bundle_assembly and name in _BUNDLE_MACHINE_FILENAMES:
                 continue
 
             item_uri = VikingURI(uri).join(name).uri

@@ -6,24 +6,18 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-import io
 import json
-import struct
 import tempfile
 import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 
-from PIL import Image
-
 from openviking.parse.base import NodeType, ParseResult, ResourceNode
 from openviking.parse.parsers.base_parser import BaseParser
-from openviking.parse.parsers.dwg_extract import (
-    build_beam_topology,
-    build_drawing_text,
-    build_drawing_text_chunks,
-)
+from openviking.parse.parsers.dwg_extract import build_beam_topology
+from openviking.parse.parsers.dwg_sheet import build_sheet_artifacts
+from openviking_cli.utils.config import get_openviking_config
 from openviking_cli.utils.uri import VikingURI
 
 
@@ -47,11 +41,7 @@ class DWGParser(BaseParser):
             _read_source_snapshot, source_path
         )
         drawing, _json_bytes, conversion_warnings = await self._export_dwg_json(source_path)
-        preview_bytes, preview_warning = _extract_embedded_preview(drawing)
-
         warnings = [*conversion_warnings, *_collect_warnings(drawing)]
-        if preview_warning:
-            warnings.append(preview_warning)
 
         requested_name = kwargs.get("source_name")
         original_filename = Path(requested_name).name if requested_name else source_path.name
@@ -63,43 +53,41 @@ class DWGParser(BaseParser):
             source_sha256=source_sha256,
             source_size_bytes=len(source_bytes),
         )
-        drawing_text = build_drawing_text(
+        markdown_config = get_openviking_config().markdown
+        sheet_artifacts = build_sheet_artifacts(
             drawing,
             source_name=source_filename,
             source_sha256=source_sha256,
+            source_size_bytes=len(source_bytes),
+            max_section_tokens=markdown_config.max_section_size,
+            max_section_chars=markdown_config.max_section_chars,
         )
-        drawing_text_index, drawing_text_chunks = build_drawing_text_chunks(drawing_text)
         topology_bytes = json.dumps(topology, ensure_ascii=False, separators=(",", ":")).encode(
             "utf-8"
         )
-        drawing_text_index_bytes = json.dumps(
-            drawing_text_index, ensure_ascii=False, indent=0, separators=(",", ":")
+        document_bytes = json.dumps(
+            sheet_artifacts["document"], ensure_ascii=False, indent=2
         ).encode("utf-8")
-        drawing_text_chunk_bytes = [
-            (
-                chunk["chunk"]["path"],
-                json.dumps(
-                    chunk, ensure_ascii=False, indent=0, separators=(",", ":")
-                ).encode("utf-8"),
-            )
-            for chunk in drawing_text_chunks
-        ]
 
         viking_fs = self._get_viking_fs()
         temp_uri = viking_fs.create_temp_uri()
         root_uri = f"{temp_uri}/{root_name}"
         try:
             await viking_fs.mkdir(root_uri, exist_ok=True)
-            await viking_fs.mkdir(f"{root_uri}/drawing_text", exist_ok=True)
+            await viking_fs.mkdir(f"{root_uri}/sheets", exist_ok=True)
             await viking_fs.write_file_bytes(f"{root_uri}/{source_filename}", source_bytes)
             await viking_fs.write_file_bytes(f"{root_uri}/beam_topology.json", topology_bytes)
-            await viking_fs.write_file_bytes(
-                f"{root_uri}/drawing_text/index.json", drawing_text_index_bytes
-            )
-            for chunk_path, chunk_bytes in drawing_text_chunk_bytes:
-                await viking_fs.write_file_bytes(f"{root_uri}/{chunk_path}", chunk_bytes)
-            if preview_bytes is not None:
-                await viking_fs.write_file_bytes(f"{root_uri}/preview.png", preview_bytes)
+            await viking_fs.write_file_bytes(f"{root_uri}/document.json", document_bytes)
+            for sheet in sheet_artifacts["sheets"]:
+                await viking_fs.mkdir(f"{root_uri}/{sheet['directory']}", exist_ok=True)
+                for filename, content in sheet["content_files"]:
+                    await viking_fs.write_file_bytes(
+                        f"{root_uri}/{sheet['directory']}/{filename}", content.encode("utf-8")
+                    )
+                await viking_fs.write_file_bytes(
+                    f"{root_uri}/{sheet['structure_path']}",
+                    json.dumps(sheet["structure"], ensure_ascii=False, indent=2).encode("utf-8"),
+                )
         except BaseException:
             try:
                 await viking_fs.delete_temp(temp_uri)
@@ -119,12 +107,22 @@ class DWGParser(BaseParser):
                 "source_size_bytes": len(source_bytes),
                 "source_modified_at": source_mtime,
                 "beam_topology": "beam_topology.json",
-                "drawing_text_index": "drawing_text/index.json",
-                "drawing_text_chunks": [path for path, _ in drawing_text_chunk_bytes],
-                "preview": "preview.png" if preview_bytes is not None else None,
+                "document_manifest": "document.json",
+                "sheet_bundles": [
+                    {
+                        key: sheet[key]
+                        for key in (
+                            "sheet_id",
+                            "directory",
+                            "title",
+                            "content_paths",
+                            "structure_path",
+                        )
+                    }
+                    for sheet in sheet_artifacts["sheets"]
+                ],
                 "beam_label_count": topology["stats"]["beam_labels"],
-                "drawing_text_count": len(drawing_text["records"]),
-                "drawing_text_chunk_count": len(drawing_text_chunks),
+                "sheet_count": len(sheet_artifacts["sheets"]),
                 "summary_info": _nonempty_mapping(summary_info),
                 "temp_root_uri": root_uri,
                 "warnings": warnings,
@@ -136,7 +134,7 @@ class DWGParser(BaseParser):
             temp_dir_path=temp_uri,
             source_format="dwg",
             parser_name="DWGParser",
-            parser_version="2.0",
+            parser_version="3.0",
             parse_time=time.perf_counter() - started_at,
             parse_timestamp=datetime.now(timezone.utc),
             meta=root_node.meta,
@@ -319,64 +317,3 @@ def _collect_warnings(drawing: Dict[str, Any]) -> List[str]:
     if xref_count:
         warnings.append(f"{xref_count} possible XREF references detected")
     return warnings
-
-
-def _extract_embedded_preview(drawing: Dict[str, Any]) -> Tuple[Optional[bytes], Optional[str]]:
-    thumbnail = drawing.get("THUMBNAILIMAGE")
-    chain = thumbnail.get("chain") if isinstance(thumbnail, dict) else None
-    if not chain:
-        return None, "No usable embedded DWG preview"
-    try:
-        if isinstance(chain, str):
-            raw = bytes.fromhex("".join(chain.split()))
-        elif isinstance(chain, list):
-            raw = bytes(chain)
-        else:
-            return None, "No usable embedded DWG preview"
-        for signature in (b"\x89PNG\r\n\x1a\n", b"\xff\xd8\xff"):
-            start = raw.find(signature)
-            if start >= 0:
-                preview = _image_as_png(raw[start:])
-                if preview:
-                    return preview, None
-        start = raw.find(b"\x28\x00\x00\x00")
-        while start >= 0:
-            preview = _image_as_png(_dib_as_bmp(raw[start:]))
-            if preview:
-                return preview, None
-            start = raw.find(b"\x28\x00\x00\x00", start + 1)
-    except Exception:
-        pass
-    return None, "No usable embedded DWG preview"
-
-
-def _dib_as_bmp(dib: bytes) -> bytes:
-    if len(dib) < 40:
-        return b""
-    header_size = struct.unpack_from("<I", dib, 0)[0]
-    if header_size < 12 or header_size > len(dib):
-        return b""
-    if header_size == 12:
-        bit_count = struct.unpack_from("<H", dib, 10)[0]
-        palette_size = (1 << bit_count) * 3 if bit_count <= 8 else 0
-    else:
-        bit_count = struct.unpack_from("<H", dib, 14)[0]
-        colors_used = struct.unpack_from("<I", dib, 32)[0] if len(dib) >= 36 else 0
-        palette_size = (colors_used or (1 << bit_count)) * 4 if bit_count <= 8 else 0
-    pixel_offset = 14 + header_size + palette_size
-    if pixel_offset > 14 + len(dib):
-        return b""
-    return b"BM" + struct.pack("<IHHI", 14 + len(dib), 0, 0, pixel_offset) + dib
-
-
-def _image_as_png(raw: bytes) -> Optional[bytes]:
-    if not raw:
-        return None
-    try:
-        with Image.open(io.BytesIO(raw)) as image:
-            image.load()
-            output = io.BytesIO()
-            image.save(output, format="PNG")
-            return output.getvalue()
-    except Exception:
-        return None

@@ -11,11 +11,12 @@ import contextlib
 import hashlib
 import inspect
 import json
+import posixpath
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 from uuid import uuid4
 
@@ -24,6 +25,8 @@ from openviking.core.uri_validation import validate_optional_content_target_uri
 from openviking.parse.parsers.constants import MPEG_TS_EXTENSION_ALIAS
 from openviking.resource.atomic_bundle import (
     RESOURCE_BUNDLE_MANIFEST,
+    RESOURCE_BUNDLE_SCHEMA_V3,
+    build_dwg_sheet_manifest,
     build_manifest,
     find_resource_bundle_root,
     kind_from_source_name,
@@ -824,6 +827,224 @@ class ResourceService:
             )
         return artifacts
 
+    @staticmethod
+    def _bundle_relative_path(value: Any, field: str) -> str:
+        if not isinstance(value, str) or not value.strip():
+            raise RuntimeError(f"DWG parser returned an invalid {field}")
+        raw = value.strip()
+        path = PurePosixPath(raw)
+        if (
+            raw.startswith("/")
+            or "\\" in raw
+            or "://" in raw
+            or any(part in {"", ".", ".."} for part in path.parts)
+        ):
+            raise RuntimeError(f"DWG parser returned an unsafe {field}: {value}")
+        return str(path)
+
+    async def _assemble_dwg_sheet_bundles(
+        self,
+        *,
+        staging_uri: str,
+        parsed_meta: Dict[str, Any],
+        stored_name: str,
+        source_sha256: str,
+        ctx: RequestContext,
+        timeout: Optional[float],
+    ) -> tuple[Dict[str, Dict[str, str]], List[Dict[str, Any]], str]:
+        """Seal parser-produced sheets while the whole DWG tree is still temporary."""
+        document_path = self._bundle_relative_path(
+            parsed_meta.get("document_manifest"), "document_manifest"
+        )
+        beam_topology_path = self._bundle_relative_path(
+            parsed_meta.get("beam_topology"), "beam_topology"
+        )
+        raw_sheets = parsed_meta.get("sheet_bundles")
+        if not isinstance(raw_sheets, list) or not raw_sheets:
+            raise RuntimeError("DWG parser did not produce sheet bundles")
+
+        source_content = await self._viking_fs.read_file_bytes(
+            f"{staging_uri}/{stored_name}", ctx=ctx
+        )
+        if hashlib.sha256(source_content).hexdigest() != source_sha256:
+            raise RuntimeError("Parsed DWG source snapshot does not match the bundle source")
+
+        document_content = await self._viking_fs.read_file_bytes(
+            f"{staging_uri}/{document_path}", ctx=ctx
+        )
+        try:
+            document = json.loads(document_content)
+        except (TypeError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise RuntimeError("DWG parser produced an invalid document manifest") from exc
+        if not isinstance(document, dict):
+            raise RuntimeError("DWG parser produced an invalid document manifest")
+        document_id = document.get("document_id")
+        if not isinstance(document_id, str) or not document_id:
+            document_id = f"dwg-{source_sha256[:16]}"
+
+        beam_topology_content = await self._viking_fs.read_file_bytes(
+            f"{staging_uri}/{beam_topology_path}", ctx=ctx
+        )
+        try:
+            beam_topology = json.loads(beam_topology_content)
+        except (TypeError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise RuntimeError("DWG parser produced invalid beam topology JSON") from exc
+        beam_topology_schema = (
+            beam_topology.get("schema") if isinstance(beam_topology, dict) else None
+        )
+
+        root_artifacts: Dict[str, Dict[str, str]] = {
+            "source": {
+                "path": stored_name,
+                "schema": "dwg",
+                "sha256": source_sha256,
+            },
+            "document": {
+                "path": document_path,
+                "schema": str(document.get("schema") or "openviking.dwg-document/v1"),
+                "sha256": hashlib.sha256(document_content).hexdigest(),
+            },
+            "beam_topology": {
+                "path": beam_topology_path,
+                "schema": str(beam_topology_schema or "deterministic-dwg-topology-v2"),
+                "sha256": hashlib.sha256(beam_topology_content).hexdigest(),
+            },
+        }
+        normalized_sheets: List[Dict[str, Any]] = []
+        seen_ids: set[str] = set()
+        seen_directories: set[str] = set()
+
+        for index, raw_sheet in enumerate(raw_sheets):
+            if not isinstance(raw_sheet, dict):
+                raise RuntimeError("DWG parser returned an invalid sheet bundle")
+            sheet_id = raw_sheet.get("sheet_id")
+            if not isinstance(sheet_id, str) or not sheet_id or sheet_id in seen_ids:
+                raise RuntimeError(f"DWG parser returned an invalid sheet_id: {sheet_id}")
+            directory = self._bundle_relative_path(
+                raw_sheet.get("directory"), f"sheet {sheet_id} directory"
+            )
+            if directory in seen_directories:
+                raise RuntimeError(f"DWG parser returned a duplicate sheet directory: {directory}")
+            if any(
+                directory.startswith(f"{existing}/") or existing.startswith(f"{directory}/")
+                for existing in seen_directories
+            ):
+                raise RuntimeError(
+                    f"DWG parser returned overlapping sheet directories: {directory}"
+                )
+
+            content_paths = raw_sheet.get("content_paths")
+            if content_paths is None and raw_sheet.get("content_path") is not None:
+                content_paths = [raw_sheet["content_path"]]
+            if not isinstance(content_paths, list) or not content_paths:
+                raise RuntimeError(f"DWG sheet {sheet_id} has no content")
+            content_paths = [
+                self._bundle_relative_path(path, f"sheet {sheet_id} content path")
+                for path in content_paths
+            ]
+            structure_path = self._bundle_relative_path(
+                raw_sheet.get("structure_path"), f"sheet {sheet_id} structure path"
+            )
+            prefix = f"{directory}/"
+            if any(not path.startswith(prefix) for path in [*content_paths, structure_path]):
+                raise RuntimeError(f"DWG sheet {sheet_id} artifacts must stay inside {directory}")
+            if len(set(content_paths)) != len(content_paths):
+                raise RuntimeError(f"DWG sheet {sheet_id} contains duplicate content paths")
+            relative_content_paths = [path.removeprefix(prefix) for path in content_paths]
+            if any(
+                "/" in path or not path.startswith("content") or not path.endswith(".md")
+                for path in relative_content_paths
+            ):
+                raise RuntimeError(f"DWG sheet {sheet_id} content must be direct content*.md files")
+            if structure_path.removeprefix(prefix) != "structure.json":
+                raise RuntimeError(f"DWG sheet {sheet_id} structure must be structure.json")
+
+            sheet_uri = f"{staging_uri}/{directory}"
+            for preview_name in ("preview.png", "preview.webp"):
+                preview_uri = f"{sheet_uri}/{preview_name}"
+                if await self._viking_fs.exists(preview_uri, ctx=ctx):
+                    await self._viking_fs.rm(preview_uri, recursive=False, ctx=ctx)
+            await self._summarize_bundle_staging(sheet_uri, ctx=ctx, timeout=timeout)
+
+            sheet_artifacts: Dict[str, Dict[str, Any]] = {}
+            for content_index, content_path in enumerate(content_paths):
+                content = await self._viking_fs.read_file_bytes(
+                    f"{staging_uri}/{content_path}", ctx=ctx
+                )
+                role = "content" if len(content_paths) == 1 else f"content_{content_index:04d}"
+                sheet_artifacts[role] = {
+                    "path": relative_content_paths[content_index],
+                    "schema": "text/markdown",
+                    "sha256": hashlib.sha256(content).hexdigest(),
+                    "searchable": True,
+                }
+
+            structure_content = await self._viking_fs.read_file_bytes(
+                f"{staging_uri}/{structure_path}", ctx=ctx
+            )
+            try:
+                structure = json.loads(structure_content)
+            except (TypeError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+                raise RuntimeError(f"DWG sheet {sheet_id} has invalid structure JSON") from exc
+            structure_schema = structure.get("schema") if isinstance(structure, dict) else None
+            sheet_artifacts["structure"] = {
+                "path": structure_path.removeprefix(prefix),
+                "schema": str(structure_schema or "openviking.dwg-sheet-structure/v1"),
+                "sha256": hashlib.sha256(structure_content).hexdigest(),
+                "searchable": False,
+            }
+            for role, name, schema in (
+                ("abstract", ".abstract.md", "openviking.semantic/l0"),
+                ("overview", ".overview.md", "openviking.semantic/l1"),
+            ):
+                uri = f"{sheet_uri}/{name}"
+                if await self._viking_fs.exists(uri, ctx=ctx):
+                    content = await self._viking_fs.read_file_bytes(uri, ctx=ctx)
+                    sheet_artifacts[role] = {
+                        "path": name,
+                        "schema": schema,
+                        "sha256": hashlib.sha256(content).hexdigest(),
+                        "searchable": False,
+                    }
+
+            title = raw_sheet.get("title")
+            title = title if isinstance(title, str) and title else sheet_id
+            sheet_manifest = build_dwg_sheet_manifest(
+                document_id=document_id,
+                sheet_id=sheet_id,
+                title=title,
+                source_path=posixpath.relpath(stored_name, directory),
+                source_sha256=source_sha256,
+                artifacts=sheet_artifacts,
+            )
+            serialized = serialize_manifest(sheet_manifest)
+            sheet_manifest_path = f"{directory}/{RESOURCE_BUNDLE_MANIFEST}"
+            await self._viking_fs.write_file(
+                f"{staging_uri}/{sheet_manifest_path}", serialized, ctx=ctx
+            )
+            root_artifacts[f"sheet_{index:04d}"] = {
+                "path": sheet_manifest_path,
+                "schema": RESOURCE_BUNDLE_SCHEMA_V3,
+                "sha256": hashlib.sha256(serialized.encode("utf-8")).hexdigest(),
+            }
+            normalized_sheets.append(
+                {
+                    "sheet_id": sheet_id,
+                    "directory": directory,
+                    "title": title,
+                    "content_paths": content_paths,
+                    "structure_path": structure_path,
+                }
+            )
+            seen_ids.add(sheet_id)
+            seen_directories.add(directory)
+
+        for preview_name in ("preview.png", "preview.webp"):
+            preview_uri = f"{staging_uri}/{preview_name}"
+            if await self._viking_fs.exists(preview_uri, ctx=ctx):
+                await self._viking_fs.rm(preview_uri, recursive=False, ctx=ctx)
+        return root_artifacts, normalized_sheets, document_id
+
     async def _add_atomic_resource_bundle(
         self,
         *,
@@ -881,6 +1102,8 @@ class ResourceService:
         created_root = False
         staging_parent: Optional[str] = None
         semantic_status = "skipped"
+        sheet_bundles: List[Dict[str, Any]] = []
+        document_id: Optional[str] = None
         try:
             parent_bundle = await find_resource_bundle_root(
                 self._viking_fs,
@@ -899,22 +1122,8 @@ class ResourceService:
             if kind in {"dwg", "step"}:
                 if kind == "dwg":
                     from openviking.parse.parsers.dwg import DWGParser
-                    from openviking.parse.parsers.dwg_extract import (
-                        DRAWING_TEXT_CHUNK_SCHEMA,
-                        DRAWING_TEXT_INDEX_SCHEMA,
-                    )
 
                     parser = DWGParser()
-                    derived = {
-                        "beam_topology": (
-                            "beam_topology.json",
-                            "deterministic-dwg-topology-v2",
-                        ),
-                        "drawing_text_index": (
-                            "drawing_text/index.json",
-                            DRAWING_TEXT_INDEX_SCHEMA,
-                        ),
-                    }
                 else:
                     from openviking.parse.parsers.step import (
                         STEP_EVIDENCE_SCHEMA,
@@ -935,31 +1144,24 @@ class ResourceService:
                 if not staging_parent or not staging_uri:
                     raise RuntimeError(f"{kind.upper()} parser did not produce a staging bundle")
                 if kind == "dwg":
-                    chunk_paths = parsed.meta.get("drawing_text_chunks")
-                    if not isinstance(chunk_paths, list) or not chunk_paths:
-                        raise RuntimeError("DWG parser did not produce drawing text chunks")
-                    derived.update(
-                        {
-                            f"drawing_text_chunk_{index:04d}": (
-                                str(chunk_path),
-                                DRAWING_TEXT_CHUNK_SCHEMA,
-                            )
-                            for index, chunk_path in enumerate(chunk_paths)
-                        }
+                    artifacts, sheet_bundles, document_id = await self._assemble_dwg_sheet_bundles(
+                        staging_uri=staging_uri,
+                        parsed_meta=parsed.meta,
+                        stored_name=stored_name,
+                        source_sha256=source_sha256,
+                        ctx=ctx,
+                        timeout=timeout,
                     )
-                await self._summarize_bundle_staging(staging_uri, ctx=ctx, timeout=timeout)
-                if kind == "dwg" and await self._viking_fs.exists(
-                    f"{staging_uri}/preview.png", ctx=ctx
-                ):
-                    derived["preview"] = ("preview.png", "png")
-                artifacts = await self._parsed_bundle_artifacts(
-                    staging_uri,
-                    source_name=stored_name,
-                    source_sha256=source_sha256,
-                    kind=kind,
-                    derived=derived,
-                    ctx=ctx,
-                )
+                else:
+                    await self._summarize_bundle_staging(staging_uri, ctx=ctx, timeout=timeout)
+                    artifacts = await self._parsed_bundle_artifacts(
+                        staging_uri,
+                        source_name=stored_name,
+                        source_sha256=source_sha256,
+                        kind=kind,
+                        derived=derived,
+                        ctx=ctx,
+                    )
                 semantic_status = "complete"
             else:
                 artifacts = {
@@ -1026,6 +1228,9 @@ class ResourceService:
             "semantic_status": semantic_status,
             "vector_status": "skipped",
         }
+        if kind == "dwg":
+            result["document_id"] = document_id
+            result["sheet_uris"] = [f"{root_uri}/{sheet['directory']}" for sheet in sheet_bundles]
         if build_index:
             queue_status, vector_status = await self._index_atomic_resource_bundle(
                 root_uri=root_uri,
@@ -1033,6 +1238,7 @@ class ResourceService:
                 ctx=ctx,
                 wait=wait,
                 timeout=timeout,
+                sheet_bundles=sheet_bundles,
             )
             result["vector_status"] = vector_status
             if queue_status is not None:
@@ -1047,16 +1253,28 @@ class ResourceService:
         ctx: RequestContext,
         wait: bool,
         timeout: Optional[float],
+        sheet_bundles: Optional[List[Dict[str, Any]]] = None,
     ) -> tuple[Optional[Dict[str, Any]], str]:
         """Index every searchable bundle artifact with the bundle's kind tag."""
-        scalar_override = {"search_tags": [f"kind={kind}"]}
-        await index_resource(
-            root_uri,
-            ctx,
-            scalar_override=scalar_override,
-        )
         if kind == "dwg":
-            await index_resource(f"{root_uri}/drawing_text", ctx, scalar_override=scalar_override)
+            scalar_override = {"search_tags": ["kind=dwg-sheet"]}
+            for sheet in sheet_bundles or []:
+                directory = sheet["directory"]
+                prefix = f"{directory}/"
+                await index_resource(
+                    f"{root_uri}/{directory}",
+                    ctx,
+                    scalar_override=scalar_override,
+                    include_files={path.removeprefix(prefix) for path in sheet["content_paths"]},
+                    include_directory_meta=False,
+                )
+        else:
+            scalar_override = {"search_tags": [f"kind={kind}"]}
+            await index_resource(
+                root_uri,
+                ctx,
+                scalar_override=scalar_override,
+            )
         if not wait:
             return None, "queued"
         queue_manager = get_queue_manager()

@@ -22,6 +22,7 @@ if TYPE_CHECKING:
 
 RESOURCE_BUNDLE_SCHEMA_V1 = "openviking.resource-bundle/v1"
 RESOURCE_BUNDLE_SCHEMA = "openviking.resource-bundle/v2"
+RESOURCE_BUNDLE_SCHEMA_V3 = "openviking.resource-bundle/v3"
 RESOURCE_BUNDLE_MANIFEST = "manifest.json"
 _SHA256_HEX_RE = re.compile(r"^[0-9a-f]{64}$")
 
@@ -99,6 +100,26 @@ def build_manifest(
     }
 
 
+def build_dwg_sheet_manifest(
+    *,
+    document_id: str,
+    sheet_id: str,
+    title: str,
+    source_path: str,
+    source_sha256: str,
+    artifacts: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    """Build a V3 sheet bundle that references its document-owned DWG."""
+    return {
+        "schema": RESOURCE_BUNDLE_SCHEMA_V3,
+        "kind": "dwg-sheet",
+        "owner": {"document_id": document_id},
+        "sheet": {"id": sheet_id, "title": title},
+        "source_ref": {"path": source_path, "sha256": source_sha256},
+        "artifacts": artifacts,
+    }
+
+
 def serialize_manifest(manifest: dict[str, Any]) -> str:
     """Render a stable, human-readable manifest without adding another sidecar."""
     return json.dumps(manifest, ensure_ascii=False, indent=2) + "\n"
@@ -108,14 +129,53 @@ def is_resource_bundle_manifest(payload: Any) -> bool:
     """Return whether *payload* is a complete atomic-bundle marker.
 
     The schema string alone must not turn an arbitrary directory into an
-    immutable bundle. V1 remains readable; new V2 manifests also require a
-    complete artifact inventory.
+    immutable bundle. V1 remains readable; V2 owns a source snapshot, while a
+    nested V3 DWG sheet references the source owned by its document bundle.
     """
     if not isinstance(payload, dict) or payload.get("schema") not in {
         RESOURCE_BUNDLE_SCHEMA_V1,
         RESOURCE_BUNDLE_SCHEMA,
+        RESOURCE_BUNDLE_SCHEMA_V3,
     }:
         return False
+    if payload.get("schema") == RESOURCE_BUNDLE_SCHEMA_V3:
+        owner = payload.get("owner")
+        source_ref = payload.get("source_ref")
+        sheet = payload.get("sheet")
+        artifacts = payload.get("artifacts")
+        if (
+            payload.get("kind") != "dwg-sheet"
+            or not isinstance(owner, dict)
+            or not isinstance(owner.get("document_id"), str)
+            or not owner["document_id"]
+            or not isinstance(sheet, dict)
+            or not isinstance(sheet.get("id"), str)
+            or not sheet["id"]
+            or not isinstance(source_ref, dict)
+            or not isinstance(source_ref.get("path"), str)
+            or not source_ref["path"]
+            or not isinstance(source_ref.get("sha256"), str)
+            or not _SHA256_HEX_RE.fullmatch(source_ref["sha256"])
+            or not isinstance(artifacts, dict)
+            or not artifacts
+        ):
+            return False
+        for role, artifact in artifacts.items():
+            if (
+                not isinstance(role, str)
+                or not role
+                or not isinstance(artifact, dict)
+                or not isinstance(artifact.get("path"), str)
+                or not artifact["path"]
+                or not isinstance(artifact.get("schema"), str)
+                or not artifact["schema"]
+                or not isinstance(artifact.get("sha256"), str)
+                or not _SHA256_HEX_RE.fullmatch(artifact["sha256"])
+                or not isinstance(artifact.get("searchable"), bool)
+            ):
+                return False
+        return any(artifact["searchable"] for artifact in artifacts.values())
+
     source = payload.get("source")
     valid_source = (
         isinstance(payload.get("kind"), str)
@@ -198,3 +258,30 @@ async def find_resource_bundle_root(
                 return current.uri.rstrip("/")
         current = current.parent
     return None
+
+
+async def find_resource_bundle_owner_root(
+    viking_fs: "VikingFS",
+    uri: str,
+    *,
+    ctx: "RequestContext",
+    uri_is_directory: bool = False,
+) -> Optional[str]:
+    """Return the outer bundle that owns mutations for a nested bundle tree."""
+    nearest = await find_resource_bundle_root(
+        viking_fs,
+        uri,
+        ctx=ctx,
+        uri_is_directory=uri_is_directory,
+    )
+    if not nearest:
+        return None
+
+    outermost = nearest
+    current = VikingURI(nearest).parent
+    while current is not None and current.scope == "resources":
+        if current.uri.rstrip("/") != "viking://resources":
+            if await read_resource_bundle_manifest(viking_fs, current.uri, ctx=ctx):
+                outermost = current.uri.rstrip("/")
+        current = current.parent
+    return outermost

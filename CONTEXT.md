@@ -5,19 +5,19 @@ This context defines the terms used when a resource directory represents one com
 ## Language
 
 **Atomic Resource Bundle**:
-A marked resource directory that represents one source asset together with its associated artifacts as the minimum `find_resource` result. Ingestion assembles it before publication; after publication, it is replaced or removed only as a complete unit.
+A marked resource directory that represents one independently retrievable resource unit together with its associated artifacts as the minimum `find_resource` result. It normally owns its source bytes; a DWG Sheet Bundle instead references the shared DWG Source owned by its DWG Document Container.
 _Avoid_: atomic folder, leaf node, leaf folder
 
 **Bundle Manifest**:
-The required root-level `manifest.json` that marks an atomic resource bundle and inventories the sealed package. It carries a Manifest Schema, exactly one Resource Kind, source identity, and each derived artifact's role, path, schema, and hash.
+The required `manifest.json` at a resource bundle's own root that marks and inventories the sealed package. It carries a Manifest Schema, exactly one Resource Kind, source identity or source reference, and each derived artifact's role, path, schema, and hash.
 _Avoid_: optional metadata file, source-only card, directory-name convention
 
 **Bundle Boundary**:
-The complete subtree rooted at an atomic resource bundle. It may contain ordinary directories but cannot contain another Bundle Manifest.
-_Avoid_: nested bundle, package hierarchy
+The complete subtree owned by a resource bundle. Bundle Boundaries normally do not overlap; the deliberate exception is generated DWG Sheet Bundles nested inside their owning DWG Document Container.
+_Avoid_: arbitrary nested bundle, manually nested bundle
 
 **Bundle Ingestion**:
-The explicit, opt-in creation of an immutable atomic resource bundle through `add-resource(bundle=true)`. The target URI names the bundle root; ingestion preserves the original artifact and may run its format parser to add derived artifacts before publishing the bundle.
+The explicit, opt-in creation of immutable resource units through `add-resource(bundle=true)`. It normally publishes one Atomic Resource Bundle; DWG ingestion publishes one root DWG Document Container plus generated nested DWG Sheet Bundles.
 _Avoid_: separate bundle upload API, implicit bundle creation, raw-only upload, parser-free bundle
 
 **Bundle Snapshot**:
@@ -40,24 +40,40 @@ _Avoid_: resource discovery, model download
 A resource processed by its extension parser, which may persist derived artifacts and semantic navigation. It may also be an Atomic Resource Bundle when those artifacts must be discovered and managed as one resource unit.
 _Avoid_: raw-only resource
 
+**DWG Document Container**:
+A root v2 Resource Bundle of kind `dwg` that owns one unchanged DWG Source and all DWG Sheet Bundles discovered from it. It is the document-wide publication and source-ownership boundary, while its Sheets are the minimum DWG retrieval units.
+_Avoid_: sheet bundle, manifest-less folder
+
+**DWG Sheet Bundle**:
+A generated v3 Resource Bundle of kind `dwg-sheet` for exactly one Sheet and the minimum DWG discovery and retrieval result. Its content and evidence are Sheet-scoped, while `source_ref` identifies the DWG Source owned by its parent DWG Document Container.
+_Avoid_: whole-DWG bundle, drawing text folder, page preview
+
 **DWG Source**:
-The unchanged `.dwg` file inside a DWG Atomic Resource Bundle. Its exact child URI, rather than a filename reconstructed from the bundle root, identifies the bytes used for download and preview.
+The unchanged `.dwg` file stored exactly once by a DWG Document Container and referenced by its DWG Sheet Bundles. It remains the authoritative source for every Sheet derived from that document.
 _Avoid_: generated drawing, bundle URI, preview artifact
 
 **Drawing Preview**:
-A transient, read-only browser rendering of a DWG Source for visual verification. It may report missing fonts, images, or external references and never replaces the DWG Source or becomes a Bundle artifact.
-_Avoid_: CAD editor, source of truth, derived bundle artifact
+A transient, read-only rendering of a DWG Source for visual verification, when a client chooses to provide one. It never replaces the DWG Source, and no raster or rendered preview is retained as a DWG parsing artifact.
+_Avoid_: CAD editor, source of truth, persisted preview artifact
+
+**Sheet**:
+A bounded drawing unit intended to stand alone for identification and retrieval. It may originate from a Paper Space Layout or a drawing frame in Model Space; its identity does not depend on a potentially missing or repeated drawing title.
+_Avoid_: page image, viewport, small drawing, region
+
+**Region**:
+A typed semantic area within one Sheet, such as metadata, a table, notes, a plan, or a detail. It provides containment and reading scope but is neither a fixed pixel tile nor an independent bundle.
+_Avoid_: crop tile, sheet, bundle
 
 **Beam Topology Index**:
 A deterministic derived DWG artifact that binds beam labels to available geometric and dimensional evidence while preserving confidence states and source-object references. It covers beam topology only, not the complete drawing.
 _Avoid_: DWG topology, complete drawing model, source of truth
 
-**Drawing Text Index**:
-A deterministic derived DWG artifact containing source-grounded drawing text, source-object references, and spatial chunks suitable for retrieval. It excludes OCR and semantic completion.
-_Avoid_: drawing summary, VLM navigation, OCR transcript
+**Drawing Annotation Graph**:
+A deterministic, Sheet-scoped relationship model connecting annotations to their supported targets, spaces, grids, or other drawing objects while preserving source evidence and confidence. It is not a complete drawing model and does not assign unrelated annotations to the Beam Topology Index.
+_Avoid_: Drawing Text Index, beam topology, complete DWG graph
 
 **Searchable Artifact**:
-An artifact that can be reliably text-interpreted, including JSON or STEP; a binary artifact needs a deterministic text projection before it is searchable. V1 uses ordinary `grep` over the bundle root.
+An artifact explicitly exposed to model retrieval because its content can be reliably text-interpreted. Machine-readable evidence is not searchable by default; a bundle may retain deterministic structure solely for validation and provenance.
 _Avoid_: text sidecar
 
 **STEP Evidence**:
@@ -65,9 +81,9 @@ A deterministic JSON artifact derived only from the complete geometry and header
 _Avoid_: timeline evidence, STEP summary, benchmark evidence pack
 
 **Manifest Schema**:
-The versioned identifier for a manifest's machine-readable layout. New Bundle Manifests use `openviking.resource-bundle/v2`; readers retain compatibility with `v1`.
+The versioned identifier for a manifest's machine-readable layout. Ordinary bundles and DWG Document Containers use `openviking.resource-bundle/v2`, generated DWG Sheet Bundles use `openviking.resource-bundle/v3`, and readers retain compatibility with `v1`.
 _Avoid_: implicit JSON shape, parser version
 
 **Resource Kind**:
-A single canonical source-format family, such as `step`, `glb`, or `gltf`, that classifies a bundle's original asset. Bundle Ingestion derives it from the original artifact's suffix, normalizing known aliases such as `.stp` to `step`; it rejects only sources whose type cannot be inferred because they have no suffix. It is recorded in the Bundle Manifest and projected as the required `kind=<value>` Index Tag, while auxiliary files do not change it.
+A single canonical family that classifies a bundle's resource unit. Ordinary bundles and a DWG Document Container use the original source format, while a generated DWG Sheet Bundle uses `dwg-sheet`; the value is recorded in the Bundle Manifest and projected as the required `kind=<value>` Index Tag.
 _Avoid_: broad 3D category, raw file extension
