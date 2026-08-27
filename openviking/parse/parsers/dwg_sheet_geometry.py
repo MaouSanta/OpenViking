@@ -96,6 +96,34 @@ def _join_text(parts: Iterable[str]) -> str:
     return result
 
 
+def _merge_raised_unit_powers(matches: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    result = [dict(text) for text in matches]
+    for power in list(result):
+        value = str(power.get("text") or "").strip()
+        if value not in {"2", "3"} or not (power_point := _point(power.get("point"))):
+            continue
+        candidates = []
+        for base in result:
+            if base is power or not (base_point := _point(base.get("point"))):
+                continue
+            base_text = str(base.get("text") or "").strip()
+            base_height = float(base.get("height") or 0.0)
+            power_height = float(power.get("height") or 0.0)
+            if (
+                base_text.endswith(("N/m", "kN/m", "kg/m", "N/mm"))
+                and 0 < power_point[1] - base_point[1] <= base_height * 0.8
+                and 0 < power_height <= base_height * 0.8
+                and power_point[0] > base_point[0]
+            ):
+                candidates.append((power_point[0] - base_point[0], base))
+        if len(candidates) != 1:
+            continue
+        target = candidates[0][1]
+        target["text"] = str(target.get("text") or "").rstrip() + {"2": "²", "3": "³"}[value]
+        result.remove(power)
+    return result
+
+
 def _cluster(values: Iterable[float], tolerance: float) -> list[float]:
     groups: list[list[float]] = []
     for value in sorted(values):
@@ -446,7 +474,9 @@ def _table_from_cells(
         for text in matches:
             if text.get("uid") is not None:
                 consumed.add(str(text["uid"]))
-        text_value = _join_text(str(text.get("text") or "") for text in matches)
+        text_value = _join_text(
+            str(text.get("text") or "") for text in _merge_raised_unit_powers(matches)
+        )
         refs = _unique_refs(cell["source_refs"] + [_text_ref(text) for text in matches])
         cell_rows.append(
             {

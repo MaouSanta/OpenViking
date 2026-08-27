@@ -118,6 +118,25 @@ def test_detect_table_grid_keeps_a_left_offset_caption_out_of_header_cells():
     assert table["anchor"] == (-0.6, 30.4)
 
 
+def test_detect_table_grid_merges_a_raised_unit_power_into_its_value():
+    lines = [
+        *[_line(1 + column, (column * 10, 0), (column * 10, 20)) for column in range(3)],
+        *[_line(10 + row, (0, row * 10), (20, row * 10)) for row in range(3)],
+    ]
+    texts = [
+        _text(101, "设计值", (2, 15)),
+        _text(102, "等级", (12, 15)),
+        _text(103, "fy=270N/mm", (2, 5)),
+        _text(104, "2", (8, 5.5), height=0.6),
+        _text(105, "C30", (12, 5)),
+    ]
+
+    table = detect_table_grids(lines, texts, sheet_bbox=(0, 0, 100, 100))[0]
+
+    assert table["rows"] == [["设计值", "等级"], ["fy=270N/mm²", "C30"]]
+    assert "text-104" in table["text_uids"]
+
+
 def test_detect_table_grid_rejects_giant_sparse_sheet_alignment():
     lines = [
         _line(1, (0, 0), (0, 100)),

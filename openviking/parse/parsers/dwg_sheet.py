@@ -50,7 +50,7 @@ _NUMBERED_RE = re.compile(
     r"(?:[1-9]\d?(?:\.\d+){2,})$|(?:[1-9]\d?)[.．](?=\D))"
 )
 _TOP_LEVEL_RE = re.compile(r"^\s*([1-9]\d?)[.．](?=\D)")
-_FORM_SLOT_RE = re.compile(r"(?<=\S) {3,}(?=\S)")
+_FORM_SLOT_RE = re.compile(r"(?<=\S) {2,}(?=\S)")
 
 SheetModeClassifier = Callable[[bytes, dict[str, Any]], dict[str, Any] | str | None]
 
@@ -69,9 +69,16 @@ def _point(value: Any) -> tuple[float, float] | None:
     return (x, y) if math.isfinite(x) and math.isfinite(y) else None
 
 
+def _decode_text_codes(text: str) -> str:
+    text = text.replace("%%1403%%141", "³").replace("%%%", "%")
+    text = re.sub(r"%%P", "±", text, flags=re.I)
+    text = re.sub(r"%%D", "°", text, flags=re.I)
+    return re.sub(r"%%C", "⌀", text, flags=re.I)
+
+
 def _clean_text(value: Any) -> str:
     """Remove MTEXT presentation codes while preserving its paragraph structure."""
-    text = unicodedata.normalize("NFC", "" if value is None else str(value))
+    text = _decode_text_codes(unicodedata.normalize("NFC", "" if value is None else str(value)))
     text = re.sub(r"\\U\+([0-9A-Fa-f]{4})", lambda match: chr(int(match.group(1), 16)), text)
     text = text.replace("\\P", "\n").replace("\\~", " ").replace("\r", "\n")
     text = _FORMAT_RE.sub("", text).replace("{", "").replace("}", "")
@@ -307,6 +314,7 @@ def _walk_block(block_handle: Any, graph: dict[str, Any]) -> dict[str, list[dict
                             "a": _matrix_apply(matrix, start),
                             "b": _matrix_apply(matrix, end),
                             "record": record,
+                            "layer": graph["layers"].get(_ref(record.get("layer")), ""),
                             "instance_path": list(path),
                             "source_ref": _source_ref(record, path),
                         }
@@ -336,6 +344,7 @@ def _walk_block(block_handle: Any, graph: dict[str, Any]) -> dict[str, list[dict
                             "a": a,
                             "b": b,
                             "record": record,
+                            "layer": graph["layers"].get(_ref(record.get("layer")), ""),
                             "instance_path": list(path),
                             "source_ref": _source_ref(record, path),
                         }
@@ -878,7 +887,8 @@ def _document_column_cuts(
         gap_left, gap_right = max(
             zip(between, between[1:], strict=False), key=lambda pair: pair[1] - pair[0]
         )
-        cuts.append((gap_left + gap_right) / 2)
+        # Keep right-aligned form values with the column that owns their template.
+        cuts.append(max((gap_left + gap_right) / 2, right - (right - left) * 0.1))
     return cuts
 
 
@@ -910,6 +920,23 @@ def _render_sheet_layout(
             height - margin - round((point[1] - box[1]) * scale),
         )
 
+    anchors = _document_column_anchors(records, box, set())
+    cuts = _document_column_cuts(records, anchors, set()) if len(anchors) > 1 else []
+    nominal_column_width = span_x / max(len(anchors), 1)
+
+    def fitted(value: str, font: Any, max_width: float) -> str:
+        value = value.replace("\n", " ")[:120]
+        if draw.textlength(value, font=font) <= max_width:
+            return value
+        low, high = 0, len(value)
+        while low < high:
+            middle = (low + high + 1) // 2
+            if draw.textlength(value[:middle], font=font) <= max_width:
+                low = middle
+            else:
+                high = middle - 1
+        return value[:low]
+
     for line in lines:
         draw.line((pixel(line["a"]), pixel(line["b"])), fill=(105, 105, 105), width=1)
     font_path = "/System/Library/Fonts/Supplemental/Arial Unicode.ttf"
@@ -923,7 +950,15 @@ def _render_sheet_layout(
                 fonts[size] = ImageFont.truetype(font_path, size)
             except OSError:
                 fonts[size] = ImageFont.load_default()
-        draw.text(pixel(record["point"]), record["text"][:120], fill="white", font=fonts[size])
+        column = bisect_right(cuts, record["point"][0])
+        right = cuts[column] if column < len(cuts) else box[2]
+        max_width = max(1.0, min(right - record["point"][0], nominal_column_width * 0.95) * scale)
+        draw.text(
+            pixel(record["point"]),
+            fitted(record["text"], fonts[size], max_width),
+            fill="white",
+            font=fonts[size],
+        )
     output = io.BytesIO()
     image.save(output, format="PNG", optimize=True)
     return output.getvalue()
@@ -1002,7 +1037,7 @@ def _form_raw_text(event: dict[str, Any]) -> str | None:
         return None
     text = unicodedata.normalize("NFC", value)
     text = re.sub(r"\\U\+([0-9A-Fa-f]{4})", lambda match: chr(int(match.group(1), 16)), text)
-    text = re.sub(r"%%P", "±", text, flags=re.I)
+    text = _decode_text_codes(text)
     text = _FORMAT_RE.sub("", text).replace("{", "").replace("}", "")
     return re.sub(r"[\t\x00-\x1f\x7f]+", " ", text)
 
@@ -1020,6 +1055,123 @@ def _form_advance(text: str, height: float, width_factor: float) -> float:
             result += unit * 0.5
         else:
             result += unit * 0.6
+    return result
+
+
+def _roman_i_glyph(segments: list[dict[str, Any]], height: float) -> str | None:
+    vertical = []
+    horizontal = []
+    for segment in segments:
+        a, b = segment["a"], segment["b"]
+        dx, dy = abs(b[0] - a[0]), abs(b[1] - a[1])
+        if dx <= height * 0.05 and height * 0.45 <= dy <= height * 1.1:
+            vertical.append(segment)
+        elif dy <= height * 0.05 and height * 0.08 <= dx <= height * 0.5:
+            horizontal.append(segment)
+        else:
+            return None
+    if not 1 <= len(vertical) <= 3 or len(horizontal) != len(vertical) * 2:
+        return None
+
+    consumed: set[int] = set()
+    glyphs = []
+    for stem in sorted(vertical, key=lambda line: (line["a"][0] + line["b"][0]) / 2):
+        x = (stem["a"][0] + stem["b"][0]) / 2
+        bottom, top = sorted((stem["a"][1], stem["b"][1]))
+        caps = []
+        for index, cap in enumerate(horizontal):
+            if index in consumed:
+                continue
+            left, right = sorted((cap["a"][0], cap["b"][0]))
+            y = (cap["a"][1] + cap["b"][1]) / 2
+            if left - height * 0.05 <= x <= right + height * 0.05 and min(
+                abs(y - bottom), abs(y - top)
+            ) <= height * 0.06:
+                caps.append((index, y))
+        if len(caps) != 2 or abs(caps[0][1] - caps[1][1]) < height * 0.4:
+            return None
+        consumed.update(index for index, _ in caps)
+        glyphs.append((x, bottom, top))
+    if len(consumed) != len(horizontal):
+        return None
+    first = glyphs[0]
+    if any(
+        abs(bottom - first[1]) > height * 0.08
+        or abs(top - first[2]) > height * 0.08
+        or not 0 <= x - previous[0] <= height * 0.35
+        for previous, (x, bottom, top) in zip(glyphs, glyphs[1:], strict=False)
+    ):
+        return None
+    return {1: "Ⅰ", 2: "Ⅱ", 3: "Ⅲ"}[len(glyphs)]
+
+
+def _exploded_form_glyphs(
+    records: list[dict[str, Any]], lines: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    result = []
+    used: set[str] = set()
+    for record in records:
+        if record.get("instance_path") or not record.get("point") or record.get("height", 0) <= 0:
+            continue
+        event = {
+            "record": record["record"],
+            "point": record["point"],
+            "height": record["height"],
+        }
+        raw = _form_raw_text(event)
+        slots = list(_FORM_SLOT_RE.finditer(raw or ""))
+        if not raw or not slots:
+            continue
+        try:
+            width_factor = float(record["record"].get("width_factor") or 1.0)
+        except (TypeError, ValueError, OverflowError):
+            continue
+        for slot_number, slot in enumerate(slots, 1):
+            height = float(record["height"])
+            left = record["point"][0] + _form_advance(raw[: slot.start()], height, width_factor)
+            right = record["point"][0] + _form_advance(raw[: slot.end()], height, width_factor)
+            if any(
+                other["uid"] != record["uid"]
+                and other.get("point")
+                and abs(other["point"][1] - record["point"][1]) <= height * 0.2
+                and left - height * 0.5 <= other["point"][0] <= right + height * 0.5
+                for other in records
+            ):
+                continue
+            candidates = [
+                line
+                for line in lines
+                if repr(line["source_ref"]) not in used
+                and not line.get("instance_path")
+                and left - height * 0.5
+                <= min(line["a"][0], line["b"][0])
+                <= max(line["a"][0], line["b"][0])
+                <= right + height * 0.5
+                and record["point"][1] - height * 0.1
+                <= min(line["a"][1], line["b"][1])
+                <= max(line["a"][1], line["b"][1])
+                <= record["point"][1] + height * 1.1
+            ]
+            if not candidates or len({line.get("layer") for line in candidates}) != 1:
+                continue
+            glyph = _roman_i_glyph(candidates, height)
+            if not glyph:
+                continue
+            refs = [line["source_ref"] for line in candidates]
+            used.update(map(repr, refs))
+            result.append(
+                {
+                    "kind": "text",
+                    "uid": f"glyph:{record['uid']}:{slot_number}",
+                    "text": glyph,
+                    "point": (min(min(line["a"][0], line["b"][0]) for line in candidates), record["point"][1]),
+                    "height": height,
+                    "layer": candidates[0].get("layer") or "",
+                    "record": {"entity": "GEOMETRY_GLYPH"},
+                    "form_fill_eligible": True,
+                    "source_refs": refs,
+                }
+            )
     return result
 
 
@@ -1093,7 +1245,6 @@ def _restore_form_slots(group: list[dict[str, Any]]) -> str:
             not candidate.get("form_fill_eligible", True)
             or not candidate.get("layer")
             or not template["item"].get("layer")
-            or candidate["layer"] == template["item"].get("layer")
         ):
             return False
         try:
@@ -1109,7 +1260,18 @@ def _restore_form_slots(group: list[dict[str, Any]]) -> str:
             height, candidate_height
         ) * 0.2:
             return False
-        margin = max(height, candidate_height) * 3.0
+        margin = max(height, candidate_height) * (
+            0.35 if candidate["layer"] == template["item"].get("layer") else 3.0
+        )
+        record = candidate.get("record") or {}
+        try:
+            candidate_width = _form_advance(
+                candidate["text"], candidate_height, float(record.get("width_factor") or 1.0)
+            )
+        except (TypeError, ValueError, OverflowError):
+            return False
+        if candidate_width > slot["right"] - slot["left"] + margin * 2:
+            return False
         boundary_margin = max(height, candidate_height) * 0.1
         x = candidate["point"][0]
         return (
@@ -1128,12 +1290,10 @@ def _restore_form_slots(group: list[dict[str, Any]]) -> str:
         [index for index, slot in enumerate(slot_specs) if matches(slot, candidate)]
         for candidate in candidates
     ]
-    if (
-        len(candidates) != len(slot_specs)
-        or len({candidate.get("layer") for candidate in candidates}) != 1
-        or any(len(indexes) != 1 for indexes in compatibility)
-        or sorted(indexes[0] for indexes in compatibility) != list(range(len(slot_specs)))
-    ):
+    mapped_slots = [indexes[0] for indexes in compatibility if len(indexes) == 1]
+    if not candidates or any(len(indexes) != 1 for indexes in compatibility) or len(
+        set(mapped_slots)
+    ) != len(mapped_slots):
         return _join_fragments([item["text"] for item in group])
 
     assignments: dict[int, list[tuple[tuple[int, int], str]]] = defaultdict(list)
@@ -1149,7 +1309,13 @@ def _restore_form_slots(group: list[dict[str, Any]]) -> str:
         if index in assignments:
             text = templates_by_index[index]["raw"]
             for (start, end), value in sorted(assignments[index], reverse=True):
-                text = f"{text[:start]} {value.strip()} {text[end:]}"
+                value = value.strip()
+                replacement = (
+                    value
+                    if _CJK_RE.fullmatch(text[start - 1]) and _CJK_RE.fullmatch(text[end])
+                    else f" {value} "
+                )
+                text = f"{text[:start]}{replacement}{text[end:]}"
             text = _clean_text(text)
         values.append(text)
     return _join_fragments(values)
@@ -1170,6 +1336,12 @@ def _join_fragments(values: list[str]) -> str:
 
 def _document_text(text: str) -> str:
     compact = text.strip()
+    compact = re.sub(
+        r"((?:kN|N|kg)/m(?:m)?)\s+([23])\b",
+        lambda match: match.group(1) + {"2": "²", "3": "³"}[match.group(2)],
+        compact,
+        flags=re.I,
+    )
     if len(compact) <= 24 and re.search(r"(?:总说明|设计说明)$", compact):
         return f"## {compact}"
     return compact
@@ -1191,6 +1363,7 @@ def _document_flow(
     excluded_uids: set[str],
     anchors: list[float],
     markers: list[dict[str, Any]] | None = None,
+    lines: list[dict[str, Any]] | None = None,
 ) -> tuple[list[str], list[dict[str, Any]]]:
     table_uids = {uid for table in tables for uid in table.get("_text_uids", [])}
     excluded = excluded_uids | table_uids
@@ -1227,6 +1400,11 @@ def _document_flow(
                 "source_refs": [_source_ref(record["record"], record["instance_path"])],
             }
         )
+    events.extend(
+        _exploded_form_glyphs(
+            [record for record in records if record["uid"] not in excluded], lines or []
+        )
+    )
     for index, table in enumerate(tables, 1):
         box, anchor = table.get("bbox"), table.get("anchor")
         if anchor and len(anchor) >= 2:
@@ -1308,14 +1486,18 @@ def _document_flow(
                 group = [event]
             else:
                 group = [event]
-                tolerance = max(float(event.get("height") or 0.0) * 0.45, 1e-6)
                 while (
                     index + len(group) < len(ordered)
                     and ordered[index + len(group)]["kind"] == "text"
                     and abs(
                         ordered[index + len(group)]["point"][1] - event["point"][1]
                     )
-                    <= tolerance
+                    <= max(
+                        float(event.get("height") or 0.0),
+                        float(ordered[index + len(group)].get("height") or 0.0),
+                        1e-6,
+                    )
+                    * 0.55
                 ):
                     group.append(ordered[index + len(group)])
                 group.sort(key=lambda item: item["point"][0])
@@ -1938,6 +2120,7 @@ def build_sheet_artifacts(
                 meta_uids,
                 projection["_column_anchors"],
                 classified["markers"],
+                candidate.get("lines", []),
             )
             sheet["document_blocks"] = blocks
             classified["_document_flow"] = flow
