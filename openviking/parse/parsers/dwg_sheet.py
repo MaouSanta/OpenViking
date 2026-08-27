@@ -33,6 +33,7 @@ _FIELD_RE = re.compile(
 _META_KEYS = tuple(
     "项目名称 建设单位 设计单位 图纸名称 图名 图号 专业 比例 日期 出图日期 修订 版本 页码 设计 校对 审核 批准".split()
 )
+_META_HEADER_LABELS = set(_META_KEYS) | {"图别", "序号", "图幅", "备注", "图纸目录"}
 _DIRECTIVE_RE = re.compile(
     r"(?:不得|严禁|应当|应按|应采用|须|封堵|预留|待.+后|施工要求|安装要求|注意事项)"
 )
@@ -88,6 +89,10 @@ def _clean_text(value: Any) -> str:
     text = _FORMAT_RE.sub("", text).replace("{", "").replace("}", "")
     lines = [re.sub(r"[ \t\x00-\x1f\x7f]+", " ", line).strip() for line in text.split("\n")]
     return "\n".join(line for line in lines if line).strip()
+
+
+def _compact_cjk_spacing(value: str) -> str:
+    return re.sub(r"(?<=[\u4e00-\u9fff])\s+(?=[\u4e00-\u9fff])", "", value).strip()
 
 
 def _kind(record: dict[str, Any]) -> str:
@@ -649,6 +654,8 @@ def _extract_meta(
         ]
         if candidates:
             value = min(candidates, key=lambda item: item["point"][0] - x)
+            if _compact_cjk_spacing(value["text"]) in _META_HEADER_LABELS:
+                continue
             if value["point"][0] - x <= height * 80:
                 fields[key] = value["text"].replace("\n", " ")
                 used.update({label["uid"], value["uid"]})
@@ -1776,29 +1783,31 @@ def _title(classified: dict[str, Any], fallback: str) -> str:
         "图纸名称",
         "图号",
     }
-    candidates = [
-        item
-        for item in classified["labels"] + classified["unassigned"]
-        if re.search(r"(?:图|说明|目录|清单|表)$", item["text"])
-        and item["text"].strip() not in boilerplate
-        and not re.search(r"[，。；：,;]", item["text"])
-        and 3 <= len(item["text"]) <= 48
-    ]
+    candidates = []
+    for item in classified["labels"] + classified["unassigned"]:
+        text = _compact_cjk_spacing(item["text"])
+        if (
+            re.search(r"(?:图|说明|目录|清单|表)$", text)
+            and text not in boilerplate
+            and not re.search(r"[，。；：,;]", text)
+            and 3 <= len(text) <= 48
+        ):
+            candidates.append({**item, "title_text": text})
     if not candidates:
         return fallback
     candidates.sort(
         key=lambda item: (
             3
-            if re.search(r"(?:总说明|设计说明|图纸目录|清单|表)$", item["text"])
+            if re.search(r"(?:总说明|设计说明|图纸目录|清单|表)$", item["title_text"])
             else 2
-            if re.search(r"(?:平面图|立面图|剖面图|详图)$", item["text"])
+            if re.search(r"(?:平面图|立面图|剖面图|详图)$", item["title_text"])
             else 1,
-            len(item["text"]),
+            len(item["title_text"]),
             item["count"],
         ),
         reverse=True,
     )
-    return candidates[0]["text"]
+    return candidates[0]["title_text"]
 
 
 def _sheet_id(source_sha256: str, locator: str) -> str:

@@ -1,3 +1,4 @@
+from openviking.parse.parsers.dwg_sheet import _extract_meta, _title
 from openviking.parse.parsers.dwg_titleblock import extract_titleblock_meta
 
 
@@ -58,3 +59,30 @@ def test_extract_titleblock_meta_requires_a_titleblock_anchor_cluster():
     ]
 
     assert extract_titleblock_meta(records, (0, 0, 1000, 1000)) == ({}, set())
+
+
+def test_sheet_title_compacts_cjk_display_spacing_without_using_header_labels():
+    classified = {
+        "meta": {},
+        "labels": [
+            {"text": "图 纸 目 录", "role": "label", "count": 1},
+            {"text": "图 纸 名 称", "role": "label", "count": 1},
+        ],
+        "unassigned": [],
+    }
+
+    assert _title(classified, "Sheet 001") == "图纸目录"
+
+
+def test_sheet_meta_does_not_pair_adjacent_directory_headers_as_values():
+    records = [
+        _text("drawing-no", "图号", 10, 20),
+        _text("revision", "版本", 20, 20),
+        _text("drawing-title", "图 纸 名 称", 30, 20),
+        _text("size", "图幅", 40, 20),
+    ]
+
+    meta, _ = _extract_meta(records, {}, (0, 0, 100, 100))
+
+    assert "图号" not in meta
+    assert "版本" not in meta
