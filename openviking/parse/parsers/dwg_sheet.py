@@ -50,6 +50,7 @@ _NUMBERED_RE = re.compile(
     r"(?:[1-9]\d?(?:\.\d+){2,})$|(?:[1-9]\d?)[.．](?=\D))"
 )
 _TOP_LEVEL_RE = re.compile(r"^\s*([1-9]\d?)[.．](?=\D)")
+_FORM_SLOT_RE = re.compile(r"(?<=\S) {3,}(?=\S)")
 
 SheetModeClassifier = Callable[[bytes, dict[str, Any]], dict[str, Any] | str | None]
 
@@ -986,6 +987,174 @@ def _sheet_mode(
     return mode
 
 
+def _form_raw_text(event: dict[str, Any]) -> str | None:
+    record = event.get("record")
+    if not isinstance(record, dict) or _kind(record) != "TEXT":
+        return None
+    try:
+        rotation = float(record.get("rotation") or 0.0)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if not math.isfinite(rotation) or abs(rotation) > 1e-6:
+        return None
+    value = record.get("text_value")
+    if not isinstance(value, str) or "\n" in value or "\r" in value or "\\P" in value:
+        return None
+    text = unicodedata.normalize("NFC", value)
+    text = re.sub(r"\\U\+([0-9A-Fa-f]{4})", lambda match: chr(int(match.group(1), 16)), text)
+    text = re.sub(r"%%P", "±", text, flags=re.I)
+    text = _FORMAT_RE.sub("", text).replace("{", "").replace("}", "")
+    return re.sub(r"[\t\x00-\x1f\x7f]+", " ", text)
+
+
+def _form_advance(text: str, height: float, width_factor: float) -> float:
+    # ponytail: approximate SHX advances; use real font metrics only if fail-closed misses matter.
+    unit = max(height * width_factor, 1e-6)
+    result = 0.0
+    for char in text:
+        if char == " ":
+            result += unit * 0.5
+        elif unicodedata.east_asian_width(char) in {"W", "F"}:
+            result += unit
+        elif unicodedata.category(char).startswith("P"):
+            result += unit * 0.5
+        else:
+            result += unit * 0.6
+    return result
+
+
+def _restore_form_slots(group: list[dict[str, Any]]) -> str:
+    """Restore independent TEXT values into explicit whitespace slots, or do nothing."""
+    if len(group) < 2:
+        return _join_fragments([item["text"] for item in group])
+    templates: list[dict[str, Any]] = []
+    template_indexes: set[int] = set()
+    for index, item in enumerate(group):
+        raw = _form_raw_text(item)
+        slots = list(_FORM_SLOT_RE.finditer(raw or ""))
+        if not raw or not slots or not item.get("form_fill_eligible", True):
+            continue
+        record = item["record"]
+        try:
+            height = float(item.get("height") or 0.0)
+            width_factor = float(record.get("width_factor") or 1.0)
+        except (TypeError, ValueError, OverflowError):
+            continue
+        if height <= 0 or width_factor <= 0:
+            continue
+        template_indexes.add(index)
+        templates.append(
+            {
+                "index": index,
+                "item": item,
+                "raw": raw,
+                "height": height,
+                "width_factor": width_factor,
+                "slots": slots,
+            }
+        )
+    if not templates:
+        return _join_fragments([item["text"] for item in group])
+    templates_by_index = {template["index"]: template for template in templates}
+
+    slot_specs = []
+    for template in templates:
+        item, raw = template["item"], template["raw"]
+        for match in template["slots"]:
+            slot_specs.append(
+                {
+                    "template": template,
+                    "span": match.span(),
+                    "left": item["point"][0]
+                    + _form_advance(raw[: match.start()], template["height"], template["width_factor"]),
+                    "right": item["point"][0]
+                    + _form_advance(raw[: match.end()], template["height"], template["width_factor"]),
+                }
+            )
+    slot_specs.sort(key=lambda slot: slot["left"])
+    for index, slot in enumerate(slot_specs):
+        center = (slot["left"] + slot["right"]) / 2
+        slot["partition_left"] = (
+            -math.inf
+            if index == 0
+            else ((slot_specs[index - 1]["left"] + slot_specs[index - 1]["right"]) / 2 + center)
+            / 2
+        )
+        slot["partition_right"] = (
+            math.inf
+            if index + 1 == len(slot_specs)
+            else (center + (slot_specs[index + 1]["left"] + slot_specs[index + 1]["right"]) / 2)
+            / 2
+        )
+
+    def matches(slot: dict[str, Any], candidate: dict[str, Any]) -> bool:
+        template = slot["template"]
+        if (
+            not candidate.get("form_fill_eligible", True)
+            or not candidate.get("layer")
+            or not template["item"].get("layer")
+            or candidate["layer"] == template["item"].get("layer")
+        ):
+            return False
+        try:
+            candidate_height = float(candidate.get("height") or 0.0)
+        except (TypeError, ValueError, OverflowError):
+            return False
+        if candidate_height <= 0:
+            return False
+        height = template["height"]
+        if not 0.6 <= candidate_height / height <= 1.6:
+            return False
+        if abs(candidate["point"][1] - template["item"]["point"][1]) > max(
+            height, candidate_height
+        ) * 0.2:
+            return False
+        margin = max(height, candidate_height) * 3.0
+        boundary_margin = max(height, candidate_height) * 0.1
+        x = candidate["point"][0]
+        return (
+            slot["left"] - margin <= x <= slot["right"] + margin
+            and slot["partition_left"] + boundary_margin < x
+            and x < slot["partition_right"] - boundary_margin
+        )
+
+    candidates = [
+        item
+        for index, item in enumerate(group)
+        if index not in template_indexes and any(matches(slot, item) for slot in slot_specs)
+    ]
+    candidates.sort(key=lambda item: item["point"][0])
+    compatibility = [
+        [index for index, slot in enumerate(slot_specs) if matches(slot, candidate)]
+        for candidate in candidates
+    ]
+    if (
+        len(candidates) != len(slot_specs)
+        or len({candidate.get("layer") for candidate in candidates}) != 1
+        or any(len(indexes) != 1 for indexes in compatibility)
+        or sorted(indexes[0] for indexes in compatibility) != list(range(len(slot_specs)))
+    ):
+        return _join_fragments([item["text"] for item in group])
+
+    assignments: dict[int, list[tuple[tuple[int, int], str]]] = defaultdict(list)
+    used = {id(candidate) for candidate in candidates}
+    for candidate, indexes in zip(candidates, compatibility, strict=True):
+        slot = slot_specs[indexes[0]]
+        assignments[slot["template"]["index"]].append((slot["span"], candidate["text"]))
+    values = []
+    for index, item in enumerate(group):
+        if id(item) in used:
+            continue
+        text = item["text"]
+        if index in assignments:
+            text = templates_by_index[index]["raw"]
+            for (start, end), value in sorted(assignments[index], reverse=True):
+                text = f"{text[:start]} {value.strip()} {text[end:]}"
+            text = _clean_text(text)
+        values.append(text)
+    return _join_fragments(values)
+
+
 def _join_fragments(values: list[str]) -> str:
     result = ""
     for value in values:
@@ -1050,6 +1219,11 @@ def _document_flow(
                 "point": record["point"],
                 "height": record.get("height", 0.0),
                 "text": text,
+                "uid": record["uid"],
+                "record": record["record"],
+                "layer": record.get("layer") or "",
+                # ponytail: nested INSERT metrics are unscaled here; fail closed until normalized.
+                "form_fill_eligible": marker is None and not record["instance_path"],
                 "source_refs": [_source_ref(record["record"], record["instance_path"])],
             }
         )
@@ -1110,6 +1284,7 @@ def _document_flow(
                 "point": record["point"],
                 "height": record.get("height", 0.0),
                 "text": f"{_marker_prefix(marker)} {marker['label'] or record['text']}",
+                "form_fill_eligible": False,
                 "source_refs": [_source_ref(record["record"], record["instance_path"])],
             }
         )
@@ -1147,7 +1322,7 @@ def _document_flow(
             text = (
                 event["text"]
                 if event["kind"] == "table"
-                else _document_text(_join_fragments([item["text"] for item in group]))
+                else _document_text(_restore_form_slots(group))
             )
             blocks.append(text)
             source_refs = [ref for item in group for ref in item["source_refs"]]
