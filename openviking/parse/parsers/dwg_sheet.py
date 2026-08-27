@@ -1059,6 +1059,14 @@ def _form_advance(text: str, height: float, width_factor: float) -> float:
 
 
 def _roman_i_glyph(segments: list[dict[str, Any]], height: float) -> str | None:
+    """Recognize only the exploded I/II/III shape observed in T0202.
+
+    This is a temporary, sample-specific bridge—not a general exploded-text
+    recognizer and not a pattern to extend with more hard-coded glyphs. If a
+    second exploded-font family appears, replace this path with generic text-row
+    candidate detection plus SHX template matching or local OCR/VLM.
+    """
+    # ponytail: T0202-only bridge; replace it instead of adding another glyph family.
     vertical = []
     horizontal = []
     for segment in segments:
@@ -1108,6 +1116,12 @@ def _roman_i_glyph(segments: list[dict[str, Any]], height: float) -> str | None:
 def _exploded_form_glyphs(
     records: list[dict[str, Any]], lines: list[dict[str, Any]]
 ) -> list[dict[str, Any]]:
+    """Apply the temporary T0202 Roman-numeral patch inside explicit form slots.
+
+    Slot containment keeps this workaround from pretending that arbitrary CAD
+    linework is text. Do not use its success as evidence of general exploded-text
+    support; another case should trigger a redesign, not another glyph branch.
+    """
     result = []
     used: set[str] = set()
     for record in records:
