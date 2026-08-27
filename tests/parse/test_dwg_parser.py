@@ -11,6 +11,9 @@ import pytest
 from openviking.parse.parsers.base_parser import BaseParser
 from openviking.parse.parsers.dwg import DWGParser, _normalize_libredwg_json
 from openviking.parse.parsers.dwg_sheet import (
+    _document_flow,
+    _native_sheet_mode,
+    _sheet_mode,
     _split_body,
     _table_markdown,
     build_sheet_artifacts,
@@ -219,6 +222,240 @@ def test_sheet_parser_accepts_flag512_model_frames_skips_empty_layout_and_bounds
         "text": "名称",
         "source_refs": [{"object_index": 31, "handle": 31}],
     }
+
+
+def test_document_sheet_restores_column_order_and_inline_table_independent_of_entity_order():
+    columns = [10.0, 260.0, 510.0, 760.0]
+    headings = [
+        (columns[0], 900, "1.工程概况"),
+        (columns[0], 650, "2.设计总则"),
+        (columns[0], 400, "3.设计与控制等级"),
+        (columns[1], 900, "4.主要设计依据"),
+        (columns[1], 650, "5.地基基础"),
+        (columns[1], 400, "6.主要结构材料"),
+        (columns[2], 900, "7.1结构混凝土环境类别及耐久性要求"),
+        (columns[2], 700, "7.2钢筋混凝土保护层厚度"),
+        (columns[2], 400, "7.3纵向受拉钢筋最小锚固及搭接长度"),
+        (columns[3], 900, "8.砌体与混凝土墙连接要求"),
+        (columns[3], 700, "9.施工要求"),
+        (columns[3], 500, "10.防雷接地做法详电施图"),
+        (columns[3], 300, "11.其它"),
+    ]
+
+    def text(index, x, y, value):
+        return {
+            "uid": f"u{index}",
+            "text": value,
+            "point": (x, y),
+            "height": 8.0,
+            "record": {"index": index, "handle": [0, 0, index]},
+            "instance_path": [],
+        }
+
+    records = [text(index, x, y, value) for index, (x, y, value) in enumerate(headings, 1)]
+    records.extend(
+        text(100 + index, columns[index % 4] + 20, 150 - index, "这是一条完整的结构设计说明文字")
+        for index in range(72)
+    )
+    tables = [
+        {
+            "title": "几何表格",
+            "rows": [
+                ["环境类别", "板、墙、壳", "梁、柱、杆"],
+                ["一", "15", "20"],
+                ["二a", "20", "25"],
+                ["二b", "25", "35"],
+            ],
+            "header_rows": 1,
+            "spans": [],
+            "bbox": [510, 520, 720, 650],
+            "source_refs": [{"object_index": 999, "handle": 999}],
+            "_text_uids": [],
+        }
+    ]
+    bbox = (0.0, 0.0, 1000.0, 1000.0)
+    native = _native_sheet_mode(records, tables, bbox, set())
+
+    assert native["mode"] == "document"
+    assert native["column_count"] == 4
+    blocks, _ = _document_flow(records, tables, set(), native["_column_anchors"])
+    reversed_blocks, _ = _document_flow(
+        list(reversed(records)), tables, set(), native["_column_anchors"]
+    )
+    assert blocks == reversed_blocks
+    content = "\n".join(blocks)
+    ordered = [
+        "1.工程概况",
+        "2.设计总则",
+        "3.设计与控制等级",
+        "4.主要设计依据",
+        "5.地基基础",
+        "6.主要结构材料",
+        "7.1结构混凝土环境类别及耐久性要求",
+        "7.2钢筋混凝土保护层厚度",
+        "| 环境类别 | 板、墙、壳 | 梁、柱、杆 |",
+        "7.3纵向受拉钢筋最小锚固及搭接长度",
+        "8.砌体与混凝土墙连接要求",
+        "9.施工要求",
+        "10.防雷接地做法详电施图",
+        "11.其它",
+    ]
+    assert [content.index(value) for value in ordered] == sorted(content.index(value) for value in ordered)
+    assert "## 2.设计总则" not in content
+
+    calls = []
+
+    def fake_vlm(image, evidence):
+        calls.append((image, evidence))
+        return {"mode": "document", "confidence": 0.99, "reason": "multi-column manual"}
+
+    classified = _sheet_mode(records, [], tables, bbox, set(), fake_vlm)
+    assert classified["method"] == "native_layout+vlm"
+    assert calls and calls[0][0].startswith(b"\x89PNG")
+    invalid = _sheet_mode(
+        records,
+        [],
+        tables,
+        bbox,
+        set(),
+        lambda _image, _evidence: {"mode": "drawing", "confidence": "high"},
+    )
+    assert invalid["mode"] == "document"
+    assert invalid["vlm"]["confidence"] == 0.0
+    conflict = _sheet_mode(
+        records,
+        [],
+        tables,
+        bbox,
+        set(),
+        lambda _image, _evidence: {"mode": "drawing", "confidence": 0.7},
+    )
+    assert conflict["mode"] == "document"
+
+
+def test_vlm_document_mode_uses_native_columns_without_numbered_headings():
+    def text(index, column, row):
+        return {
+            "uid": f"u{index}",
+            "text": f"第{column + 1}栏第{row + 1}条完整设计说明文字，施工时应按现行规范逐项核对并记录。",
+            "point": (10 + column * 500, 900 - row * 15),
+            "height": 5.0,
+            "record": {"index": index, "handle": [0, 0, index]},
+            "instance_path": [],
+        }
+
+    records = [text(column * 40 + row, column, row) for column in range(2) for row in range(40)]
+    bbox = (0.0, 0.0, 1000.0, 1000.0)
+    classified = _sheet_mode(
+        records,
+        [],
+        [],
+        bbox,
+        set(),
+        lambda _image, _evidence: {"mode": "document", "confidence": 0.99},
+    )
+    blocks, _ = _document_flow(records, [], set(), classified["_column_anchors"])
+
+    assert classified["mode"] == "document"
+    assert classified["column_count"] == 2
+    assert blocks[0].startswith("第1栏")
+    assert blocks[39].startswith("第1栏")
+    assert blocks[40].startswith("第2栏")
+
+
+def test_document_flow_orders_a_table_from_its_caption_not_its_grid_top():
+    records = [
+        {
+            "uid": "3.1",
+            "text": "3.1 本工程主体结构设计使用年限为50年。",
+            "point": (10, 110),
+            "height": 5,
+            "record": {"index": 1, "handle": [0, 0, 1]},
+            "instance_path": [],
+        },
+        {
+            "uid": "3.3",
+            "text": "3.3 钢筋混凝土结构的抗震等级：",
+            "point": (10, 50),
+            "height": 5,
+            "record": {"index": 3, "handle": [0, 0, 3]},
+            "instance_path": [],
+        }
+    ]
+    tables = [
+        {
+            "title": "3.2 结构设计等级：",
+            "rows": [["安全等级", "二级"], ["抗震类别", "丙类"]],
+            "header_rows": 1,
+            "spans": [],
+            "bbox": [10, 60, 80, 85],
+            "anchor": (10, 90),
+            "source_refs": [{"object_index": 2, "handle": 2}],
+            "_text_uids": [],
+        }
+    ]
+
+    blocks, _ = _document_flow(records, tables, set(), [10])
+
+    assert blocks[0].startswith("3.1 本工程主体结构")
+    assert blocks[1].startswith("3.2 结构设计等级：")
+    assert blocks[2] == "3.3 钢筋混凝土结构的抗震等级："
+
+
+def test_document_flow_inlines_native_checkbox_state_at_the_label_position():
+    records = [
+        {
+            "uid": f"option-{index}",
+            "text": label,
+            "point": (10, 100 - index * 10),
+            "height": 5,
+            "record": {"index": index, "handle": [0, 0, index]},
+            "instance_path": [],
+        }
+        for index, label in enumerate(("基坑支护工程", "滑模工程"), 1)
+    ]
+    markers = [
+        {"_label_uid": "option-1", "state": "selected", "label": "基坑支护工程"},
+        {"_label_uid": "option-2", "state": "unselected", "label": "滑模工程"},
+    ]
+
+    blocks, _ = _document_flow(records, [], set(), [10], markers)
+
+    assert blocks == ["[x] 基坑支护工程", "[ ] 滑模工程"]
+
+
+def test_document_flow_inlines_checkbox_state_inside_a_table_cell():
+    records = [
+        {
+            "uid": "table-option",
+            "text": "☑ 基坑支护工程",
+            "point": (20, 70),
+            "height": 5,
+            "record": {"index": 1, "handle": [0, 0, 1]},
+            "instance_path": [],
+        }
+    ]
+    tables = [
+        {
+            "title": "几何表格",
+            "rows": [["选项"], ["☑ 基坑支护工程"]],
+            "header_rows": 1,
+            "spans": [],
+            "bbox": [10, 50, 90, 90],
+            "anchor": (10, 90),
+            "source_refs": [{"object_index": 2, "handle": 2}],
+            "cell_source_refs": {"1:0": [{"object_index": 1, "handle": 1}]},
+            "_text_uids": ["table-option"],
+        }
+    ]
+    markers = [
+        {"_label_uid": "table-option", "state": "selected", "label": "基坑支护工程"}
+    ]
+
+    blocks, _ = _document_flow(records, tables, set(), [10], markers)
+
+    assert "| [x] 基坑支护工程 |" in blocks[0]
+    assert "☑" not in blocks[0]
 
 
 def test_open_four_point_polyline_is_not_invented_as_a_sheet_frame():

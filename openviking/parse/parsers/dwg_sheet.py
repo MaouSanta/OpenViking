@@ -5,16 +5,20 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import math
 import re
+import statistics
 import unicodedata
+from bisect import bisect_right
 from collections import Counter, defaultdict
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 
 from openviking.parse.parsers.dwg_sheet_geometry import (
     detect_marker_groups,
     detect_table_grids,
 )
+from openviking.parse.parsers.dwg_titleblock import extract_titleblock_meta
 from openviking_cli.utils.config.parser_config import ParserConfig
 from openviking_cli.utils.uri import VikingURI
 
@@ -41,6 +45,13 @@ _MARKER_RE = re.compile(r"^\s*([□■☐☑☒○●◯✓√×✕])\s*(.*)$")
 _FRAME_NAME_RE = re.compile(r"(?:图框|图签|title\s*block|border|sheet\s*frame)", re.I)
 _CJK_RE = re.compile(r"[\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af]")
 _NONSPACE_RE = re.compile(r"[^\s]")
+_NUMBERED_RE = re.compile(
+    r"^\s*((?:[1-9]\d?(?:\.\d+)+)(?=[^\d.])|"
+    r"(?:[1-9]\d?(?:\.\d+){2,})$|(?:[1-9]\d?)[.．](?=\D))"
+)
+_TOP_LEVEL_RE = re.compile(r"^\s*([1-9]\d?)[.．](?=\D)")
+
+SheetModeClassifier = Callable[[bytes, dict[str, Any]], dict[str, Any] | str | None]
 
 
 def _ref(value: Any) -> Any:
@@ -580,14 +591,21 @@ def _native_tables(
                     "confidence": "exact",
                     "source_refs": [_source_ref(record, [])],
                     "text_uids": [],
+                    "anchor": position,
                 }
             )
     return tables
 
 
 def _extract_meta(
-    records: list[dict[str, Any]], summary: dict[str, Any]
+    records: list[dict[str, Any]],
+    summary: dict[str, Any],
+    sheet_bbox: tuple[float, float, float, float] | None,
 ) -> tuple[dict[str, str], set[str]]:
+    titleblock, titleblock_uids = extract_titleblock_meta(records, sheet_bbox)
+    if titleblock:
+        return titleblock, titleblock_uids
+
     fields = {
         str(key): _clean_text(value)
         for key, value in summary.items()
@@ -631,7 +649,7 @@ def _classify_sheet(
     lines: list[dict[str, Any]],
     sheet_bbox: tuple[float, float, float, float] | None,
 ) -> dict[str, Any]:
-    meta, used = _extract_meta(records, summary)
+    meta, used = _extract_meta(records, summary, sheet_bbox)
     category_uids: dict[str, set[str]] = defaultdict(set)
     category_uids["meta"].update(used)
     tables = _native_tables(objects, sheet_bbox)
@@ -643,11 +661,25 @@ def _classify_sheet(
         )
     for table in tables:
         table_uids = table.pop("text_uids", [])
+        table["_text_uids"] = table_uids
         used.update(table_uids)
         category_uids["tables"].update(table_uids)
     notes, directives = [], []
     option_groups = detect_marker_groups(frames, lines, records)
     markers = [marker for group in option_groups for marker in group["markers"]]
+    text_uids_by_ref = {
+        repr(_source_ref(record["record"], record["instance_path"])): record["uid"]
+        for record in records
+    }
+    for marker in markers:
+        marker["_label_uid"] = next(
+            (
+                text_uids_by_ref[repr(source)]
+                for source in reversed(marker["source_refs"])
+                if repr(source) in text_uids_by_ref
+            ),
+            None,
+        )
     marker_label_uids = {
         uid for group in option_groups for uid in group.pop("text_uids", [])
     }
@@ -685,6 +717,7 @@ def _classify_sheet(
                     "label": label,
                     "evidence": "text_glyph",
                     "source_refs": [source],
+                    "_label_uid": record["uid"],
                 }
             )
             category_uids["markers"].add(record["uid"])
@@ -739,6 +772,391 @@ def _classify_sheet(
         "unassigned": unresolved,
         "_category_uids": {key: sorted(values) for key, values in category_uids.items()},
     }
+
+
+def _document_column_anchors(
+    records: list[dict[str, Any]],
+    sheet_bbox: tuple[float, float, float, float] | None,
+    excluded_uids: set[str],
+) -> list[float]:
+    numbered = [
+        record
+        for record in records
+        if record["uid"] not in excluded_uids
+        and record.get("point")
+        and _NUMBERED_RE.match(record["text"])
+    ]
+    width = (sheet_bbox[2] - sheet_bbox[0]) if sheet_bbox else 0.0
+    heights = [record["height"] for record in records if record.get("height", 0) > 0]
+    tolerance = max(statistics.median(heights) * 8 if heights else 0.0, width * 0.04, 1.0)
+
+    def cluster(items: list[dict[str, Any]], minimum: int) -> list[float]:
+        groups: list[list[float]] = []
+        for x in sorted(record["point"][0] for record in items):
+            if not groups or x - groups[-1][-1] > tolerance:
+                groups.append([x])
+            else:
+                groups[-1].append(x)
+        return [statistics.median(group) for group in groups if len(group) >= minimum]
+
+    anchors = cluster(numbered, 2)
+    if len(anchors) >= 2:
+        return anchors
+    narrative = [
+        record
+        for record in records
+        if record["uid"] not in excluded_uids
+        and record.get("point")
+        and len(record["text"].replace("\n", "")) >= 12
+    ]
+    fallback = cluster(narrative, max(3, math.ceil(len(narrative) * 0.04)))
+    if 2 <= len(fallback) <= 6:
+        return fallback
+    positioned = [record["point"][0] for record in records if record.get("point")]
+    return anchors or ([min(positioned)] if positioned else [])
+
+
+def _native_sheet_mode(
+    records: list[dict[str, Any]],
+    tables: list[dict[str, Any]],
+    sheet_bbox: tuple[float, float, float, float] | None,
+    excluded_uids: set[str],
+) -> dict[str, Any]:
+    body = [record for record in records if record["uid"] not in excluded_uids]
+    numbered = [record for record in body if _NUMBERED_RE.match(record["text"])]
+    top_levels = {
+        int(match.group(1))
+        for record in body
+        if (match := _TOP_LEVEL_RE.match(record["text"]))
+    }
+    anchors = _document_column_anchors(body, sheet_bbox, set())
+    narrative = sum(len(record["text"].replace("\n", "")) >= 24 for record in body)
+    score = sum(
+        (
+            2 if len(body) >= 80 else 0,
+            2 if len(numbered) >= 10 else 0,
+            2 if 2 <= len(anchors) <= 6 else 0,
+            2 if len(top_levels) >= 4 else 0,
+            1 if narrative >= 30 else 0,
+            1 if tables else 0,
+        )
+    )
+    return {
+        "mode": "document" if score >= 7 else "drawing",
+        "method": "native_layout",
+        "confidence": min(0.98, 0.45 + score * 0.055),
+        "column_count": len(anchors),
+        "signals": {
+            "text_instances": len(body),
+            "numbered_instances": len(numbered),
+            "top_level_sections": len(top_levels),
+            "narrative_instances": narrative,
+            "table_count": len(tables),
+        },
+        "_column_anchors": anchors,
+        "_score": score,
+    }
+
+
+def _document_column_cuts(
+    records: list[dict[str, Any]], anchors: list[float], excluded_uids: set[str]
+) -> list[float]:
+    xs = sorted(
+        {
+            record["point"][0]
+            for record in records
+            if record["uid"] not in excluded_uids and record.get("point")
+        }
+    )
+    cuts: list[float] = []
+    for left, right in zip(anchors, anchors[1:], strict=False):
+        between = [x for x in xs if left <= x <= right]
+        if len(between) < 2:
+            cuts.append((left + right) / 2)
+            continue
+        gap_left, gap_right = max(
+            zip(between, between[1:], strict=False), key=lambda pair: pair[1] - pair[0]
+        )
+        cuts.append((gap_left + gap_right) / 2)
+    return cuts
+
+
+def _render_sheet_layout(
+    records: list[dict[str, Any]],
+    lines: list[dict[str, Any]],
+    sheet_bbox: tuple[float, float, float, float] | None,
+) -> bytes:
+    """Render one transient high-resolution layout image for mode classification."""
+    from PIL import Image, ImageDraw, ImageFont
+
+    box = sheet_bbox or _bbox(
+        [record["point"] for record in records if record.get("point")]
+        + [line[key] for line in lines for key in ("a", "b")]
+    )
+    if not box or box[2] <= box[0] or box[3] <= box[1]:
+        return b""
+    span_x, span_y = box[2] - box[0], box[3] - box[1]
+    max_dimension, margin = 1800, 24
+    scale = min((max_dimension - margin * 2) / span_x, (max_dimension - margin * 2) / span_y)
+    width = max(64, round(span_x * scale) + margin * 2)
+    height = max(64, round(span_y * scale) + margin * 2)
+    image = Image.new("RGB", (width, height), "black")
+    draw = ImageDraw.Draw(image)
+
+    def pixel(point: tuple[float, float]) -> tuple[int, int]:
+        return (
+            round((point[0] - box[0]) * scale) + margin,
+            height - margin - round((point[1] - box[1]) * scale),
+        )
+
+    for line in lines:
+        draw.line((pixel(line["a"]), pixel(line["b"])), fill=(105, 105, 105), width=1)
+    font_path = "/System/Library/Fonts/Supplemental/Arial Unicode.ttf"
+    fonts: dict[int, Any] = {}
+    for record in records:
+        if not record.get("point"):
+            continue
+        size = max(6, min(28, round(max(record.get("height", 0.0), span_y / 500) * scale)))
+        if size not in fonts:
+            try:
+                fonts[size] = ImageFont.truetype(font_path, size)
+            except OSError:
+                fonts[size] = ImageFont.load_default()
+        draw.text(pixel(record["point"]), record["text"][:120], fill="white", font=fonts[size])
+    output = io.BytesIO()
+    image.save(output, format="PNG", optimize=True)
+    return output.getvalue()
+
+
+def _sheet_mode(
+    records: list[dict[str, Any]],
+    lines: list[dict[str, Any]],
+    tables: list[dict[str, Any]],
+    sheet_bbox: tuple[float, float, float, float] | None,
+    excluded_uids: set[str],
+    classifier: SheetModeClassifier | None,
+) -> dict[str, Any]:
+    mode = _native_sheet_mode(records, tables, sheet_bbox, excluded_uids)
+    should_look = (
+        classifier is not None
+        and mode["signals"]["text_instances"] >= 80
+        and (
+            mode["signals"]["numbered_instances"] >= 6
+            or mode["signals"]["narrative_instances"] >= 30
+        )
+    )
+    if not should_look:
+        return mode
+    try:
+        image = _render_sheet_layout(records, lines, sheet_bbox)
+    except Exception as exc:
+        mode["vlm"] = {"status": "render_failed", "error": type(exc).__name__}
+        return mode
+    if not image:
+        return mode
+    evidence = {key: value for key, value in mode.items() if not key.startswith("_")}
+    try:
+        result = classifier(image, evidence)
+    except Exception as exc:
+        mode["vlm"] = {"status": "failed", "error": type(exc).__name__}
+        return mode
+    if isinstance(result, str):
+        result = {"mode": result}
+    if not isinstance(result, dict) or result.get("mode") not in {"document", "drawing"}:
+        mode["vlm"] = {"status": "invalid_response"}
+        return mode
+    try:
+        confidence = float(result.get("confidence", 0.0) or 0.0)
+    except (TypeError, ValueError, OverflowError):
+        confidence = 0.0
+    confidence = min(1.0, max(0.0, confidence)) if math.isfinite(confidence) else 0.0
+    mode["vlm"] = {
+        "status": "used",
+        "mode": result["mode"],
+        "confidence": confidence,
+        "reason": str(result.get("reason") or "")[:240],
+    }
+    agrees = result["mode"] == mode["mode"]
+    if confidence >= 0.7 and (agrees or confidence > mode["confidence"]):
+        mode.update(
+            mode=result["mode"],
+            method="native_layout+vlm",
+            confidence=max(mode["confidence"], confidence) if agrees else confidence,
+        )
+    return mode
+
+
+def _join_fragments(values: list[str]) -> str:
+    result = ""
+    for value in values:
+        value = value.strip()
+        if not value:
+            continue
+        if not result or result[-1] in "（(【[、/" or value[0] in "，。；：、）)】]！？,.!?;:%‰":
+            result += value
+        else:
+            result += " " + value
+    return result
+
+
+def _document_text(text: str) -> str:
+    compact = text.strip()
+    if len(compact) <= 24 and re.search(r"(?:总说明|设计说明)$", compact):
+        return f"## {compact}"
+    return compact
+
+
+def _marker_prefix(marker: dict[str, Any]) -> str:
+    return (
+        "[x]"
+        if marker["state"] == "selected"
+        else "[ ]"
+        if marker["state"] == "unselected"
+        else "[?]"
+    )
+
+
+def _document_flow(
+    records: list[dict[str, Any]],
+    tables: list[dict[str, Any]],
+    excluded_uids: set[str],
+    anchors: list[float],
+    markers: list[dict[str, Any]] | None = None,
+) -> tuple[list[str], list[dict[str, Any]]]:
+    table_uids = {uid for table in tables for uid in table.get("_text_uids", [])}
+    excluded = excluded_uids | table_uids
+    markers_by_uid = {
+        marker["_label_uid"]: marker
+        for marker in markers or []
+        if marker.get("_label_uid") is not None
+    }
+    records_by_uid = {record["uid"]: record for record in records}
+    source_keys_by_uid = {
+        record["uid"]: repr(_source_ref(record["record"], record["instance_path"]))
+        for record in records
+    }
+    inlined_marker_uids: set[str] = set()
+    events: list[dict[str, Any]] = []
+    for record in records:
+        if record["uid"] in excluded or not record.get("point"):
+            continue
+        text = record["text"]
+        if marker := markers_by_uid.get(record["uid"]):
+            text = f"{_marker_prefix(marker)} {marker['label'] or text}"
+            inlined_marker_uids.add(record["uid"])
+        events.append(
+            {
+                "kind": "text",
+                "point": record["point"],
+                "height": record.get("height", 0.0),
+                "text": text,
+                "source_refs": [_source_ref(record["record"], record["instance_path"])],
+            }
+        )
+    for index, table in enumerate(tables, 1):
+        box, anchor = table.get("bbox"), table.get("anchor")
+        if anchor and len(anchor) >= 2:
+            point = (float(anchor[0]), float(anchor[1]))
+        elif box and len(box) == 4:
+            point = (float(box[0]), float(box[3]))
+        else:
+            point = (anchors[0] if anchors else 0.0, -math.inf)
+        title = table["title"]
+        rows = [row[:] for row in table["rows"]]
+        for cell, refs in table.get("cell_source_refs", {}).items():
+            source_keys = {repr(ref) for ref in refs}
+            row, column = map(int, cell.split(":"))
+            for uid, marker in markers_by_uid.items():
+                if uid in inlined_marker_uids or source_keys_by_uid.get(uid) not in source_keys:
+                    continue
+                prefix = _marker_prefix(marker)
+                label = marker.get("label") or ""
+                value = rows[row][column]
+                raw = records_by_uid.get(uid, {}).get("text", "")
+                glyph = _MARKER_RE.match(raw)
+                replacement = f"{prefix} {label or (glyph.group(2) if glyph else raw)}".strip()
+                if glyph and raw in value:
+                    rows[row][column] = value.replace(raw, replacement, 1)
+                elif label and label in value:
+                    rows[row][column] = value.replace(label, f"{prefix} {label}", 1)
+                else:
+                    rows[row][column] = f"{prefix} {value}".strip()
+                inlined_marker_uids.add(uid)
+        markdown = _table_markdown(
+            rows, header_rows=table["header_rows"], spans=table["spans"]
+        )
+        if title and title != "几何表格":
+            markdown = f"{_document_text(title)}\n\n{markdown}"
+        events.append(
+            {
+                "kind": "table",
+                "point": point,
+                "height": 0.0,
+                "text": markdown,
+                "table_index": index,
+                "source_refs": table["source_refs"],
+            }
+        )
+    for uid, marker in markers_by_uid.items():
+        if (
+            uid in inlined_marker_uids
+            or not (record := records_by_uid.get(uid))
+            or not record.get("point")
+        ):
+            continue
+        events.append(
+            {
+                "kind": "text",
+                "point": record["point"],
+                "height": record.get("height", 0.0),
+                "text": f"{_marker_prefix(marker)} {marker['label'] or record['text']}",
+                "source_refs": [_source_ref(record["record"], record["instance_path"])],
+            }
+        )
+    if not events:
+        return [], []
+    anchors = anchors or [min(event["point"][0] for event in events)]
+    cuts = _document_column_cuts(records, anchors, excluded_uids)
+    columns: list[list[dict[str, Any]]] = [[] for _ in anchors]
+    for event in events:
+        column = bisect_right(cuts, event["point"][0])
+        columns[column].append(event)
+
+    blocks: list[str] = []
+    flow: list[dict[str, Any]] = []
+    for column in columns:
+        ordered = sorted(column, key=lambda item: (-item["point"][1], item["point"][0]))
+        index = 0
+        while index < len(ordered):
+            event = ordered[index]
+            if event["kind"] == "table":
+                group = [event]
+            else:
+                group = [event]
+                tolerance = max(float(event.get("height") or 0.0) * 0.45, 1e-6)
+                while (
+                    index + len(group) < len(ordered)
+                    and ordered[index + len(group)]["kind"] == "text"
+                    and abs(
+                        ordered[index + len(group)]["point"][1] - event["point"][1]
+                    )
+                    <= tolerance
+                ):
+                    group.append(ordered[index + len(group)])
+                group.sort(key=lambda item: item["point"][0])
+            text = (
+                event["text"]
+                if event["kind"] == "table"
+                else _document_text(_join_fragments([item["text"] for item in group]))
+            )
+            blocks.append(text)
+            source_refs = [ref for item in group for ref in item["source_refs"]]
+            item = {"order": len(flow) + 1, "kind": event["kind"], "source_refs": source_refs}
+            if event["kind"] == "table":
+                item["table_id"] = f"T{event['table_index']:03d}"
+            flow.append(item)
+            index += len(group)
+    return blocks, flow
 
 
 def _markdown_cell(value: Any) -> str:
@@ -800,6 +1218,21 @@ def _table_markdown(
 
 
 def _sections(classified: dict[str, Any], sheet: dict[str, Any]) -> list[tuple[str, str]]:
+    if sheet["projection"]["mode"] == "document":
+        sections: list[tuple[str, str]] = []
+        if classified["meta"]:
+            sections.append(
+                (
+                    "图纸信息",
+                    "\n".join(
+                        f"- {key}：{value.replace(chr(10), '<br>')}"
+                        for key, value in classified["meta"].items()
+                    ),
+                )
+            )
+        sections.extend(("", block) for block in sheet["document_blocks"])
+        return sections
+
     meta = dict(classified["meta"])
     meta.setdefault("来源文件", sheet["source_name"])
     meta.setdefault("Sheet ID", sheet["sheet_id"])
@@ -866,7 +1299,7 @@ def _fits(text: str, max_tokens: int, max_chars: int) -> bool:
 
 
 def _split_body(heading: str, body: str, prefix: str, max_tokens: int, max_chars: int) -> list[str]:
-    lead = f"{prefix}\n\n## {heading}\n\n"
+    lead = f"{prefix}\n\n" + (f"## {heading}\n\n" if heading else "")
     if _fits(lead + body, max_tokens, max_chars):
         return [lead + body]
     lines = body.splitlines()
@@ -1025,17 +1458,29 @@ def _table_cells(table: dict[str, Any]) -> list[dict[str, Any]]:
     return cells
 
 
+def _public_marker(marker: dict[str, Any]) -> dict[str, Any]:
+    return {key: value for key, value in marker.items() if not key.startswith("_")}
+
+
 def _structure(
     sheet: dict[str, Any], classified: dict[str, Any], content_paths: list[str]
 ) -> dict[str, Any]:
+    document_mode = sheet["projection"]["mode"] == "document"
     region_specs = (
-        ("meta", len(classified["meta"]), "图纸元数据"),
-        ("table", len(classified["tables"]), "表格"),
-        ("notes", len(classified["notes"]), "说明"),
-        ("markers", len(classified["markers"]), "选项与标记"),
-        ("directives", len(classified["directives"]), "局部施工要求"),
-        ("labels", len(classified["labels"]), "文字标签（聚合，无坐标）"),
-        ("unassigned", len(classified["unassigned"]), "未分类文字"),
+        (
+            ("meta", len(classified["meta"]), "图纸信息"),
+            ("document", len(classified.get("_document_flow", [])), ""),
+        )
+        if document_mode
+        else (
+            ("meta", len(classified["meta"]), "图纸元数据"),
+            ("table", len(classified["tables"]), "表格"),
+            ("notes", len(classified["notes"]), "说明"),
+            ("markers", len(classified["markers"]), "选项与标记"),
+            ("directives", len(classified["directives"]), "局部施工要求"),
+            ("labels", len(classified["labels"]), "文字标签（聚合，无坐标）"),
+            ("unassigned", len(classified["unassigned"]), "未分类文字"),
+        )
     )
     regions = [
         {
@@ -1047,9 +1492,19 @@ def _structure(
         for index, (kind, count, heading) in enumerate(region_specs, 1)
         if count
     ]
-    category_counts = {key: len(values) for key, values in classified["_category_uids"].items()}
-    assigned_instances = len(
-        {uid for values in classified["_category_uids"].values() for uid in values}
+    category_counts = (
+        {
+            "title_block": len(classified["_category_uids"].get("meta", [])),
+            "document_body": sheet["source_text_count"]
+            - len(classified["_category_uids"].get("meta", [])),
+        }
+        if document_mode
+        else {key: len(values) for key, values in classified["_category_uids"].items()}
+    )
+    assigned_instances = (
+        sheet["source_text_count"]
+        if document_mode
+        else len({uid for values in classified["_category_uids"].values() for uid in values})
     )
     return {
         "schema": SHEET_STRUCTURE_SCHEMA,
@@ -1062,6 +1517,7 @@ def _structure(
             "viewport_projection": sheet.get("viewport_projection", "not_applicable"),
             "source_locator": sheet["source_locator"],
             "content_paths": content_paths,
+            "projection": sheet["projection"],
         },
         "source": {
             "file": sheet["source_name"],
@@ -1070,7 +1526,8 @@ def _structure(
         },
         "regions": regions,
         "meta": classified["meta"],
-        "notes": classified["notes"],
+        "document_flow": classified.get("_document_flow", []),
+        "notes": [] if document_mode else classified["notes"],
         "tables": [
             {
                 "table_id": f"T{index:03d}",
@@ -1086,11 +1543,17 @@ def _structure(
             }
             for index, table in enumerate(classified["tables"], 1)
         ],
-        "markers": classified["markers"],
-        "option_groups": classified["option_groups"],
-        "directives": classified["directives"],
-        "labels": classified["labels"],
-        "unassigned": classified["unassigned"],
+        "markers": [_public_marker(marker) for marker in classified["markers"]],
+        "option_groups": [
+            {
+                **{key: value for key, value in group.items() if key != "markers"},
+                "markers": [_public_marker(marker) for marker in group["markers"]],
+            }
+            for group in classified["option_groups"]
+        ],
+        "directives": [] if document_mode else classified["directives"],
+        "labels": [] if document_mode else classified["labels"],
+        "unassigned": [] if document_mode else classified["unassigned"],
         "coverage": {
             "source_text_instances": sheet["source_text_count"],
             "classified_text_instances": assigned_instances,
@@ -1112,6 +1575,7 @@ def build_sheet_artifacts(
     source_size_bytes: int,
     max_section_tokens: int | None = None,
     max_section_chars: int | None = None,
+    sheet_mode_classifier: SheetModeClassifier | None = None,
 ) -> dict[str, Any]:
     """Return one document manifest and one bounded Markdown/structure pair per Sheet."""
     defaults = ParserConfig()
@@ -1264,10 +1728,24 @@ def build_sheet_artifacts(
             candidate.get("lines", []),
             candidate.get("bbox"),
         )
+        meta_uids = set(classified["_category_uids"].get("meta", []))
+        projection = _sheet_mode(
+            candidate["texts"],
+            candidate.get("lines", []),
+            classified["tables"],
+            candidate.get("bbox"),
+            meta_uids,
+            sheet_mode_classifier,
+        )
         fallback = candidate.get("layout_name") or f"Sheet {ordinal:03d}"
         title = _title(classified, fallback)
         slug = VikingURI.sanitize_segment(title) or f"sheet-{ordinal:03d}"
         directory = f"sheets/{sheet_id}__{slug}"
+        public_projection = {
+            key: value for key, value in projection.items() if not key.startswith("_")
+        }
+        if projection["mode"] == "drawing":
+            public_projection["column_count"] = None
         sheet = {
             **candidate,
             "sheet_id": sheet_id,
@@ -1276,7 +1754,18 @@ def build_sheet_artifacts(
             "source_name": source_name,
             "source_sha256": source_sha256,
             "source_text_count": len(candidate["texts"]),
+            "projection": public_projection,
         }
+        if projection["mode"] == "document":
+            blocks, flow = _document_flow(
+                candidate["texts"],
+                classified["tables"],
+                meta_uids,
+                projection["_column_anchors"],
+                classified["markers"],
+            )
+            sheet["document_blocks"] = blocks
+            classified["_document_flow"] = flow
         parts = _bounded_markdown(
             title, sheet_id, _sections(classified, sheet), max_tokens, max_chars
         )

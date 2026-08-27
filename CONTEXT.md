@@ -60,6 +60,14 @@ _Avoid_: CAD editor, source of truth, persisted preview artifact
 A bounded drawing unit intended to stand alone for identification and retrieval. It may originate from a Paper Space Layout or a drawing frame in Model Space; its identity does not depend on a potentially missing or repeated drawing title.
 _Avoid_: page image, viewport, small drawing, region
 
+**Document Sheet**:
+A text-dominant Sheet, such as a multi-column design specification, whose numbered prose and inline tables form one reading-ordered document. It is restored as a document flow rather than regrouped into semantic buckets.
+_Avoid_: notes region, drawing labels, semantic summary
+
+**Title Block**:
+The bounded Sheet area that identifies the drawing, project, issuer, revision, and responsible roles. Its fields are Sheet metadata and are excluded from the Document Sheet body.
+_Avoid_: generic metadata text, body notes, drawing title guess
+
 **Region**:
 A typed semantic area within one Sheet, such as metadata, a table, notes, a plan, or a detail. It provides containment and reading scope but is neither a fixed pixel tile nor an independent bundle.
 _Avoid_: crop tile, sheet, bundle

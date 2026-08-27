@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import math
 import statistics
+import unicodedata
 from collections import defaultdict
 from typing import Any, Iterable
 
@@ -62,6 +63,37 @@ def _contains(
         box[0] - tolerance <= point[0] <= box[2] + tolerance
         and box[1] - tolerance <= point[1] <= box[3] + tolerance
     )
+
+
+def _bbox_distance(
+    box: tuple[float, float, float, float], point: tuple[float, float]
+) -> float:
+    return math.hypot(
+        max(box[0] - point[0], 0.0, point[0] - box[2]),
+        max(box[1] - point[1], 0.0, point[1] - box[3]),
+    )
+
+
+def _text_margin(text: dict[str, Any], tolerance: float) -> float:
+    height = text.get("height")
+    return max(
+        tolerance,
+        float(height) * 0.5 if isinstance(height, (int, float)) and height > 0 else 0.0,
+    )
+
+
+def _join_text(parts: Iterable[str]) -> str:
+    result = ""
+    for part in (part.strip() for part in parts):
+        if not part:
+            continue
+        if result and not (
+            unicodedata.category(result[-1]).startswith("P")
+            or unicodedata.category(part[0]).startswith("P")
+        ):
+            result += " "
+        result += part
+    return result
 
 
 def _cluster(values: Iterable[float], tolerance: float) -> list[float]:
@@ -338,11 +370,11 @@ def _table_from_cells(
     if len(xs) < 3 or len(ys) < 3:
         return None
     box = min(xs), min(ys), max(xs), max(ys)
-    table_texts = [
-        text
-        for text in texts
-        if (point := _point(text.get("point"))) and _contains(box, point, tolerance)
-    ]
+    table_texts = []
+    for text in texts:
+        point = _point(text.get("point"))
+        if point and _bbox_distance(box, point) <= _text_margin(text, tolerance):
+            table_texts.append(text)
     if len(table_texts) < 2:
         return None
     if sheet_bbox and _bbox_area(sheet_bbox) > 0:
@@ -351,17 +383,40 @@ def _table_from_cells(
             len(cells) < 8 or len(table_texts) < math.ceil(len(cells) * 0.25)
         ):
             return None
+    heights = [
+        float(text["height"])
+        for text in texts
+        if isinstance(text.get("height"), (int, float)) and text["height"] > 0
+    ]
+    title_gap = max(
+        (statistics.median(heights) * 3 if heights else 0.0), (box[3] - box[1]) * 0.08
+    )
+    titles = [
+        text
+        for text in texts
+        if (point := _point(text.get("point")))
+        and box[0] - _text_margin(text, tolerance) * 4
+        <= point[0]
+        <= box[2] + _text_margin(text, tolerance) * 4
+        and box[3] < point[1] <= box[3] + title_gap
+    ]
+    title_record = min(titles, key=lambda text: _point(text["point"])[1] - box[3], default=None)
+    if title_record in table_texts:
+        table_texts.remove(title_record)
+    if len(table_texts) < 2:
+        return None
 
     matches_by_cell: dict[int, list[dict[str, Any]]] = defaultdict(list)
     for text in table_texts:
         point = _point(text.get("point"))
         choices = [
-            (index, cell)
+            (_bbox_distance(cell["bbox"], point), _bbox_area(cell["bbox"]), index)
             for index, cell in enumerate(cells)
-            if point and _contains(cell["bbox"], point, tolerance)
+            if point
+            and _bbox_distance(cell["bbox"], point) <= _text_margin(text, tolerance)
         ]
         if choices:
-            index, _ = min(choices, key=lambda choice: _bbox_area(choice[1]["bbox"]))
+            _, _, index = min(choices)
             matches_by_cell[index].append(text)
 
     cell_rows: list[dict[str, Any]] = []
@@ -373,11 +428,25 @@ def _table_from_cells(
         column = min(range(len(xs)), key=lambda index: abs(xs[index] - left))
         column_end = min(range(len(xs)), key=lambda index: abs(xs[index] - right))
         matches = matches_by_cell[cell_index]
-        matches.sort(key=lambda text: (-_point(text["point"])[1], _point(text["point"])[0]))
+        match_heights = [
+            float(text["height"])
+            for text in matches
+            if isinstance(text.get("height"), (int, float)) and text["height"] > 0
+        ]
+        line_tolerance = max(
+            tolerance, statistics.median(match_heights) * 0.5 if match_heights else 0.0
+        )
+        line_levels = _cluster((_point(text["point"])[1] for text in matches), line_tolerance)
+        matches.sort(
+            key=lambda text: (
+                -_nearest(_point(text["point"])[1], line_levels),
+                _point(text["point"])[0],
+            )
+        )
         for text in matches:
             if text.get("uid") is not None:
                 consumed.add(str(text["uid"]))
-        text_value = " ".join(str(text.get("text") or "").strip() for text in matches).strip()
+        text_value = _join_text(str(text.get("text") or "") for text in matches)
         refs = _unique_refs(cell["source_refs"] + [_text_ref(text) for text in matches])
         cell_rows.append(
             {
@@ -427,20 +496,6 @@ def _table_from_cells(
         )
         else 1
     )
-    heights = [
-        float(text["height"])
-        for text in texts
-        if isinstance(text.get("height"), (int, float)) and text["height"] > 0
-    ]
-    title_gap = max((statistics.median(heights) * 3 if heights else 0.0), (box[3] - box[1]) * 0.08)
-    titles = [
-        text
-        for text in texts
-        if (point := _point(text.get("point")))
-        and box[0] - tolerance <= point[0] <= box[2] + tolerance
-        and box[3] < point[1] <= box[3] + title_gap
-    ]
-    title_record = min(titles, key=lambda text: _point(text["point"])[1] - box[3], default=None)
     if title_record and title_record.get("uid") is not None:
         consumed.add(str(title_record["uid"]))
     source_refs = _unique_refs(ref for cell in cell_rows for ref in cell["source_refs"])
@@ -453,6 +508,7 @@ def _table_from_cells(
         "spans": spans,
         "cells": sorted(cell_rows, key=lambda cell: (cell["row"], cell["column"])),
         "bbox": list(box),
+        "anchor": _point(title_record.get("point")) if title_record else (box[0], box[3]),
         "source_kind": "native_line_grid",
         "confidence": "high",
         "source_refs": source_refs,

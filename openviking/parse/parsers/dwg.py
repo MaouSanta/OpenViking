@@ -18,6 +18,7 @@ from openviking.parse.parsers.base_parser import BaseParser
 from openviking.parse.parsers.dwg_extract import build_beam_topology
 from openviking.parse.parsers.dwg_sheet import build_sheet_artifacts
 from openviking_cli.utils.config import get_openviking_config
+from openviking_cli.utils.llm import parse_json_from_response
 from openviking_cli.utils.uri import VikingURI
 
 
@@ -54,13 +55,16 @@ class DWGParser(BaseParser):
             source_size_bytes=len(source_bytes),
         )
         markdown_config = get_openviking_config().markdown
-        sheet_artifacts = build_sheet_artifacts(
+        sheet_mode_classifier = kwargs.get("sheet_mode_classifier") or _sheet_mode_classifier()
+        sheet_artifacts = await asyncio.to_thread(
+            build_sheet_artifacts,
             drawing,
             source_name=source_filename,
             source_sha256=source_sha256,
             source_size_bytes=len(source_bytes),
             max_section_tokens=markdown_config.max_section_size,
             max_section_chars=markdown_config.max_section_chars,
+            sheet_mode_classifier=sheet_mode_classifier,
         )
         topology_bytes = json.dumps(topology, ensure_ascii=False, separators=(",", ":")).encode(
             "utf-8"
@@ -184,6 +188,24 @@ def _read_source_snapshot(path: Path) -> Tuple[bytes, str, str]:
     payload = path.read_bytes()
     modified_at = datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc).isoformat()
     return payload, hashlib.sha256(payload).hexdigest(), modified_at
+
+
+def _sheet_mode_classifier():
+    """Use one transient layout image to distinguish document sheets from drawings."""
+    vlm = get_openviking_config().vlm
+    if not vlm.is_available():
+        return None
+
+    def classify(image: bytes, evidence: Dict[str, Any]) -> Any:
+        prompt = f"""Classify this complete DWG sheet by layout only.
+Return JSON: {{"mode":"document|drawing","confidence":0.0,"reason":"short reason"}}.
+document means the sheet is primarily a multi-column manual/specification whose numbered text and inline tables must be restored in reading order. drawing means a plan/detail whose text is spatial annotation. Do not transcribe or summarize text.
+Native evidence: {json.dumps(evidence, ensure_ascii=False)}"""
+        return parse_json_from_response(
+            vlm.get_vision_completion(prompt=prompt, images=[image], thinking=False)
+        )
+
+    return classify
 
 
 def _normalize_libredwg_json(

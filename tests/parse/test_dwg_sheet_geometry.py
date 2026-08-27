@@ -63,6 +63,61 @@ def test_detect_table_grid_restores_multilevel_header_and_sources():
     assert table["text_uids"] == ["text-101", "text-102", "text-103", "text-104", "text-105"]
 
 
+def test_detect_table_grid_accepts_text_baselines_just_outside_edge_cells():
+    lines = [
+        _line(1, (0, 0), (0, 4)),
+        _line(2, (3, 0), (3, 4)),
+        _line(3, (8, 0), (8, 4)),
+        _line(4, (13, 0), (13, 4)),
+        *[_line(10 + row, (0, row), (13, row)) for row in range(5)],
+    ]
+    texts = [
+        _text(101, "环境类别", (-0.4, 3.2)),
+        _text(102, "板、墙、壳", (4, 3.2)),
+        _text(103, "梁、", (9, 3.2)),
+        _text(113, "柱、杆", (10, 3.21)),
+        _text(104, "一", (-0.2, 2.2)),
+        _text(105, "15", (4, 2.2)),
+        _text(106, "20", (9, 2.2)),
+        _text(107, "二a", (-0.2, 1.2)),
+        _text(108, "20", (4, 1.2)),
+        _text(109, "25", (9, 1.2)),
+        _text(110, "二b", (-0.2, -0.1)),
+        _text(111, "25", (4, 0.2)),
+        _text(112, "35", (9, 0.2)),
+    ]
+
+    tables = detect_table_grids(lines, texts, sheet_bbox=(0, 0, 100, 100))
+
+    assert len(tables) == 1
+    assert tables[0]["rows"] == [
+        ["环境类别", "板、墙、壳", "梁、柱、杆"],
+        ["一", "15", "20"],
+        ["二a", "20", "25"],
+        ["二b", "25", "35"],
+    ]
+
+
+def test_detect_table_grid_keeps_a_left_offset_caption_out_of_header_cells():
+    lines = [
+        *[_line(1 + column, (column * 10, 0), (column * 10, 30)) for column in range(3)],
+        *[_line(10 + row, (0, row * 15), (20, row * 15)) for row in range(3)],
+    ]
+    texts = [
+        _text(100, "3.2 结构设计等级：", (-0.6, 30.4)),
+        _text(101, "安全等级", (2, 25)),
+        _text(102, "抗震类别", (12, 25)),
+        _text(103, "二级", (2, 5)),
+        _text(104, "丙类", (12, 5)),
+    ]
+
+    table = detect_table_grids(lines, texts, sheet_bbox=(0, 0, 100, 100))[0]
+
+    assert table["title"] == "3.2 结构设计等级："
+    assert table["rows"] == [["安全等级", "抗震类别"], ["二级", "丙类"]]
+    assert table["anchor"] == (-0.6, 30.4)
+
+
 def test_detect_table_grid_rejects_giant_sparse_sheet_alignment():
     lines = [
         _line(1, (0, 0), (0, 100)),
