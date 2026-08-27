@@ -73,7 +73,11 @@ def _decode_text_codes(text: str) -> str:
     text = text.replace("%%1403%%141", "³").replace("%%%", "%")
     text = re.sub(r"%%P", "±", text, flags=re.I)
     text = re.sub(r"%%D", "°", text, flags=re.I)
-    return re.sub(r"%%C", "⌀", text, flags=re.I)
+    text = re.sub(r"%%C", "⌀", text, flags=re.I)
+    return "".join(
+        f"⟦SHX:0x{ord(char):02X}⟧" if 0x80 <= ord(char) <= 0x9F else char
+        for char in text
+    )
 
 
 def _clean_text(value: Any) -> str:

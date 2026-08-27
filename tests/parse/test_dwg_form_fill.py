@@ -131,6 +131,8 @@ def test_clean_text_decodes_verified_autocad_display_codes():
     assert _clean_text("弯钩180%%D") == "弯钩180°"
     assert _clean_text("标高%%P0.00") == "标高±0.00"
     assert _clean_text("19kN/m%%1403%%141") == "19kN/m³"
+    assert _clean_text("\x82") == "⟦SHX:0x82⟧"
+    assert _clean_text("2\x8414") == "2⟦SHX:0x84⟧14"
 
 
 def test_restore_form_slots_does_not_swallow_an_other_layer_note_on_a_slot_boundary():
