@@ -43,7 +43,9 @@ _DIMENSION_RE = re.compile(
     r"^(?:[±+-]?\d+(?:\.\d+)?|[ΦØRr]\s*\d+|.*(?:标高|尺寸|\d\s*[xX×]\s*\d).*)$"
 )
 _MARKER_RE = re.compile(r"^\s*([□■☐☑☒○●◯✓√×✕])\s*(.*)$")
-_FRAME_NAME_RE = re.compile(r"(?:图框|图签|title\s*block|border|sheet\s*frame)", re.I)
+_FRAME_NAME_RE = re.compile(
+    r"(?:图框|图签|图纸目录|title\s*block|border|sheet\s*frame)", re.I
+)
 _CJK_RE = re.compile(r"[\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af]")
 _NONSPACE_RE = re.compile(r"[^\s]")
 _NUMBERED_RE = re.compile(
@@ -52,6 +54,9 @@ _NUMBERED_RE = re.compile(
 )
 _TOP_LEVEL_RE = re.compile(r"^\s*([1-9]\d?)[.．](?=\D)")
 _FORM_SLOT_RE = re.compile(r"(?<=\S) {2,}(?=\S)")
+_TITLE_SUFFIX_RE = re.compile(
+    r"(?:图|说明|目录|清单|表|专篇|大样)(?:[一二三四五六七八九十]|[（(][一二三四五六七八九十][)）])?$"
+)
 
 SheetModeClassifier = Callable[[bytes, dict[str, Any]], dict[str, Any] | str | None]
 
@@ -489,33 +494,54 @@ def _select_frames(space: dict[str, list[dict[str, Any]]]) -> list[dict[str, Any
     ]
     if not frames:
         return []
-    candidates = frames
+    # Sheet frames in the supported Model-Space corpus are top-level drawing
+    # objects. Nested rectangles are rooms, symbols, tables, and block internals.
+    # ponytail: fall back to nested candidates only if a future corpus groups all
+    # physical sheets inside one master INSERT.
+    top_level = [
+        frame for frame in frames if not frame.get("source_ref", {}).get("instance_path")
+    ]
+    candidates = top_level or frames
     extent = _bbox(
         [record["point"] for record in space["texts"] if record["point"]]
         + [line[endpoint] for line in space["lines"] for endpoint in ("a", "b")]
     )
     span_x = max(1.0, (extent[2] - extent[0]) if extent else 1.0)
     span_y = max(1.0, (extent[3] - extent[1]) if extent else 1.0)
+    repeated_blocks = {
+        name
+        for name, count in Counter(
+            frame.get("block_name") for frame in candidates if frame.get("block_name")
+        ).items()
+        if count >= 2
+    }
     filtered = []
     for frame in candidates:
         box = frame["bbox"]
         width, height = box[2] - box[0], box[3] - box[1]
-        text_count = sum(_inside(box, record["point"]) for record in space["texts"])
-        if frame["source_kind"] == "frame_block" or (
-            0.28 <= width / max(height, 1e-12) <= 3.6
-            and width >= span_x * 0.06
-            and height >= span_y * 0.06
+        block_name = frame.get("block_name")
+        aspect = width / max(height, 1e-12)
+        large_enough = max(width / span_x, height / span_y) >= 0.06
+        if frame["source_kind"] == "frame_block" or block_name in repeated_blocks or (
+            0.28 <= aspect <= 3.6 and large_enough
         ):
+            text_count = sum(_inside(box, record["point"]) for record in space["texts"])
             frame = {**frame, "text_count": text_count}
             filtered.append(frame)
     dimension_groups: list[list[dict[str, Any]]] = []
     for frame in filtered:
         box = frame["bbox"]
         width, height = box[2] - box[0], box[3] - box[1]
+        block_name = frame.get("block_name")
         group = next(
             (
                 group
                 for group in dimension_groups
+                if (
+                    group[0].get("block_name") == block_name
+                    if group[0].get("block_name") or block_name
+                    else True
+                )
                 if abs((group[0]["bbox"][2] - group[0]["bbox"][0]) - width) <= width * 0.02
                 and abs((group[0]["bbox"][3] - group[0]["bbox"][1]) - height) <= height * 0.02
             ),
@@ -541,7 +567,7 @@ def _select_frames(space: dict[str, list[dict[str, Any]]]) -> list[dict[str, Any
                 if _contains(frame["bbox"], other["bbox"])
                 and _box_area(other["bbox"]) < _box_area(frame["bbox"])
             }
-            if len(contained_centers) < 2:
+            if not contained_centers:
                 retained_unique.append(frame)
         filtered = repeated + retained_unique
     else:
@@ -674,7 +700,9 @@ def _classify_sheet(
     category_uids: dict[str, set[str]] = defaultdict(set)
     category_uids["meta"].update(used)
     tables = _native_tables(objects, sheet_bbox)
-    if not tables:
+    # ponytail: dense plans contain hundreds of thousands of orthogonal segments;
+    # exhaustive grid reconstruction is for document/table sheets, not floor plans.
+    if not tables and len(lines) <= 25_000:
         tables = detect_table_grids(
             lines,
             [record for record in records if record["uid"] not in used],
@@ -1768,7 +1796,47 @@ def _bounded_markdown(
     return parts
 
 
-def _title(classified: dict[str, Any], fallback: str) -> str:
+def _formal_title(records: list[dict[str, Any]]) -> str | None:
+    titleblock = [
+        record
+        for record in records
+        if "TB-ATTRIB" in str(record.get("layer") or "").upper()
+        and record.get("point")
+        and record.get("text")
+    ]
+    candidates: list[tuple[int, str]] = []
+    for record in titleblock:
+        text = _compact_cjk_spacing(record["text"].replace("\n", ""))
+        if not _TITLE_SUFFIX_RE.search(text) or len(text) > 64:
+            continue
+        x, y = record["point"]
+        height = max(float(record.get("height") or 0.0), 1.0)
+        prefixes = [
+            item
+            for item in titleblock
+            if item is not record
+            and 0 < item["point"][1] - y <= height * 3
+            and abs(item["point"][0] - x) <= height * 20
+            and not _IDENTIFIER_RE.fullmatch(item["text"])
+            and item["text"].rstrip().endswith(("、", "，", ",", "；", ";"))
+        ]
+        pieces = [
+            item["text"].replace("\n", "")
+            for item in sorted(prefixes, key=lambda item: -item["point"][1])
+        ]
+        pieces.append(text)
+        layer = str(record.get("layer") or "").upper()
+        priority = 2 if layer == "0-TB-ATTRIB" else 1 if "TK-JDB" in layer else 0
+        candidates.append((priority, "".join(pieces)))
+    return max(candidates, key=lambda item: (item[0], len(item[1])))[1] if candidates else None
+
+
+def _title(
+    classified: dict[str, Any], fallback: str, records: list[dict[str, Any]] | None = None
+) -> str:
+    formal = _formal_title(records or [])
+    if formal:
+        return formal
     for key in ("图纸名称", "图名"):
         if classified["meta"].get(key):
             return classified["meta"][key]
@@ -1787,7 +1855,7 @@ def _title(classified: dict[str, Any], fallback: str) -> str:
     for item in classified["labels"] + classified["unassigned"]:
         text = _compact_cjk_spacing(item["text"])
         if (
-            re.search(r"(?:图|说明|目录|清单|表)$", text)
+            _TITLE_SUFFIX_RE.search(text)
             and text not in boilerplate
             and not re.search(r"[，。；：,;]", text)
             and 3 <= len(text) <= 48
@@ -2053,7 +2121,7 @@ def build_sheet_artifacts(
                 }
             )
         outside = [record for record in space["texts"] if record["uid"] not in assigned]
-        if outside:
+        if outside and not frames:
             candidates.append(
                 {
                     "kind": "model_unframed",
@@ -2122,7 +2190,7 @@ def build_sheet_artifacts(
             sheet_mode_classifier,
         )
         fallback = candidate.get("layout_name") or f"Sheet {ordinal:03d}"
-        title = _title(classified, fallback)
+        title = _title(classified, fallback, candidate["texts"])
         slug = VikingURI.sanitize_segment(title) or f"sheet-{ordinal:03d}"
         directory = f"sheets/{sheet_id}__{slug}"
         public_projection = {

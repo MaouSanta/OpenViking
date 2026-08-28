@@ -764,6 +764,10 @@ def detect_marker_groups(
             <= typical_height * 4
         )
     ]
+    # ponytail: checkbox grouping is quadratic; dense plan geometry is not a
+    # checkbox form. Raise these bounds only with a spatial-index implementation.
+    if len(frames) > 5_000 or len(segments) > 100_000:
+        return []
     nested: set[int] = set()
     for left_index, left in enumerate(frames):
         left_box = left["bbox"]

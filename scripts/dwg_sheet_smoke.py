@@ -14,6 +14,7 @@ from pathlib import Path
 
 from openviking.parse.parsers.dwg import _normalize_libredwg_json
 from openviking.parse.parsers.dwg_sheet import build_sheet_artifacts
+from openviking.parse.parsers.dwg_sheet_export import export_flat_sheet_dwgs
 
 
 def _sha256(path: Path) -> str:
@@ -68,6 +69,10 @@ def _write_artifacts(output: Path, artifacts: dict) -> list[str]:
             encoding="utf-8",
         )
         written.append(structure_path.relative_to(output).as_posix())
+        if sheet.get("dwg_path"):
+            dwg_path = output / sheet["dwg_path"]
+            dwg_path.write_bytes(sheet["dwg_bytes"])
+            written.append(dwg_path.relative_to(output).as_posix())
     return written
 
 
@@ -95,6 +100,24 @@ def main(argv: list[str] | None = None) -> int:
             source_sha256=_sha256(source),
             source_size_bytes=source.stat().st_size,
         )
+        sheet_dwgs, export_warnings = export_flat_sheet_dwgs(source, artifacts["sheets"])
+        warnings.extend(export_warnings)
+        document_sheets = {
+            sheet["sheet_id"]: sheet for sheet in artifacts["document"]["sheets"]
+        }
+        for sheet in artifacts["sheets"]:
+            exported = sheet_dwgs.get(sheet["sheet_id"])
+            if not exported:
+                continue
+            dwg_path = f"{sheet['directory']}/sheet.dwg"
+            sheet["dwg_path"] = dwg_path
+            sheet["dwg_bytes"] = exported["bytes"]
+            sheet["structure"]["sheet"]["dwg_path"] = "sheet.dwg"
+            sheet["structure"]["sheet"]["dwg_export"] = {
+                "mode": "flattened_bbox_intersection",
+                **{key: value for key, value in exported.items() if key != "bytes"},
+            }
+            document_sheets[sheet["sheet_id"]]["dwg_path"] = dwg_path
         written = _write_artifacts(output, artifacts)
     except (OSError, RuntimeError, ValueError) as exc:
         parser.exit(1, f"error: {exc}\n")

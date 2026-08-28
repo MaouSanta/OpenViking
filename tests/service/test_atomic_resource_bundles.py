@@ -341,6 +341,7 @@ async def test_dwg_bundle_publishes_document_and_nested_sheet_bundle(tmp_path, m
             "beam_topology.json": b'{"schema":"deterministic-dwg-topology-v2"}',
             "sheets/S001/content.md": "# 一层平面图\n\n生产辅助间".encode(),
             "sheets/S001/structure.json": b'{"schema":"openviking.dwg-sheet-structure/v1"}',
+            "sheets/S001/sheet.dwg": b"AC1027sheet",
             "preview.png": b"png",
         }
         for name, content in files.items():
@@ -358,6 +359,8 @@ async def test_dwg_bundle_publishes_document_and_nested_sheet_bundle(tmp_path, m
                         "title": "一层平面图",
                         "content_paths": ["sheets/S001/content.md"],
                         "structure_path": "sheets/S001/structure.json",
+                        "dwg_path": "sheets/S001/sheet.dwg",
+                        "kind": "model_frame",
                     }
                 ],
             },
@@ -384,6 +387,7 @@ async def test_dwg_bundle_publishes_document_and_nested_sheet_bundle(tmp_path, m
         f"{root}/beam_topology.json",
         f"{root}/sheets/S001/content.md",
         f"{root}/sheets/S001/structure.json",
+        f"{root}/sheets/S001/sheet.dwg",
         f"{root}/sheets/S001/manifest.json",
         f"{root}/manifest.json",
     }
@@ -408,6 +412,8 @@ async def test_dwg_bundle_publishes_document_and_nested_sheet_bundle(tmp_path, m
     }
     assert sheet_manifest["artifacts"]["content"]["searchable"] is True
     assert sheet_manifest["artifacts"]["structure"]["searchable"] is False
+    assert sheet_manifest["artifacts"]["flat_dwg"]["path"] == "sheet.dwg"
+    assert sheet_manifest["artifacts"]["flat_dwg"]["searchable"] is False
     assert not any(path.endswith("libredwg.json") for path in viking_fs.files)
     assert not any("preview" in path for path in viking_fs.files)
     service._summarize_bundle_staging.assert_awaited_once_with(

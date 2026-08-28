@@ -26,7 +26,9 @@ logger = get_logger(__name__)
 # These are canonical archives (e.g. session transcripts) whose content provides
 # no additional retrieval value and would only waste tokens and add latency.
 _SKIP_FILENAMES = frozenset({"messages.jsonl"})
-_BUNDLE_MACHINE_FILENAMES = frozenset({"document.json", "manifest.json", "structure.json"})
+_BUNDLE_MACHINE_FILENAMES = frozenset(
+    {"document.json", "manifest.json", "sheet.dwg", "structure.json"}
+)
 
 
 @dataclass

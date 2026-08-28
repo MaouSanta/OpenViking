@@ -35,6 +35,23 @@ def test_dwg_sheet_smoke_writes_only_inspection_artifacts(tmp_path, monkeypatch,
         return subprocess.CompletedProcess(command, 0, b"", b"")
 
     monkeypatch.setattr(dwg_sheet_smoke.subprocess, "run", fake_dwgread)
+    monkeypatch.setattr(
+        dwg_sheet_smoke,
+        "export_flat_sheet_dwgs",
+        lambda _source, sheets: (
+            {
+                sheet["sheet_id"]: {
+                    "bytes": b"AC1027sheet",
+                    "entity_count": 1,
+                    "entity_types": {"TEXT": 1},
+                    "audit_fixes": 0,
+                    "bbox": [0, 0, 1, 1],
+                }
+                for sheet in sheets
+            },
+            [],
+        ),
+    )
 
     assert dwg_sheet_smoke.main([str(source), str(output), "--json"]) == 0
     summary = json.loads(capsys.readouterr().out)
@@ -45,4 +62,5 @@ def test_dwg_sheet_smoke_writes_only_inspection_artifacts(tmp_path, monkeypatch,
     assert "document.json" in files
     assert any(path.endswith("/content.md") for path in files)
     assert any(path.endswith("/structure.json") for path in files)
-    assert not any(path.endswith(".dwg") or "preview" in path for path in files)
+    assert any(path.endswith("/sheet.dwg") for path in files)
+    assert not any("preview" in path for path in files)

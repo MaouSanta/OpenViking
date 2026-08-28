@@ -207,6 +207,7 @@ async def test_bundle_assembly_excludes_machine_manifests(monkeypatch):
             {"name": "structure.json", "isDir": False},
             {"name": "document.json", "isDir": False},
             {"name": "manifest.json", "isDir": False},
+            {"name": "sheet.dwg", "isDir": False},
         ]
     }
     fake_fs = _FakeVikingFS(tree)

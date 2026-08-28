@@ -945,8 +945,16 @@ class ResourceService:
             structure_path = self._bundle_relative_path(
                 raw_sheet.get("structure_path"), f"sheet {sheet_id} structure path"
             )
+            dwg_path = None
+            if raw_sheet.get("dwg_path") is not None:
+                dwg_path = self._bundle_relative_path(
+                    raw_sheet.get("dwg_path"), f"sheet {sheet_id} dwg path"
+                )
             prefix = f"{directory}/"
-            if any(not path.startswith(prefix) for path in [*content_paths, structure_path]):
+            artifact_paths = [*content_paths, structure_path]
+            if dwg_path:
+                artifact_paths.append(dwg_path)
+            if any(not path.startswith(prefix) for path in artifact_paths):
                 raise RuntimeError(f"DWG sheet {sheet_id} artifacts must stay inside {directory}")
             if len(set(content_paths)) != len(content_paths):
                 raise RuntimeError(f"DWG sheet {sheet_id} contains duplicate content paths")
@@ -958,6 +966,10 @@ class ResourceService:
                 raise RuntimeError(f"DWG sheet {sheet_id} content must be direct content*.md files")
             if structure_path.removeprefix(prefix) != "structure.json":
                 raise RuntimeError(f"DWG sheet {sheet_id} structure must be structure.json")
+            if dwg_path and dwg_path.removeprefix(prefix) != "sheet.dwg":
+                raise RuntimeError(f"DWG sheet {sheet_id} flat DWG must be sheet.dwg")
+            if raw_sheet.get("kind") == "model_frame" and not dwg_path:
+                raise RuntimeError(f"DWG sheet {sheet_id} has no flat DWG")
 
             sheet_uri = f"{staging_uri}/{directory}"
             for preview_name in ("preview.png", "preview.webp"):
@@ -993,6 +1005,18 @@ class ResourceService:
                 "sha256": hashlib.sha256(structure_content).hexdigest(),
                 "searchable": False,
             }
+            if dwg_path:
+                dwg_content = await self._viking_fs.read_file_bytes(
+                    f"{staging_uri}/{dwg_path}", ctx=ctx
+                )
+                if len(dwg_content) < 6 or not dwg_content.startswith(b"AC10"):
+                    raise RuntimeError(f"DWG sheet {sheet_id} has an invalid flat DWG")
+                sheet_artifacts["flat_dwg"] = {
+                    "path": "sheet.dwg",
+                    "schema": "dwg",
+                    "sha256": hashlib.sha256(dwg_content).hexdigest(),
+                    "searchable": False,
+                }
             for role, name, schema in (
                 ("abstract", ".abstract.md", "openviking.semantic/l0"),
                 ("overview", ".overview.md", "openviking.semantic/l1"),
@@ -1034,6 +1058,7 @@ class ResourceService:
                     "title": title,
                     "content_paths": content_paths,
                     "structure_path": structure_path,
+                    **({"dwg_path": dwg_path} if dwg_path else {}),
                 }
             )
             seen_ids.add(sheet_id)

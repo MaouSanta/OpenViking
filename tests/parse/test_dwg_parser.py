@@ -12,12 +12,14 @@ from openviking.parse.parsers.base_parser import BaseParser
 from openviking.parse.parsers.dwg import DWGParser, _normalize_libredwg_json
 from openviking.parse.parsers.dwg_sheet import (
     _document_flow,
+    _formal_title,
     _native_sheet_mode,
     _sheet_mode,
     _split_body,
     _table_markdown,
     build_sheet_artifacts,
 )
+from openviking.parse.parsers.dwg_sheet_export import export_flat_sheet_dwgs
 from openviking.parse.registry import ParserRegistry
 
 
@@ -108,9 +110,21 @@ async def test_dwg_parser_writes_sheet_bundles_without_preview(tmp_path: Path, m
     async def fake_export(_source_path):
         return drawing, json.dumps(drawing, ensure_ascii=False).encode("utf-8"), []
 
+    def fake_sheet_export(_source_path, sheets):
+        return {
+            sheet["sheet_id"]: {
+                "bytes": b"AC1027sheet",
+                "entity_count": 1,
+                "entity_types": {"LINE": 1},
+                "audit_fixes": 0,
+                "bbox": [0, 0, 1, 1],
+            }
+            for sheet in sheets
+        }, []
+
     monkeypatch.setattr(parser, "_export_dwg_json", fake_export)
     with patch.object(BaseParser, "_get_viking_fs", return_value=fake_fs):
-        result = await parser.parse(source)
+        result = await parser.parse(source, sheet_dwg_exporter=fake_sheet_export)
 
     assert result.precomputed_semantics is False
     assert any(uri.endswith("/building-plan.dwg") for uri in fake_fs.files)
@@ -132,11 +146,14 @@ async def test_dwg_parser_writes_sheet_bundles_without_preview(tmp_path: Path, m
     assert structure["schema"] == "openviking.dwg-sheet-structure/v1"
     assert structure["coverage"]["complete"] is True
     assert structure["coverage"]["no_per_label_coordinates"] is True
+    assert structure["sheet"]["dwg_path"] == "sheet.dwg"
     assert "point" not in json.dumps(structure)
     assert any(uri.endswith("/content.md") for uri in fake_fs.files)
+    assert any(uri.endswith("/sheet.dwg") for uri in fake_fs.files)
     assert not any("drawing_text" in uri or "preview" in uri for uri in fake_fs.files)
     assert result.meta["document_manifest"] == "document.json"
     assert result.meta["sheet_bundles"][0]["content_paths"]
+    assert result.meta["sheet_bundles"][0]["dwg_path"].endswith("/sheet.dwg")
     assert result.meta["source_sha256"]
     assert any("proxy objects" in warning for warning in result.warnings)
 
@@ -155,9 +172,52 @@ async def test_dwg_parser_ignores_an_embedded_preview(tmp_path: Path, monkeypatc
 
     monkeypatch.setattr(parser, "_export_dwg_json", fake_export)
     with patch.object(BaseParser, "_get_viking_fs", return_value=fake_fs):
-        await parser.parse(source)
+        await parser.parse(source, sheet_dwg_exporter=lambda *_args: ({}, []))
 
     assert not any(uri.endswith(("/preview.png", "/preview.webp")) for uri in fake_fs.files)
+
+
+def test_flat_sheet_dwg_export_keeps_whole_intersecting_entities(tmp_path, monkeypatch):
+    import ezdxf
+
+    source_doc = ezdxf.new("R2018")
+    source_doc.modelspace().add_line((-5, 5), (15, 5))
+    source_doc.modelspace().add_line((20, 20), (30, 30))
+    sheets = [
+        {
+            "sheet_id": "S001",
+            "kind": "model_frame",
+            "structure": {"sheet": {"bbox": [0, 0, 10, 10]}},
+        },
+        {
+            "sheet_id": "Model",
+            "kind": "model_unframed",
+            "structure": {"sheet": {"bbox": None}},
+        },
+    ]
+
+    monkeypatch.setattr(
+        "openviking.parse.parsers.dwg_sheet_export._configure_oda_file_converter", lambda: None
+    )
+    monkeypatch.setattr(
+        "openviking.parse.parsers.dwg_sheet_export.odafc.readfile",
+        lambda *_args, **_kwargs: source_doc,
+    )
+
+    def fake_export(_doc, filename, **_kwargs):
+        Path(filename).write_bytes(b"AC1027sheet")
+
+    monkeypatch.setattr(
+        "openviking.parse.parsers.dwg_sheet_export.odafc.export_dwg", fake_export
+    )
+
+    exports, warnings = export_flat_sheet_dwgs(tmp_path / "source.dwg", sheets)
+
+    assert set(exports) == {"S001"}
+    assert exports["S001"]["entity_count"] == 1
+    assert exports["S001"]["entity_types"] == {"LINE": 1}
+    assert exports["S001"]["bytes"] == b"AC1027sheet"
+    assert any("world-space CAD primitives" in warning for warning in warnings)
 
 
 def test_sheet_parser_accepts_flag512_model_frames_skips_empty_layout_and_bounds_markdown():
@@ -572,6 +632,100 @@ def test_named_title_block_does_not_suppress_the_outer_sheet_frame():
     frames = [sheet for sheet in result["sheets"] if sheet["kind"] == "model_frame"]
     assert len(frames) == 1
     assert frames[0]["source_locator"]["source_ref"]["handle"] == 30
+
+
+def test_repeated_top_level_frames_win_over_one_cross_sheet_container():
+    objects = [
+        {"object": "BLOCK_HEADER", "handle": [0, 0, 10], "name": "*Model_Space"},
+        {"object": "BLOCK_HEADER", "handle": [0, 0, 100], "name": "专业总容器"},
+        {
+            "entity": "LWPOLYLINE",
+            "handle": [0, 0, 101],
+            "ownerhandle": [0, 0, 100],
+            "flag": 512,
+            "points": [[-100, -2100], [2900, -2100], [2900, 100], [-100, 100]],
+        },
+        {
+            "entity": "INSERT",
+            "index": 40,
+            "handle": [0, 0, 40],
+            "entmode": 2,
+            "block_header": [0, 0, 100],
+            "ins_pt": [0, 0],
+            "scale": [1, 1, 1],
+        },
+    ]
+    for index, bottom in enumerate((0, -1000, -2000), 1):
+        handle = 20 + index
+        objects.extend(
+            [
+                {
+                    "entity": "LWPOLYLINE",
+                    "index": handle,
+                    "handle": [0, 0, handle],
+                    "entmode": 2,
+                    "flag": 512,
+                    "points": [
+                        [0, bottom],
+                        [200, bottom],
+                        [200, bottom + 60],
+                        [0, bottom + 60],
+                    ],
+                },
+                {
+                    "entity": "TEXT",
+                    "index": 50 + index,
+                    "handle": [0, 0, 50 + index],
+                    "entmode": 2,
+                    "ins_pt": [10, bottom + 30],
+                    "height": 5,
+                    "text_value": f"图纸名称：第{index}张图",
+                },
+            ]
+        )
+    objects.append(
+        {
+            "entity": "TEXT",
+            "index": 99,
+            "handle": [0, 0, 99],
+            "entmode": 2,
+            "ins_pt": [2500, 5000],
+            "height": 5,
+            "text_value": "模板残留文字",
+        }
+    )
+
+    result = build_sheet_artifacts(
+        {"OBJECTS": objects},
+        source_name="stacked.dwg",
+        source_sha256="1" * 64,
+        source_size_bytes=1,
+    )
+
+    frames = [sheet for sheet in result["sheets"] if sheet["kind"] == "model_frame"]
+    assert len(frames) == 3
+    assert {sheet["source_locator"]["source_ref"]["handle"] for sheet in frames} == {21, 22, 23}
+    assert result["document"]["sheet_count"] == 3
+
+
+def test_formal_title_prefers_and_joins_titleblock_attributes():
+    records = [
+        {
+            "text": "室内装修表、装修构造做法表、",
+            "point": (100, 20),
+            "height": 5,
+            "layer": "TK-JDB$0$0-TB-ATTRIB",
+        },
+        {
+            "text": "工业建筑节能设计专篇",
+            "point": (100, 10),
+            "height": 5,
+            "layer": "TK-JDB$0$0-TB-ATTRIB",
+        },
+        {"text": "电气入户井详图", "point": (50, 50), "height": 5, "layer": "DETAIL"},
+    ]
+
+    assert _formal_title(records) == "室内装修表、装修构造做法表、工业建筑节能设计专篇"
 
 
 def test_oversized_table_header_does_not_create_one_file_per_character():

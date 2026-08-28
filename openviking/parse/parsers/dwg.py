@@ -17,6 +17,7 @@ from openviking.parse.base import NodeType, ParseResult, ResourceNode
 from openviking.parse.parsers.base_parser import BaseParser
 from openviking.parse.parsers.dwg_extract import build_beam_topology
 from openviking.parse.parsers.dwg_sheet import build_sheet_artifacts
+from openviking.parse.parsers.dwg_sheet_export import export_flat_sheet_dwgs
 from openviking_cli.utils.config import get_openviking_config
 from openviking_cli.utils.llm import parse_json_from_response
 from openviking_cli.utils.uri import VikingURI
@@ -66,6 +67,29 @@ class DWGParser(BaseParser):
             max_section_chars=markdown_config.max_section_chars,
             sheet_mode_classifier=sheet_mode_classifier,
         )
+        sheet_dwg_exporter = kwargs.get("sheet_dwg_exporter") or export_flat_sheet_dwgs
+        sheet_dwgs, sheet_dwg_warnings = await asyncio.to_thread(
+            sheet_dwg_exporter, source_path, sheet_artifacts["sheets"]
+        )
+        warnings.extend(sheet_dwg_warnings)
+        document_sheets = {
+            sheet["sheet_id"]: sheet for sheet in sheet_artifacts["document"]["sheets"]
+        }
+        for sheet in sheet_artifacts["sheets"]:
+            exported = sheet_dwgs.get(sheet["sheet_id"])
+            if not exported:
+                continue
+            dwg_path = f"{sheet['directory']}/sheet.dwg"
+            export_meta = {key: value for key, value in exported.items() if key != "bytes"}
+            sheet["dwg_path"] = dwg_path
+            sheet["dwg_bytes"] = exported["bytes"]
+            sheet["structure"]["sheet"]["dwg_path"] = "sheet.dwg"
+            sheet["structure"]["sheet"]["dwg_export"] = {
+                "mode": "flattened_bbox_intersection",
+                **export_meta,
+            }
+            document_sheets[sheet["sheet_id"]]["dwg_path"] = dwg_path
+            document_sheets[sheet["sheet_id"]]["dwg_export"] = export_meta
         topology_bytes = json.dumps(topology, ensure_ascii=False, separators=(",", ":")).encode(
             "utf-8"
         )
@@ -92,6 +116,10 @@ class DWGParser(BaseParser):
                     f"{root_uri}/{sheet['structure_path']}",
                     json.dumps(sheet["structure"], ensure_ascii=False, indent=2).encode("utf-8"),
                 )
+                if sheet.get("dwg_path"):
+                    await viking_fs.write_file_bytes(
+                        f"{root_uri}/{sheet['dwg_path']}", sheet["dwg_bytes"]
+                    )
         except BaseException:
             try:
                 await viking_fs.delete_temp(temp_uri)
@@ -121,7 +149,10 @@ class DWGParser(BaseParser):
                             "title",
                             "content_paths",
                             "structure_path",
+                            "dwg_path",
+                            "kind",
                         )
+                        if key in sheet
                     }
                     for sheet in sheet_artifacts["sheets"]
                 ],
@@ -138,7 +169,7 @@ class DWGParser(BaseParser):
             temp_dir_path=temp_uri,
             source_format="dwg",
             parser_name="DWGParser",
-            parser_version="3.0",
+            parser_version="3.1",
             parse_time=time.perf_counter() - started_at,
             parse_timestamp=datetime.now(timezone.utc),
             meta=root_node.meta,
