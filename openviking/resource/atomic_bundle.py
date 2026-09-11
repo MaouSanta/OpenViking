@@ -233,6 +233,129 @@ async def read_resource_bundle_manifest(
     return payload if is_resource_bundle_manifest(payload) else None
 
 
+async def is_dwg_parser_data(
+    viking_fs: "VikingFS",
+    uri: str,
+    *,
+    ctx: Optional["RequestContext"],
+    is_directory: bool = False,
+) -> bool:
+    """Identify read-only DWG JSON, including directories containing only it.
+
+    Classification uses explicit schemas, never a filename such as ``chunks``.
+    Hidden semantic sidecars do not turn a JSON-only directory into model input.
+    Ordinary JSON and mixed directories retain their normal processing behavior.
+    """
+    if is_directory:
+        from openviking.storage.viking_fs import LS_ALL_NODES
+
+        try:
+            entries = await viking_fs.ls(uri, node_limit=LS_ALL_NODES, ctx=ctx)
+        except Exception:
+            return False
+        found = False
+        for entry in entries:
+            name = entry.get("name", "")
+            if not name or name.startswith("."):
+                continue
+            child = entry.get("uri") or VikingURI(uri).join(name).uri
+            if not await is_dwg_parser_data(
+                viking_fs,
+                child,
+                ctx=ctx,
+                is_directory=bool(entry.get("isDir") or entry.get("type") == "directory"),
+            ):
+                return False
+            found = True
+        return found
+    if not uri.lower().endswith(".json"):
+        return False
+    try:
+        raw = await viking_fs.read_file(uri, ctx=ctx)
+    except Exception:
+        return False
+    try:
+        payload = json.loads(raw)
+    except (ValueError, TypeError):
+        # A truncated parser artifact must not become ordinary model input.
+        # Only its explicit first-field schema declaration qualifies; arbitrary
+        # malformed business JSON or quoted examples do not.
+        text = raw.decode("utf-8", errors="replace") if isinstance(raw, bytes) else raw
+        return (
+            isinstance(text, str)
+            and re.match(
+                r'^\s*\ufeff?\s*\{\s*"schema"\s*:\s*"openviking\.dwg-json(?:-chunk)?/v1"\s*(?:[,}]|$)',
+                text,
+            )
+            is not None
+        )
+    return isinstance(payload, dict) and (
+        payload.get("schema") in {"openviking.dwg-json/v1", "openviking.dwg-json-chunk/v1"}
+        or (is_resource_bundle_manifest(payload) and payload.get("kind") in {"dwg", "dwg-sheet"})
+    )
+
+
+async def unindexed_dwg_uris(
+    viking_fs: "VikingFS",
+    root_uri: str,
+    entries: list[dict[str, Any]],
+    *,
+    ctx: "RequestContext",
+) -> set[str]:
+    """Exclude DWG evidence and directory metadata using the existing manifests.
+
+    Ordinary resources retain their normal indexing behavior. Ancestor manifests
+    also cover exports of a Sheet or one of its view directories.
+    """
+    entry_uris = {
+        entry.get("uri") or VikingURI(root_uri).join(str(entry.get("rel_path") or "")).uri
+        for entry in entries
+    }
+    candidates = {
+        uri.rsplit("/", 1)[0] for uri in entry_uris if uri.endswith(f"/{RESOURCE_BUNDLE_MANIFEST}")
+    }
+    current = VikingURI(root_uri)
+    while current is not None and current.scope == "resources":
+        candidates.add(current.uri)
+        current = current.parent
+
+    searchable: dict[str, set[str]] = {}
+    for directory in sorted(candidates):
+        manifest = await read_resource_bundle_manifest(viking_fs, directory, ctx=ctx)
+        if not manifest:
+            continue
+        if manifest["schema"] == RESOURCE_BUNDLE_SCHEMA_V3:
+            searchable[directory] = {
+                VikingURI(directory).join(artifact["path"]).uri
+                for artifact in manifest["artifacts"].values()
+                if artifact["searchable"]
+            }
+        elif manifest["schema"] == RESOURCE_BUNDLE_SCHEMA and manifest["kind"] == "dwg":
+            searchable[directory] = set()
+
+    excluded = set()
+    for uri in entry_uris | {root_uri}:
+        ancestor = uri
+        while ancestor.startswith("viking://"):
+            if ancestor in searchable:
+                if uri not in searchable[ancestor]:
+                    excluded.add(uri)
+                break
+            ancestor = ancestor.rsplit("/", 1)[0]
+    # Directory imports need no bundle marker: parser schemas survive merging
+    # and still define which files/derived directory summaries are not indexed.
+    for entry in [*entries, {"uri": root_uri, "isDir": True}]:
+        uri = entry.get("uri") or VikingURI(root_uri).join(str(entry.get("rel_path") or "")).uri
+        if uri not in excluded and await is_dwg_parser_data(
+            viking_fs,
+            uri,
+            ctx=ctx,
+            is_directory=bool(entry.get("isDir") or entry.get("type") == "directory"),
+        ):
+            excluded.add(uri)
+    return excluded
+
+
 async def find_resource_bundle_root(
     viking_fs: "VikingFS",
     uri: str,

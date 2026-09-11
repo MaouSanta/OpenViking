@@ -1,6 +1,6 @@
 # Copyright (c) 2026 Beijing Volcano Engine Technology Co., Ltd.
 # SPDX-License-Identifier: AGPL-3.0
-"""DWG parsing: preserve the source and derive compact searchable artifacts."""
+"""DWG parsing: preserve the source and derive one bundle per Sheet."""
 
 from __future__ import annotations
 
@@ -15,16 +15,17 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 
 from openviking.parse.base import NodeType, ParseResult, ResourceNode
 from openviking.parse.parsers.base_parser import BaseParser
-from openviking.parse.parsers.dwg_extract import build_beam_topology
+from openviking.parse.parsers.dwg_json import build_json_artifacts
+from openviking.parse.parsers.dwg_render import sheet_renderer
 from openviking.parse.parsers.dwg_sheet import build_sheet_artifacts
-from openviking.parse.parsers.dwg_sheet_export import export_flat_sheet_dwgs
+from openviking_cli.utils.async_utils import run_async
 from openviking_cli.utils.config import get_openviking_config
 from openviking_cli.utils.llm import parse_json_from_response
 from openviking_cli.utils.uri import VikingURI
 
 
 class DWGParser(BaseParser):
-    """Keep the DWG and derive deterministic topology and text artifacts."""
+    """Keep the source, move prose to Markdown, and store native JSON by scope."""
 
     @property
     def supported_extensions(self) -> List[str]:
@@ -49,53 +50,19 @@ class DWGParser(BaseParser):
         original_filename = Path(requested_name).name if requested_name else source_path.name
         source_filename = VikingURI.sanitize_segment(original_filename) or "drawing.dwg"
         root_name = VikingURI.sanitize_segment(f"{Path(source_filename).stem}_dwg") or "drawing_dwg"
-        topology = build_beam_topology(
-            drawing,
-            source_name=source_filename,
-            source_sha256=source_sha256,
-            source_size_bytes=len(source_bytes),
-        )
-        markdown_config = get_openviking_config().markdown
-        sheet_mode_classifier = kwargs.get("sheet_mode_classifier") or _sheet_mode_classifier()
         sheet_artifacts = await asyncio.to_thread(
-            build_sheet_artifacts,
+            build_dwg_artifacts,
             drawing,
+            source_path=source_path,
             source_name=source_filename,
             source_sha256=source_sha256,
             source_size_bytes=len(source_bytes),
-            max_section_tokens=markdown_config.max_section_size,
-            max_section_chars=markdown_config.max_section_chars,
-            sheet_mode_classifier=sheet_mode_classifier,
+            **{
+                key: kwargs[key] for key in ("region_classifier", "sheet_renderer") if key in kwargs
+            },
         )
-        sheet_dwg_exporter = kwargs.get("sheet_dwg_exporter") or export_flat_sheet_dwgs
-        sheet_dwgs, sheet_dwg_warnings = await asyncio.to_thread(
-            sheet_dwg_exporter, source_path, sheet_artifacts["sheets"]
-        )
-        warnings.extend(sheet_dwg_warnings)
-        document_sheets = {
-            sheet["sheet_id"]: sheet for sheet in sheet_artifacts["document"]["sheets"]
-        }
-        for sheet in sheet_artifacts["sheets"]:
-            exported = sheet_dwgs.get(sheet["sheet_id"])
-            if not exported:
-                continue
-            dwg_path = f"{sheet['directory']}/sheet.dwg"
-            export_meta = {key: value for key, value in exported.items() if key != "bytes"}
-            sheet["dwg_path"] = dwg_path
-            sheet["dwg_bytes"] = exported["bytes"]
-            sheet["structure"]["sheet"]["dwg_path"] = "sheet.dwg"
-            sheet["structure"]["sheet"]["dwg_export"] = {
-                "mode": "flattened_bbox_intersection",
-                **export_meta,
-            }
-            document_sheets[sheet["sheet_id"]]["dwg_path"] = dwg_path
-            document_sheets[sheet["sheet_id"]]["dwg_export"] = export_meta
-        topology_bytes = json.dumps(topology, ensure_ascii=False, separators=(",", ":")).encode(
-            "utf-8"
-        )
-        document_bytes = json.dumps(
-            sheet_artifacts["document"], ensure_ascii=False, indent=2
-        ).encode("utf-8")
+        if sheet_artifacts["parse_status"] == "partial":
+            warnings.append("DWG partition is partial; unresolved native data is preserved in JSON")
 
         viking_fs = self._get_viking_fs()
         temp_uri = viking_fs.create_temp_uri()
@@ -104,22 +71,14 @@ class DWGParser(BaseParser):
             await viking_fs.mkdir(root_uri, exist_ok=True)
             await viking_fs.mkdir(f"{root_uri}/sheets", exist_ok=True)
             await viking_fs.write_file_bytes(f"{root_uri}/{source_filename}", source_bytes)
-            await viking_fs.write_file_bytes(f"{root_uri}/beam_topology.json", topology_bytes)
-            await viking_fs.write_file_bytes(f"{root_uri}/document.json", document_bytes)
             for sheet in sheet_artifacts["sheets"]:
                 await viking_fs.mkdir(f"{root_uri}/{sheet['directory']}", exist_ok=True)
                 for filename, content in sheet["content_files"]:
                     await viking_fs.write_file_bytes(
                         f"{root_uri}/{sheet['directory']}/{filename}", content.encode("utf-8")
                     )
-                await viking_fs.write_file_bytes(
-                    f"{root_uri}/{sheet['structure_path']}",
-                    json.dumps(sheet["structure"], ensure_ascii=False, indent=2).encode("utf-8"),
-                )
-                if sheet.get("dwg_path"):
-                    await viking_fs.write_file_bytes(
-                        f"{root_uri}/{sheet['dwg_path']}", sheet["dwg_bytes"]
-                    )
+            for path, content in sheet_artifacts["json_files"].items():
+                await viking_fs.write_file_bytes(f"{root_uri}/{path}", content.encode("utf-8"))
         except BaseException:
             try:
                 await viking_fs.delete_temp(temp_uri)
@@ -138,8 +97,7 @@ class DWGParser(BaseParser):
                 "source_sha256": source_sha256,
                 "source_size_bytes": len(source_bytes),
                 "source_modified_at": source_mtime,
-                "beam_topology": "beam_topology.json",
-                "document_manifest": "document.json",
+                "document_id": sheet_artifacts["document"]["document_id"],
                 "sheet_bundles": [
                     {
                         key: sheet[key]
@@ -148,16 +106,17 @@ class DWGParser(BaseParser):
                             "directory",
                             "title",
                             "content_paths",
-                            "structure_path",
-                            "dwg_path",
+                            "json_artifacts",
+                            "status",
                             "kind",
                         )
                         if key in sheet
                     }
                     for sheet in sheet_artifacts["sheets"]
                 ],
-                "beam_label_count": topology["stats"]["beam_labels"],
                 "sheet_count": len(sheet_artifacts["sheets"]),
+                "json_artifacts": sheet_artifacts["json_artifacts"],
+                "parse_status": sheet_artifacts["parse_status"],
                 "summary_info": _nonempty_mapping(summary_info),
                 "temp_root_uri": root_uri,
                 "warnings": warnings,
@@ -169,7 +128,7 @@ class DWGParser(BaseParser):
             temp_dir_path=temp_uri,
             source_format="dwg",
             parser_name="DWGParser",
-            parser_version="3.1",
+            parser_version="10.0",
             parse_time=time.perf_counter() - started_at,
             parse_timestamp=datetime.now(timezone.utc),
             meta=root_node.meta,
@@ -221,20 +180,97 @@ def _read_source_snapshot(path: Path) -> Tuple[bytes, str, str]:
     return payload, hashlib.sha256(payload).hexdigest(), modified_at
 
 
-def _sheet_mode_classifier():
-    """Use one transient layout image to distinguish document sheets from drawings."""
+def build_dwg_artifacts(
+    drawing: dict[str, Any],
+    *,
+    source_path: Path,
+    source_name: str,
+    source_sha256: str,
+    source_size_bytes: int,
+    **overrides: Any,
+) -> dict[str, Any]:
+    """Shared synchronous production/smoke pipeline; overrides are test injection hooks."""
+    config = get_openviking_config()
+    classifier = (
+        overrides.get("region_classifier")
+        if "region_classifier" in overrides
+        else _region_classifier()
+    )
+    renderer = (
+        overrides.get("sheet_renderer")
+        if "sheet_renderer" in overrides
+        else sheet_renderer(source_path)
+    )
+    artifacts = build_sheet_artifacts(
+        drawing,
+        source_name=source_name,
+        source_sha256=source_sha256,
+        source_size_bytes=source_size_bytes,
+        max_section_tokens=config.markdown.max_section_size,
+        max_section_chars=config.markdown.max_section_chars,
+        region_classifier=classifier,
+        sheet_renderer=renderer,
+        max_concurrent_regions=config.vlm.max_concurrent,
+    )
+    preserved = build_json_artifacts(drawing, artifacts["sheets"])
+    artifacts.update(
+        json_files=preserved["files"],
+        json_artifacts=preserved["json_artifacts"],
+        parse_status=preserved["parse_status"],
+    )
+    return artifacts
+
+
+def _region_classifier():
     vlm = get_openviking_config().vlm
     if not vlm.is_available():
         return None
 
     def classify(image: bytes, evidence: Dict[str, Any]) -> Any:
-        prompt = f"""Classify this complete DWG sheet by layout only.
-Return JSON: {{"mode":"document|drawing","confidence":0.0,"reason":"short reason"}}.
-document means the sheet is primarily a multi-column manual/specification whose numbered text and inline tables must be restored in reading order. drawing means a plan/detail whose text is spatial annotation. Do not transcribe or summarize text.
-Native evidence: {json.dumps(evidence, ensure_ascii=False)}"""
-        return parse_json_from_response(
-            vlm.get_vision_completion(prompt=prompt, images=[image], thinking=False)
+        prompt = """Locate only explanatory prose/specification areas and independent tables in this CAD Sheet image.
+Return JSON: {"regions":[{"type":"document","bbox":[x0,y0,x1,y1]}]}.
+Types: document (prose/specifications), table (independent table), unknown (an uncertain prose/table area).
+Exclude drawing labels, dimensions, title blocks and tables embedded within a drawing. Do not split or name drawing views.
+Return {"regions":[]} for a valid drawing Sheet with no explanatory prose or independent tables. This is a normal result.
+Use normalized IMAGE coordinates from 0 to 1000 on each axis: top-left=(0,0), bottom-right=(1000,1000), x right, y down.
+Include every line of the selected prose and each complete independent table. Regions must not overlap.
+Do not use CAD world coordinates or perform coordinate conversion. Regions must have positive area and stay inside the image.
+Do not transcribe, summarize, change CAD objects, or invent relationships.
+This is a whole Sheet candidate. Return {"is_sheet":false} only when it is clearly not a Sheet, such as a standalone room-area rectangle, isolated component, empty layout guide, or small indexing symbol.
+Keep complete drawing-index, notes, table and graphical Sheets. Missing a title, titleblock or prose area alone is not grounds for rejection. If uncertain, keep the candidate."""
+        response = parse_json_from_response(
+            run_async(
+                vlm.get_vision_completion_async(prompt=prompt, images=[image], thinking=False)
+            )
         )
+        if isinstance(response, dict) and response.get("is_sheet") is False:
+            return {"is_sheet": False}
+        if not isinstance(response, dict) or not isinstance(response.get("regions"), list):
+            raise ValueError("Missing prose regions")
+        x0, y0, x1, y1 = evidence["bbox"]
+        converted = []
+        for region in response["regions"]:
+            if not isinstance(region, dict) or region.get("type") not in {
+                "document",
+                "table",
+                "unknown",
+            }:
+                raise ValueError("Invalid prose region type")
+            left, top, right, bottom = map(float, region["bbox"])
+            if not (0 <= left < right <= 1000 and 0 <= top < bottom <= 1000):
+                raise ValueError("Invalid normalized VLM region bounds")
+            converted.append(
+                {
+                    **region,
+                    "bbox": [
+                        x0 + left / 1000 * (x1 - x0),
+                        y1 - bottom / 1000 * (y1 - y0),
+                        x0 + right / 1000 * (x1 - x0),
+                        y1 - top / 1000 * (y1 - y0),
+                    ],
+                }
+            )
+        return {"regions": converted}
 
     return classify
 
@@ -245,16 +281,25 @@ def _normalize_libredwg_json(
     """Normalize and validate LibreDWG's transient, occasionally non-strict JSON.
 
     LibreDWG can put raw proxy bytes in JSON strings and emits lowercase ``nan``.
-    The normalized object feeds the deterministic topology and text extractors but
-    is not persisted in the resource bundle.
+    The normalized object is the complete data source for Markdown projection
+    and scope JSON preservation; no monolithic export is persisted.
     """
     text = raw.decode("utf-8-sig", errors="surrogateescape")
     invalid_byte_count = sum(0xDC80 <= ord(char) <= 0xDCFF for char in text)
     text, nonfinite_count = _replace_nonfinite_json_tokens(text)
+    used_non_strict_json = False
     try:
         drawing = json.loads(text)
     except json.JSONDecodeError as exc:
-        raise RuntimeError(f"LibreDWG produced invalid JSON for {source_name}: {exc}") from exc
+        if exc.msg != "Invalid control character at":
+            raise RuntimeError(f"LibreDWG produced invalid JSON for {source_name}: {exc}") from exc
+        try:
+            drawing = json.loads(text, strict=False)
+        except json.JSONDecodeError as fallback_exc:
+            raise RuntimeError(
+                f"LibreDWG produced invalid JSON for {source_name}: {fallback_exc}"
+            ) from fallback_exc
+        used_non_strict_json = True
     if not isinstance(drawing, dict):
         raise RuntimeError(f"LibreDWG JSON root is not an object for {source_name}")
 
@@ -275,6 +320,8 @@ def _normalize_libredwg_json(
         warnings.append(
             f"{nonfinite_count} non-finite LibreDWG numeric tokens were normalized to null"
         )
+    if used_non_strict_json:
+        warnings.append("LibreDWG control characters were accepted using non-strict JSON parsing")
     return normalized, normalized_json, warnings
 
 

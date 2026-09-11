@@ -34,13 +34,13 @@ class FakeVikingFS:
     async def stat(self, uri: str, ctx=None):
         return {"uri": uri, "isDir": True}
 
-    async def mkdir(self, uri: str, exist_ok: bool = False, ctx=None):
+    async def mkdir(self, uri: str, exist_ok: bool = False, ctx=None, **kwargs):
         self.created_dirs.append(uri)
 
     async def ls(self, uri: str, ctx=None):
         raise NotFoundError(uri, "file")
 
-    async def write_file_bytes(self, uri: str, data: bytes, ctx=None):
+    async def write_file_bytes(self, uri: str, data: bytes, ctx=None, **kwargs):
         self.written_files.append(uri)
 
     async def tree(self, uri: str, node_limit=None, level_limit=None, ctx=None):

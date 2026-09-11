@@ -131,6 +131,7 @@ class Summarizer:
                     ingest_options=ingest_options,
                     precomputed_semantics=bool(kwargs.get("precomputed_semantics", False)),
                     bundle_assembly=bool(kwargs.get("bundle_assembly", False)),
+                    summary_files=kwargs.get("summary_files"),
                 )
                 if msg.telemetry_id:
                     get_request_wait_tracker().register_semantic_root(msg.telemetry_id, msg.id)

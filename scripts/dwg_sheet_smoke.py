@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # Copyright (c) 2026 Beijing Volcano Engine Technology Co., Ltd.
 # SPDX-License-Identifier: AGPL-3.0
-"""Write deterministic DWG Sheet artifacts to a local inspection directory."""
+"""Inspect the production DWG Markdown/JSON pipeline in a fresh local directory."""
 
 from __future__ import annotations
 
@@ -12,9 +12,7 @@ import subprocess
 import tempfile
 from pathlib import Path
 
-from openviking.parse.parsers.dwg import _normalize_libredwg_json
-from openviking.parse.parsers.dwg_sheet import build_sheet_artifacts
-from openviking.parse.parsers.dwg_sheet_export import export_flat_sheet_dwgs
+from openviking.parse.parsers.dwg import _normalize_libredwg_json, build_dwg_artifacts
 
 
 def _sha256(path: Path) -> str:
@@ -51,11 +49,7 @@ def _write_artifacts(output: Path, artifacts: dict) -> list[str]:
     if output.exists() and (not output.is_dir() or any(output.iterdir())):
         raise RuntimeError(f"output directory must be empty: {output}")
     output.mkdir(parents=True, exist_ok=True)
-    written = ["document.json"]
-    (output / "document.json").write_text(
-        json.dumps(artifacts["document"], ensure_ascii=False, indent=2) + "\n",
-        encoding="utf-8",
-    )
+    written = []
     for sheet in artifacts["sheets"]:
         sheet_dir = output / sheet["directory"]
         sheet_dir.mkdir(parents=True, exist_ok=True)
@@ -63,16 +57,11 @@ def _write_artifacts(output: Path, artifacts: dict) -> list[str]:
             path = sheet_dir / filename
             path.write_text(content, encoding="utf-8")
             written.append(path.relative_to(output).as_posix())
-        structure_path = output / sheet["structure_path"]
-        structure_path.write_text(
-            json.dumps(sheet["structure"], ensure_ascii=False, indent=2) + "\n",
-            encoding="utf-8",
-        )
-        written.append(structure_path.relative_to(output).as_posix())
-        if sheet.get("dwg_path"):
-            dwg_path = output / sheet["dwg_path"]
-            dwg_path.write_bytes(sheet["dwg_bytes"])
-            written.append(dwg_path.relative_to(output).as_posix())
+    for relative, content in artifacts["json_files"].items():
+        path = output / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding="utf-8")
+        written.append(relative)
     return written
 
 
@@ -94,31 +83,16 @@ def main(argv: list[str] | None = None) -> int:
             raise RuntimeError("output must not contain the source DWG")
 
         drawing, warnings = _read_dwg(source)
-        artifacts = build_sheet_artifacts(
+        artifacts = build_dwg_artifacts(
             drawing,
+            source_path=source,
             source_name=source.name,
             source_sha256=_sha256(source),
             source_size_bytes=source.stat().st_size,
         )
-        sheet_dwgs, export_warnings = export_flat_sheet_dwgs(source, artifacts["sheets"])
-        warnings.extend(export_warnings)
-        document_sheets = {
-            sheet["sheet_id"]: sheet for sheet in artifacts["document"]["sheets"]
-        }
-        for sheet in artifacts["sheets"]:
-            exported = sheet_dwgs.get(sheet["sheet_id"])
-            if not exported:
-                continue
-            dwg_path = f"{sheet['directory']}/sheet.dwg"
-            sheet["dwg_path"] = dwg_path
-            sheet["dwg_bytes"] = exported["bytes"]
-            sheet["structure"]["sheet"]["dwg_path"] = "sheet.dwg"
-            sheet["structure"]["sheet"]["dwg_export"] = {
-                "mode": "flattened_bbox_intersection",
-                **{key: value for key, value in exported.items() if key != "bytes"},
-            }
-            document_sheets[sheet["sheet_id"]]["dwg_path"] = dwg_path
         written = _write_artifacts(output, artifacts)
+        (output / source.name).write_bytes(source.read_bytes())
+        written.append(source.name)
     except (OSError, RuntimeError, ValueError) as exc:
         parser.exit(1, f"error: {exc}\n")
 
@@ -128,6 +102,7 @@ def main(argv: list[str] | None = None) -> int:
         "output": str(output),
         "written": written,
         "warnings": warnings,
+        "parse_status": artifacts["parse_status"],
     }
     if args.json:
         print(json.dumps(summary, ensure_ascii=False, indent=2))

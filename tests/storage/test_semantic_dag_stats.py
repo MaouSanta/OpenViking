@@ -416,6 +416,138 @@ async def test_semantic_dag_shares_node_scheduler_across_roots(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_semantic_scheduler_fills_spare_capacity_while_worker_is_busy():
+    scheduler = SemanticNodeScheduler(max_workers=4)
+    first_started, second_started, release = asyncio.Event(), asyncio.Event(), asyncio.Event()
+
+    async def first():
+        first_started.set()
+        await release.wait()
+
+    async def second():
+        second_started.set()
+        await release.wait()
+
+    try:
+        scheduler.submit(_ScheduledExecutor(first), DagWork(kind="file", dir_uri="a"))
+        await asyncio.wait_for(first_started.wait(), timeout=0.5)
+        scheduler.submit(_ScheduledExecutor(second), DagWork(kind="file", dir_uri="b"))
+        await asyncio.wait_for(second_started.wait(), timeout=0.5)
+        assert not release.is_set()
+        assert len(scheduler._workers) == 2
+    finally:
+        release.set()
+        await asyncio.wait_for(scheduler._queue.join(), timeout=0.5)
+        await asyncio.gather(*scheduler._workers)
+
+
+@pytest.mark.asyncio
+async def test_semantic_scheduler_caps_workers_and_continues_after_failure():
+    scheduler = SemanticNodeScheduler(max_workers=4)
+    started = [asyncio.Event() for _ in range(6)]
+    release = [asyncio.Event() for _ in range(6)]
+    order = []
+    active = peak = 0
+
+    async def run(index):
+        nonlocal active, peak
+        active += 1
+        peak = max(peak, active)
+        order.append(index)
+        started[index].set()
+        try:
+            await release[index].wait()
+            if index == 0:
+                raise ValueError("expected failure")
+        finally:
+            active -= 1
+
+    executors = [_ScheduledExecutor(lambda i=i: run(i)) for i in range(6)]
+    try:
+        for i, executor in enumerate(executors):
+            scheduler.submit(executor, DagWork(kind="file", dir_uri=str(i)))
+        await asyncio.wait_for(asyncio.gather(*(event.wait() for event in started[:4])), 0.5)
+        assert len(scheduler._workers) == 4
+        assert not started[4].is_set() and not started[5].is_set()
+        release[0].set()
+        await asyncio.wait_for(started[4].wait(), 0.5)
+        assert isinstance(executors[0].failure, ValueError)
+        assert not started[5].is_set()
+        release[4].set()
+        await asyncio.wait_for(started[5].wait(), 0.5)
+        assert peak == 4
+        assert order == list(range(6))
+        assert len(scheduler._workers) == 4
+    finally:
+        for event in release:
+            event.set()
+        await asyncio.wait_for(scheduler._queue.join(), 0.5)
+        await asyncio.gather(*scheduler._workers)
+    assert scheduler._busy_workers == 0
+
+
+@pytest.mark.asyncio
+async def test_semantic_scheduler_reuses_idle_workers_then_restarts_after_empty_queue():
+    scheduler = SemanticNodeScheduler(max_workers=4)
+    scheduler.configure(4)
+    assert not scheduler._workers
+    ran = asyncio.Event()
+
+    async def run():
+        ran.set()
+
+    scheduler.submit(_ScheduledExecutor(run), DagWork(kind="file", dir_uri="first"))
+    await asyncio.wait_for(scheduler._queue.join(), 0.5)
+    assert ran.is_set()
+    workers = set(scheduler._workers)
+    assert len(workers) == 1
+    assert scheduler._busy_workers == 0
+    ran.clear()
+    scheduler.submit(_ScheduledExecutor(run), DagWork(kind="file", dir_uri="second"))
+    assert scheduler._workers == workers
+    await asyncio.wait_for(scheduler._queue.join(), 0.5)
+    assert ran.is_set()
+    await asyncio.wait_for(asyncio.gather(*workers), 0.5)
+    scheduler.configure(4)
+    assert not scheduler._workers
+    ran.clear()
+    scheduler.submit(_ScheduledExecutor(run), DagWork(kind="file", dir_uri="third"))
+    assert not scheduler._workers.intersection(workers)
+    await asyncio.wait_for(scheduler._queue.join(), 0.5)
+    assert ran.is_set()
+    await asyncio.gather(*scheduler._workers)
+    assert scheduler._busy_workers == 0
+
+
+@pytest.mark.asyncio
+async def test_semantic_scheduler_cancelled_worker_does_not_leave_an_active_slot():
+    scheduler = SemanticNodeScheduler(max_workers=1)
+    started = asyncio.Event()
+
+    async def blocked():
+        started.set()
+        await asyncio.Event().wait()
+
+    scheduler.submit(_ScheduledExecutor(blocked), DagWork(kind="file", dir_uri="cancelled"))
+    await asyncio.wait_for(started.wait(), 0.5)
+    worker = next(iter(scheduler._workers))
+    worker.cancel()
+    await asyncio.gather(worker, return_exceptions=True)
+    await asyncio.wait_for(scheduler._queue.join(), 0.5)
+    assert scheduler._busy_workers == 0
+    finished = asyncio.Event()
+
+    async def finish():
+        finished.set()
+
+    scheduler.submit(_ScheduledExecutor(finish), DagWork(kind="file", dir_uri="next"))
+    await asyncio.wait_for(finished.wait(), 0.5)
+    await asyncio.wait_for(scheduler._queue.join(), 0.5)
+    await asyncio.gather(*scheduler._workers)
+    assert scheduler._busy_workers == 0
+
+
+@pytest.mark.asyncio
 async def test_task_work_rejection_does_not_stop_shared_semantic_worker():
     work_index = TaskWorkIndex()
 

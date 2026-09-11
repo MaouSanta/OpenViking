@@ -3,6 +3,7 @@
 """Focused checks for the deterministic DWG parser contract."""
 
 import json
+import re
 from pathlib import Path
 from unittest.mock import patch
 
@@ -11,15 +12,13 @@ import pytest
 from openviking.parse.parsers.base_parser import BaseParser
 from openviking.parse.parsers.dwg import DWGParser, _normalize_libredwg_json
 from openviking.parse.parsers.dwg_sheet import (
+    _document_column_anchors,
     _document_flow,
-    _formal_title,
-    _native_sheet_mode,
-    _sheet_mode,
+    _select_frames,
     _split_body,
     _table_markdown,
     build_sheet_artifacts,
 )
-from openviking.parse.parsers.dwg_sheet_export import export_flat_sheet_dwgs
 from openviking.parse.registry import ParserRegistry
 
 
@@ -100,7 +99,7 @@ def _drawing_json():
 
 
 @pytest.mark.asyncio
-async def test_dwg_parser_writes_sheet_bundles_without_preview(tmp_path: Path, monkeypatch):
+async def test_dwg_parser_preserves_json_and_never_exports_sheet_dwg(tmp_path: Path, monkeypatch):
     source = tmp_path / "building-plan.dwg"
     source.write_bytes(b"fake-dwg")
     fake_fs = _FakeVikingFS()
@@ -111,49 +110,39 @@ async def test_dwg_parser_writes_sheet_bundles_without_preview(tmp_path: Path, m
         return drawing, json.dumps(drawing, ensure_ascii=False).encode("utf-8"), []
 
     def fake_sheet_export(_source_path, sheets):
-        return {
-            sheet["sheet_id"]: {
-                "bytes": b"AC1027sheet",
-                "entity_count": 1,
-                "entity_types": {"LINE": 1},
-                "audit_fixes": 0,
-                "bbox": [0, 0, 1, 1],
-            }
-            for sheet in sheets
-        }, []
+        raise AssertionError("The parser must not invoke the old Sheet DWG exporter")
 
     monkeypatch.setattr(parser, "_export_dwg_json", fake_export)
     with patch.object(BaseParser, "_get_viking_fs", return_value=fake_fs):
         result = await parser.parse(source, sheet_dwg_exporter=fake_sheet_export)
 
     assert result.precomputed_semantics is False
+    assert result.parser_version == "10.0"
     assert any(uri.endswith("/building-plan.dwg") for uri in fake_fs.files)
     assert not any(uri.endswith("/libredwg.json") for uri in fake_fs.files)
     assert not any(uri.endswith("/.overview.md") for uri in fake_fs.files)
-    topology = json.loads(
-        next(value for uri, value in fake_fs.files.items() if uri.endswith("/beam_topology.json"))
+    assert not any(
+        uri.endswith(("/document.json", "/beam_topology.json", "/structure.json"))
+        for uri in fake_fs.files
     )
-    document = json.loads(
-        next(value for uri, value in fake_fs.files.items() if uri.endswith("/document.json"))
-    )
-    structure = json.loads(
-        next(value for uri, value in fake_fs.files.items() if uri.endswith("/structure.json"))
-    )
-    assert topology["schema_version"] == "deterministic-dwg-topology-v2"
-    assert topology["records"][0]["beam_id"] == "KL1"
-    assert document["schema"] == "openviking.dwg-document/v1"
-    assert document["sheet_count"] == 1
-    assert structure["schema"] == "openviking.dwg-sheet-structure/v1"
-    assert structure["coverage"]["complete"] is True
-    assert structure["coverage"]["no_per_label_coordinates"] is True
-    assert structure["sheet"]["dwg_path"] == "sheet.dwg"
-    assert "point" not in json.dumps(structure)
-    assert any(uri.endswith("/content.md") for uri in fake_fs.files)
-    assert any(uri.endswith("/sheet.dwg") for uri in fake_fs.files)
+    assert any(uri.endswith("/context.md") for uri in fake_fs.files)
+    assert not any(uri.endswith("/sheet.dwg") for uri in fake_fs.files)
+    assert any(uri.endswith(".json") for uri in fake_fs.files)
     assert not any("drawing_text" in uri or "preview" in uri for uri in fake_fs.files)
-    assert result.meta["document_manifest"] == "document.json"
+    assert not {"document_manifest", "beam_topology"} & result.meta.keys()
+    assert result.meta["document_id"].startswith("dwg-")
     assert result.meta["sheet_bundles"][0]["content_paths"]
-    assert result.meta["sheet_bundles"][0]["dwg_path"].endswith("/sheet.dwg")
+    assert "structure_path" not in result.meta["sheet_bundles"][0]
+    assert "dwg_path" not in result.meta["sheet_bundles"][0]
+    assert isinstance(result.meta["sheet_bundles"][0]["json_artifacts"], list)
+    assert result.meta["json_artifacts"]
+    assert any(Path(uri).name == "metadata.json" for uri in fake_fs.files)
+    assert not any(
+        segment in uri.split("/")
+        for uri in fake_fs.files
+        for segment in ("catalog", "shared", "unassigned", "views", "chunks")
+    )
+    assert result.meta["parse_status"] == "partial"
     assert result.meta["source_sha256"]
     assert any("proxy objects" in warning for warning in result.warnings)
 
@@ -175,49 +164,6 @@ async def test_dwg_parser_ignores_an_embedded_preview(tmp_path: Path, monkeypatc
         await parser.parse(source, sheet_dwg_exporter=lambda *_args: ({}, []))
 
     assert not any(uri.endswith(("/preview.png", "/preview.webp")) for uri in fake_fs.files)
-
-
-def test_flat_sheet_dwg_export_keeps_whole_intersecting_entities(tmp_path, monkeypatch):
-    import ezdxf
-
-    source_doc = ezdxf.new("R2018")
-    source_doc.modelspace().add_line((-5, 5), (15, 5))
-    source_doc.modelspace().add_line((20, 20), (30, 30))
-    sheets = [
-        {
-            "sheet_id": "S001",
-            "kind": "model_frame",
-            "structure": {"sheet": {"bbox": [0, 0, 10, 10]}},
-        },
-        {
-            "sheet_id": "Model",
-            "kind": "model_unframed",
-            "structure": {"sheet": {"bbox": None}},
-        },
-    ]
-
-    monkeypatch.setattr(
-        "openviking.parse.parsers.dwg_sheet_export._configure_oda_file_converter", lambda: None
-    )
-    monkeypatch.setattr(
-        "openviking.parse.parsers.dwg_sheet_export.odafc.readfile",
-        lambda *_args, **_kwargs: source_doc,
-    )
-
-    def fake_export(_doc, filename, **_kwargs):
-        Path(filename).write_bytes(b"AC1027sheet")
-
-    monkeypatch.setattr(
-        "openviking.parse.parsers.dwg_sheet_export.odafc.export_dwg", fake_export
-    )
-
-    exports, warnings = export_flat_sheet_dwgs(tmp_path / "source.dwg", sheets)
-
-    assert set(exports) == {"S001"}
-    assert exports["S001"]["entity_count"] == 1
-    assert exports["S001"]["entity_types"] == {"LINE": 1}
-    assert exports["S001"]["bytes"] == b"AC1027sheet"
-    assert any("world-space CAD primitives" in warning for warning in warnings)
 
 
 def test_sheet_parser_accepts_flag512_model_frames_skips_empty_layout_and_bounds_markdown():
@@ -244,6 +190,7 @@ def test_sheet_parser_accepts_flag512_model_frames_skips_empty_layout_and_bounds
             "handle": [0, 0, 31],
             "entmode": 2,
             "rows": [["名称", "数量"], ["梁", "2"]],
+            "ins_pt": [1000, 49000],
         },
     ]
     objects.extend(
@@ -264,24 +211,27 @@ def test_sheet_parser_accepts_flag512_model_frames_skips_empty_layout_and_bounds
         source_name="structure.dwg",
         source_sha256="a" * 64,
         source_size_bytes=123,
+        region_classifier=lambda *_: {
+            "regions": [{"type": "document", "bbox": [0, 0, 84100, 59400]}]
+        },
+        sheet_renderer=lambda _: b"fixture-image",
     )
 
     assert result["document"]["sheet_count"] == 1
     sheet = result["sheets"][0]
     assert sheet["kind"] == "model_frame"
     assert sheet["source_locator"]["kind"] == "closed_polyline"
+    assert sheet["region_diagnostic"]["status"] == "used"
+    assert sheet["title"] == "结构平面图"
+    assert all(re.fullmatch(r"context(?:_\d{3})?\.md", name) for name, _ in sheet["content_files"])
+    assert "## 图纸元数据" in "\n".join(content for _, content in sheet["content_files"])
     assert all(len(content) <= 6000 for _, content in sheet["content_files"])
-    assert sheet["structure"]["coverage"]["complete"] is True
-    table = sheet["structure"]["tables"][0]
-    assert table["cells"][0] == {
-        "row": 0,
-        "column": 0,
-        "row_span": 1,
-        "column_span": 1,
-        "role": "column_header",
-        "text": "名称",
-        "source_refs": [{"object_index": 31, "handle": 31}],
-    }
+    assert sheet["status"] == "complete"
+    markdown = "\n".join(content for _, content in sheet["content_files"])
+    assert "| 名称 | 数量 |" in markdown
+    assert "| 梁 | 2 |" in markdown
+    assert len(sheet["markdown_uids"]) == 80
+    assert objects[4]["rows"] == [["名称", "数量"], ["梁", "2"]]
 
 
 def test_document_sheet_restores_column_order_and_inline_table_independent_of_entity_order():
@@ -334,14 +284,11 @@ def test_document_sheet_restores_column_order_and_inline_table_independent_of_en
         }
     ]
     bbox = (0.0, 0.0, 1000.0, 1000.0)
-    native = _native_sheet_mode(records, tables, bbox, set())
+    anchors = _document_column_anchors(records, bbox, set())
 
-    assert native["mode"] == "document"
-    assert native["column_count"] == 4
-    blocks, _ = _document_flow(records, tables, set(), native["_column_anchors"])
-    reversed_blocks, _ = _document_flow(
-        list(reversed(records)), tables, set(), native["_column_anchors"]
-    )
+    assert anchors == columns
+    blocks, _ = _document_flow(records, tables, set(), anchors)
+    reversed_blocks, _ = _document_flow(list(reversed(records)), tables, set(), anchors)
     assert blocks == reversed_blocks
     content = "\n".join(blocks)
     ordered = [
@@ -360,67 +307,10 @@ def test_document_sheet_restores_column_order_and_inline_table_independent_of_en
         "10.防雷接地做法详电施图",
         "11.其它",
     ]
-    assert [content.index(value) for value in ordered] == sorted(content.index(value) for value in ordered)
+    assert [content.index(value) for value in ordered] == sorted(
+        content.index(value) for value in ordered
+    )
     assert "## 2.设计总则" not in content
-
-    calls = []
-
-    def fake_vlm(image, evidence):
-        calls.append((image, evidence))
-        return {"mode": "document", "confidence": 0.99, "reason": "multi-column manual"}
-
-    classified = _sheet_mode(records, [], tables, bbox, set(), fake_vlm)
-    assert classified["method"] == "native_layout+vlm"
-    assert calls and calls[0][0].startswith(b"\x89PNG")
-    invalid = _sheet_mode(
-        records,
-        [],
-        tables,
-        bbox,
-        set(),
-        lambda _image, _evidence: {"mode": "drawing", "confidence": "high"},
-    )
-    assert invalid["mode"] == "document"
-    assert invalid["vlm"]["confidence"] == 0.0
-    conflict = _sheet_mode(
-        records,
-        [],
-        tables,
-        bbox,
-        set(),
-        lambda _image, _evidence: {"mode": "drawing", "confidence": 0.7},
-    )
-    assert conflict["mode"] == "document"
-
-
-def test_vlm_document_mode_uses_native_columns_without_numbered_headings():
-    def text(index, column, row):
-        return {
-            "uid": f"u{index}",
-            "text": f"第{column + 1}栏第{row + 1}条完整设计说明文字，施工时应按现行规范逐项核对并记录。",
-            "point": (10 + column * 500, 900 - row * 15),
-            "height": 5.0,
-            "record": {"index": index, "handle": [0, 0, index]},
-            "instance_path": [],
-        }
-
-    records = [text(column * 40 + row, column, row) for column in range(2) for row in range(40)]
-    bbox = (0.0, 0.0, 1000.0, 1000.0)
-    classified = _sheet_mode(
-        records,
-        [],
-        [],
-        bbox,
-        set(),
-        lambda _image, _evidence: {"mode": "document", "confidence": 0.99},
-    )
-    blocks, _ = _document_flow(records, [], set(), classified["_column_anchors"])
-
-    assert classified["mode"] == "document"
-    assert classified["column_count"] == 2
-    assert blocks[0].startswith("第1栏")
-    assert blocks[39].startswith("第1栏")
-    assert blocks[40].startswith("第2栏")
 
 
 def test_document_flow_orders_a_table_from_its_caption_not_its_grid_top():
@@ -440,7 +330,7 @@ def test_document_flow_orders_a_table_from_its_caption_not_its_grid_top():
             "height": 5,
             "record": {"index": 3, "handle": [0, 0, 3]},
             "instance_path": [],
-        }
+        },
     ]
     tables = [
         {
@@ -508,9 +398,7 @@ def test_document_flow_inlines_checkbox_state_inside_a_table_cell():
             "_text_uids": ["table-option"],
         }
     ]
-    markers = [
-        {"_label_uid": "table-option", "state": "selected", "label": "基坑支护工程"}
-    ]
+    markers = [{"_label_uid": "table-option", "state": "selected", "label": "基坑支护工程"}]
 
     blocks, _ = _document_flow(records, tables, set(), [10], markers)
 
@@ -575,11 +463,12 @@ def test_layout_with_viewport_is_explicitly_marked_incomplete_until_projection()
         source_size_bytes=1,
     )
 
-    structure = result["sheets"][0]["structure"]
-    assert structure["sheet"]["viewport_projection"] == "unresolved"
-    assert structure["sheet"]["source_locator"]["viewport_handles"] == [22]
-    assert structure["coverage"]["viewport_projection_complete"] is False
-    assert structure["coverage"]["complete"] is False
+    sheet = result["sheets"][0]
+    assert sheet["kind"] == "layout"
+    assert sheet["source_locator"]["viewport_handles"] == [22]
+    assert sheet["region_diagnostic"]["status"] == "unsupported_sheet"
+    assert sheet["status"] == "partial"
+    assert not sheet["markdown_uids"]
 
 
 def test_named_title_block_does_not_suppress_the_outer_sheet_frame():
@@ -632,6 +521,80 @@ def test_named_title_block_does_not_suppress_the_outer_sheet_frame():
     frames = [sheet for sheet in result["sheets"] if sheet["kind"] == "model_frame"]
     assert len(frames) == 1
     assert frames[0]["source_locator"]["source_ref"]["handle"] == 30
+
+
+def test_repeated_electrical_block_bounds_do_not_displace_the_real_outer_frame():
+    # Source 89fdddd5: one real frame and two repeated narrow electrical symbols.
+    outer = {
+        "source_kind": "frame_block",
+        "source_ref": {"object_index": 5768, "handle": 43419},
+        "block_name": "华天图框标准",
+        "bbox": [53747748.438134015, 8671345.958182577, 53895588.438134015, 8775889.958182577],
+    }
+    symbols = [
+        {
+            "source_kind": "block_bbox",
+            "source_ref": {"object_index": ordinal, "handle": handle},
+            "block_name": "$element$00000532",
+            "bbox": bbox,
+        }
+        for ordinal, handle, bbox in (
+            (
+                36751,
+                167517,
+                [53783515.663021035, 8727078.959970865, 53783875.13932135, 8728876.341472466],
+            ),
+            (
+                36889,
+                167749,
+                [53824173.25170295, 8727078.959970865, 53824532.72800326, 8728876.341472466],
+            ),
+        )
+    ]
+
+    assert _select_frames({"frames": [outer, *symbols]}) == [outer]
+
+
+def test_repeated_component_palette_does_not_create_sheets_outside_real_frame_blocks():
+    # 11-PL: large A034-CN blocks are sheets; repeated *U symbols above them are not.
+    frames = [
+        {
+            "source_kind": "block_bbox",
+            "source_ref": {"handle": handle},
+            "block_name": "A034-CN",
+            "bbox": bbox,
+        }
+        for handle, bbox in (
+            (
+                125467,
+                [-416908.7970944941, -14441.47104265018, -104796.2970944941, 111708.52895734982],
+            ),
+            (
+                125472,
+                [383091.2029055059, -14441.47104265018, 695203.7029055059, 111708.52895734982],
+            ),
+        )
+    ]
+    palette = [
+        {
+            "source_kind": "block_bbox",
+            "source_ref": {"handle": handle},
+            "block_name": "*U",
+            "bbox": bbox,
+        }
+        for handle, bbox in (
+            (
+                43464,
+                [-23480.431645522578, 203070.07682279585, -22280.431645522578, 203670.07682279585],
+            ),
+            (
+                43504,
+                [-32488.431645522593, 199070.07682279585, -31288.431645522593, 199670.07682279585],
+            ),
+        )
+    ]
+
+    assert _select_frames({"frames": [*frames, *palette]}) == frames
 
 
 def test_repeated_top_level_frames_win_over_one_cross_sheet_container():
@@ -708,26 +671,6 @@ def test_repeated_top_level_frames_win_over_one_cross_sheet_container():
     assert result["document"]["sheet_count"] == 3
 
 
-def test_formal_title_prefers_and_joins_titleblock_attributes():
-    records = [
-        {
-            "text": "室内装修表、装修构造做法表、",
-            "point": (100, 20),
-            "height": 5,
-            "layer": "TK-JDB$0$0-TB-ATTRIB",
-        },
-        {
-            "text": "工业建筑节能设计专篇",
-            "point": (100, 10),
-            "height": 5,
-            "layer": "TK-JDB$0$0-TB-ATTRIB",
-        },
-        {"text": "电气入户井详图", "point": (50, 50), "height": 5, "layer": "DETAIL"},
-    ]
-
-    assert _formal_title(records) == "室内装修表、装修构造做法表、工业建筑节能设计专篇"
-
-
 def test_oversized_table_header_does_not_create_one_file_per_character():
     body = f"| {'说明' * 4000} |\n| --- |\n| 普通行 |"
 
@@ -735,6 +678,43 @@ def test_oversized_table_header_does_not_create_one_file_per_character():
 
     assert 1 < len(parts) < 10
     assert all(len(part) <= 6000 for part in parts)
+
+
+def test_graphical_sheet_keeps_labels_native_without_a_figure_catalog():
+    drawing = {
+        "OBJECTS": [
+            {"object": "BLOCK_HEADER", "handle": [0, 0, 10], "name": "*Model_Space"},
+            {
+                "entity": "LWPOLYLINE",
+                "handle": [0, 0, 20],
+                "entmode": 2,
+                "flag": 1,
+                "points": [[0, 0], [100, 0], [100, 100], [0, 100]],
+            },
+            {
+                "entity": "TEXT",
+                "handle": [0, 0, 21],
+                "entmode": 2,
+                "ins_pt": [10, 80],
+                "height": 5,
+                "text_value": "女儿墙节点图内标注",
+            },
+        ]
+    }
+    result = build_sheet_artifacts(
+        drawing,
+        source_name="figures.dwg",
+        source_sha256="f" * 64,
+        source_size_bytes=1,
+        region_classifier=lambda *_: {"regions": []},
+        sheet_renderer=lambda _: b"fixture-image",
+    )
+    sheet = result["sheets"][0]
+    markdown = "\n".join(content for _, content in sheet["content_files"])
+    assert "图形目录" not in markdown and "女儿墙节点图内标注" not in markdown
+    assert not sheet["markdown_uids"] and sheet["status"] == "complete"
+    assert sheet["title"] == "Sheet 001"
+    assert sheet["_texts"][0]["record"] is drawing["OBJECTS"][2]
 
 
 def test_multilevel_table_headers_are_flattened_for_markdown():
@@ -765,3 +745,18 @@ def test_libredwg_non_strict_json_is_normalized_for_grep():
     assert json.loads(normalized.decode("utf-8"))["value"] is None
     assert "项目名称" in normalized.decode("utf-8")
     assert len(warnings) == 2
+
+
+def test_libredwg_control_character_fallback_is_scoped():
+    raw = b'{"OBJECTS":[{"entity":"TEXT","text_value":"A\x01B"}]}'
+
+    drawing, normalized, warnings = _normalize_libredwg_json(raw, "sample.dwg")
+
+    assert drawing["OBJECTS"][0]["text_value"] == "A\x01B"
+    assert b"A\\u0001B" in normalized
+    assert json.loads(normalized)["OBJECTS"][0]["text_value"] == "A\x01B"
+    assert any("non-strict" in warning for warning in warnings)
+
+    malformed = b'{"OBJECTS":[{"text_value":"A\x01B"}]'
+    with pytest.raises(RuntimeError, match=r"LibreDWG produced invalid JSON for broken\.dwg"):
+        _normalize_libredwg_json(malformed, "broken.dwg")

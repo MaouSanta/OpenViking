@@ -2,11 +2,12 @@
 # SPDX-License-Identifier: AGPL-3.0
 """Focused coverage for atomic resource bundles."""
 
+import asyncio
 import hashlib
 import json
 from contextlib import nullcontext
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, call
+from unittest.mock import AsyncMock, Mock, call
 
 import pytest
 
@@ -22,8 +23,13 @@ from openviking.service.fs_service import FSService
 from openviking.service.resource_service import ResourceService
 from openviking.service.search_service import SearchService
 from openviking.storage.viking_fs import LS_ALL_NODES, VikingFS
+from openviking.telemetry.request_wait_tracker import RequestWaitTracker
 from openviking.utils.embedding_utils import _apply_scalar_overrides
-from openviking_cli.exceptions import FailedPreconditionError, InvalidURIError
+from openviking_cli.exceptions import (
+    DeadlineExceededError,
+    FailedPreconditionError,
+    InvalidURIError,
+)
 from openviking_cli.retrieve.types import ContextType, FindResult, MatchedContext
 from openviking_cli.session.user_id import UserIdentifier
 
@@ -48,8 +54,8 @@ class _BundleFS:
         del ctx
         return uri in self.existing or uri in self.directories or uri in self.files
 
-    async def mkdir(self, uri, *, ctx, lease_ref=None):
-        del ctx, lease_ref
+    async def mkdir(self, uri, *, ctx=None, lease_ref=None, exist_ok=False):
+        del ctx, lease_ref, exist_ok
         self.directories.add(uri)
 
     async def write_file_bytes(self, uri, content, *, ctx=None, lease_ref=None):
@@ -118,6 +124,302 @@ def _bundle_service(viking_fs):
     return service
 
 
+def _two_sheet_bundle(tmp_path, monkeypatch):
+    source = tmp_path / "batch.dwg"
+    source.write_bytes(b"source snapshot")
+    fs = _BundleFS()
+    service = _bundle_service(fs)
+    target = "viking://resources/batch"
+    staging = "viking://temp/job/batch_dwg"
+    service._plan_resource_target = AsyncMock(return_value=(target, _lease()))
+    files = {
+        "batch.dwg": b"source snapshot",
+        "sheets/S001/context.md": b"# First",
+        "sheets/S002/context_001.md": b"# Second part 1",
+        "sheets/S002/context_002.md": b"# Second part 2",
+    }
+    sheets = [
+        {
+            "sheet_id": "S001",
+            "directory": "sheets/S001",
+            "content_paths": ["sheets/S001/context.md"],
+        },
+        {
+            "sheet_id": "S002",
+            "directory": "sheets/S002",
+            "content_paths": ["sheets/S002/context_001.md", "sheets/S002/context_002.md"],
+        },
+    ]
+    parsed = SimpleNamespace(
+        temp_dir_path="viking://temp/job",
+        meta={
+            "temp_root_uri": staging,
+            "sheet_bundles": sheets,
+            "json_artifacts": [],
+        },
+    )
+
+    async def parse(*args, **kwargs):
+        fs.files.update({f"{staging}/{name}": content for name, content in files.items()})
+        return parsed
+
+    monkeypatch.setattr(
+        resource_service_module, "find_resource_bundle_root", AsyncMock(return_value=None)
+    )
+    monkeypatch.setattr("openviking.parse.parsers.dwg.DWGParser.parse", parse)
+    return service, fs, source, target, staging, files, sheets
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("outcome", ["success", "semantic_error", "enqueue_error", "timeout"])
+async def test_dwg_sheet_summaries_share_one_batch_wait_and_finish_before_publish_or_rollback(
+    tmp_path, monkeypatch, ctx, outcome
+):
+    service, fs, source, target, staging, _, _ = _two_sheet_bundle(tmp_path, monkeypatch)
+    tracker = object.__new__(RequestWaitTracker)
+    tracker.__init__()
+    tracker.register_request = Mock(wraps=tracker.register_request)
+    tracker.cleanup = Mock(wraps=tracker.cleanup)
+    tracker.build_queue_status = Mock(wraps=tracker.build_queue_status)
+    telemetry_id = "tm_sheet_batch"
+    register, unregister = Mock(), Mock()
+    monkeypatch.setattr(
+        resource_service_module,
+        "get_current_telemetry",
+        lambda: SimpleNamespace(telemetry_id=telemetry_id),
+    )
+    monkeypatch.setattr(resource_service_module, "get_request_wait_tracker", lambda: tracker)
+    monkeypatch.setattr(resource_service_module, "register_telemetry", register)
+    monkeypatch.setattr(resource_service_module, "unregister_telemetry", unregister)
+    running, release, trigger_timeout, draining = (asyncio.Event() for _ in range(4))
+    started, workers = set(), []
+    expected_workers = 1 if outcome == "enqueue_error" else 2
+
+    async def worker(uri):
+        started.add(uri)
+        if len(started) == expected_workers:
+            running.set()
+        await release.wait()
+        await fs.write_file(uri + "/.abstract.md", "abstract")
+        await fs.write_file(uri + "/.overview.md", "overview")
+        if outcome == "semantic_error" and uri.endswith("S002"):
+            tracker.mark_semantic_failed(telemetry_id, uri, "one Sheet failed")
+        else:
+            tracker.mark_semantic_done(telemetry_id, uri)
+
+    async def enqueue(uris, context, **kwargs):
+        assert context is ctx and len(uris) == 1
+        uri = uris[0]
+        if outcome == "enqueue_error" and uri.endswith("S002"):
+            raise RuntimeError("enqueue failed")
+        tracker.register_semantic_root(telemetry_id, uri)
+        workers.append(asyncio.create_task(worker(uri)))
+        return {"status": "success", "enqueued_count": 1}
+
+    original_wait = tracker.wait_for_request
+
+    async def wait(identifier, timeout=None):
+        if outcome == "timeout" and timeout is not None:
+            await trigger_timeout.wait()
+            raise TimeoutError("batch deadline")
+        if outcome == "timeout":
+            draining.set()
+        await original_wait(identifier)
+
+    tracker.wait_for_request = AsyncMock(side_effect=wait)
+    service._resource_processor = SimpleNamespace(summarize=AsyncMock(side_effect=enqueue))
+    task = asyncio.create_task(
+        service.add_resource(
+            path=str(source),
+            ctx=ctx,
+            to=target,
+            bundle=True,
+            build_index=False,
+            timeout=1 if outcome == "timeout" else None,
+        )
+    )
+    try:
+        await asyncio.wait_for(running.wait(), 2)
+        assert service._resource_processor.summarize.await_count == 2
+        assert tracker.wait_for_request.await_count == 1
+        assert not task.done()
+        tracker.cleanup.assert_not_called()
+        unregister.assert_not_called()
+        assert not any(path.startswith(target) for path in fs.files)
+        assert any(path.startswith(staging) for path in fs.files)
+        for call_args, names in zip(
+            service._resource_processor.summarize.await_args_list,
+            [["context.md"], ["context_001.md", "context_002.md"]],
+            strict=True,
+        ):
+            assert call_args.kwargs == {
+                "skip_vectorization": True,
+                "bundle_assembly": True,
+                "summary_files": names,
+            }
+        if outcome == "timeout":
+            trigger_timeout.set()
+            await asyncio.wait_for(draining.wait(), 2)
+            assert not task.done() and any(path.startswith(staging) for path in fs.files)
+        release.set()
+        if outcome == "success":
+            result = await asyncio.wait_for(task, 2)
+            assert len(result["sheet_uris"]) == 2 and result["semantic_status"] == "complete"
+            assert all(
+                f"{target}/sheets/{name}/manifest.json" in fs.files for name in ["S001", "S002"]
+            )
+        else:
+            expected = DeadlineExceededError if outcome == "timeout" else RuntimeError
+            with pytest.raises(expected):
+                await asyncio.wait_for(task, 2)
+            assert not any(path.startswith(target) for path in fs.files)
+        assert not any(path.startswith("viking://temp/job") for path in fs.files)
+        assert all(worker.done() for worker in workers)
+        tracker.register_request.assert_called_once_with(telemetry_id)
+        tracker.cleanup.assert_called_once_with(telemetry_id)
+        assert tracker.wait_for_request.await_count == (2 if outcome == "timeout" else 1)
+        assert tracker.build_queue_status.call_count == (0 if outcome == "timeout" else 1)
+        register.assert_called_once()
+        unregister.assert_called_once_with(telemetry_id)
+        service._release_lock_ref.assert_awaited_once()
+    finally:
+        release.set()
+        trigger_timeout.set()
+        await asyncio.gather(task, *workers, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("invalid", ["duplicate_directory", "non_markdown", "missing_markdown"])
+async def test_all_dwg_sheet_inputs_are_validated_before_any_summary_is_enqueued(
+    tmp_path, monkeypatch, ctx, invalid
+):
+    service, fs, source, target, _, files, sheets = _two_sheet_bundle(tmp_path, monkeypatch)
+    service._resource_processor = SimpleNamespace(summarize=AsyncMock())
+    if invalid == "duplicate_directory":
+        sheets[1]["directory"] = sheets[0]["directory"]
+    elif invalid == "non_markdown":
+        sheets[1]["content_paths"] = ["sheets/S002/drawing.json"]
+    else:
+        del files["sheets/S002/context_002.md"]
+    with pytest.raises((RuntimeError, KeyError)):
+        await service.add_resource(
+            path=str(source), ctx=ctx, to=target, bundle=True, build_index=False
+        )
+    service._resource_processor.summarize.assert_not_awaited()
+    assert not any(
+        path.startswith(target) or path.startswith("viking://temp/job") for path in fs.files
+    )
+    service._release_lock_ref.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_single_bundle_summary_keeps_its_existing_arguments(ctx):
+    service = _bundle_service(_BundleFS())
+    service._summarize_bundle_staging_batch = AsyncMock(return_value={"Semantic": {}})
+    result = await service._summarize_bundle_staging("viking://temp/step", ctx=ctx, timeout=10)
+    assert result == {"Semantic": {}}
+    service._summarize_bundle_staging_batch.assert_awaited_once_with(
+        [("viking://temp/step", None)], ctx=ctx, timeout=10
+    )
+
+
+@pytest.mark.asyncio
+async def test_dwg_bundle_publishes_partial_fallback_when_every_candidate_is_rejected(
+    tmp_path, monkeypatch, ctx
+):
+    from openviking.parse.parsers import dwg as dwg_module
+    from openviking.parse.parsers.base_parser import BaseParser
+    from openviking.parse.parsers.dwg_json import read_json_records
+
+    source = tmp_path / "rejected-plan.dwg"
+    source.write_bytes(b"local synthetic DWG snapshot")
+    objects = [{"object": "BLOCK_HEADER", "handle": [0, 0, 2], "name": "*Model_Space"}]
+    for index in range(2):
+        x = index * 200
+        objects.extend(
+            [
+                {
+                    "entity": "LWPOLYLINE",
+                    "handle": [0, 0, 10 + index],
+                    "entmode": 2,
+                    "flag": 512,
+                    "points": [[x, 0], [x + 100, 0], [x + 100, 80], [x, 80]],
+                },
+                {
+                    "entity": "TEXT",
+                    "handle": [0, 0, 20 + index],
+                    "entmode": 2,
+                    "ins_pt": [x + 10, 60],
+                    "height": 2,
+                    "text_value": f"非图纸示意文字{index}",
+                },
+            ]
+        )
+    drawing = {"OBJECTS": objects}
+    calls, renders = [], []
+
+    def classify(_image, evidence):
+        calls.append(evidence)
+        return {"is_sheet": False}
+
+    def render(bbox):
+        renders.append(bbox)
+        return b"fixture-image"
+
+    async def export(_parser, _path):
+        return drawing, json.dumps(drawing).encode(), []
+
+    viking_fs = _BundleFS()
+    service = _bundle_service(viking_fs)
+    root = "viking://resources/rejected-plan"
+    service._plan_resource_target = AsyncMock(return_value=(root, _lease()))
+    service._summarize_bundle_staging_batch = AsyncMock(return_value={})
+    monkeypatch.setattr(
+        resource_service_module, "find_resource_bundle_root", AsyncMock(return_value=None)
+    )
+    monkeypatch.setattr(BaseParser, "_get_viking_fs", lambda _self: viking_fs)
+    monkeypatch.setattr(dwg_module.DWGParser, "_export_dwg_json", export)
+    monkeypatch.setattr(dwg_module, "_region_classifier", lambda: classify)
+    monkeypatch.setattr(dwg_module, "sheet_renderer", lambda _source: render)
+    monkeypatch.setattr(
+        dwg_module,
+        "get_openviking_config",
+        lambda: SimpleNamespace(
+            markdown=SimpleNamespace(max_section_size=2048, max_section_chars=6000),
+            embedding=SimpleNamespace(max_input_tokens=4096),
+            vlm=SimpleNamespace(max_concurrent=4),
+        ),
+    )
+
+    result = await service.add_resource(
+        path=str(source), ctx=ctx, to=root, bundle=True, build_index=False
+    )
+
+    assert len(calls) == len(renders) == 2
+    assert all("detail" not in call for call in calls)
+    assert result["parse_status"] == "partial"
+    assert len(result["sheet_uris"]) == 1
+    sheet_uri = result["sheet_uris"][0]
+    manifest = json.loads(viking_fs.files[f"{sheet_uri}/manifest.json"])
+    assert manifest["sheet"]["status"] == "partial"
+    assert manifest["artifacts"]["content"]["searchable"] is True
+    assert b"context.md" in viking_fs.files[f"{sheet_uri}/manifest.json"]
+    service._summarize_bundle_staging_batch.assert_awaited_once()
+    assert service._summarize_bundle_staging_batch.await_args.args[0] == [
+        (sheet_uri.replace(root, "viking://temp/staging/rejected-plan_dwg"), ["context.md"])
+    ]
+    records = read_json_records(
+        content.decode()
+        for path, content in viking_fs.files.items()
+        if path.endswith(".json") and not path.endswith("/manifest.json")
+    )
+    preserved = {row["object_index"]: row["value"] for row in records if row["kind"] == "object"}
+    assert [preserved[index] for index in range(len(objects))] == objects
+    assert next(row for row in records if row["kind"] == "sheet")["source_locator"] == {
+        "kind": "synthetic"
+    }
+
+
 def test_bundle_marker_reads_v1_and_requires_a_v2_artifact_inventory():
     assert not is_resource_bundle_manifest({"schema": "openviking.resource-bundle/v1"})
     assert not is_resource_bundle_manifest(
@@ -158,14 +460,14 @@ def test_bundle_marker_reads_v1_and_requires_a_v2_artifact_inventory():
             "source_ref": {"path": "../../plan.dwg", "sha256": "a" * 64},
             "artifacts": {
                 "content": {
-                    "path": "content.md",
+                    "path": "context.md",
                     "schema": "text/markdown",
                     "sha256": "b" * 64,
                     "searchable": True,
                 },
-                "structure": {
-                    "path": "structure.json",
-                    "schema": "openviking.dwg-sheet-structure/v1",
+                "flat_dwg": {
+                    "path": "sheet.dwg",
+                    "schema": "dwg",
                     "sha256": "c" * 64,
                     "searchable": False,
                 },
@@ -180,9 +482,9 @@ def test_bundle_marker_reads_v1_and_requires_a_v2_artifact_inventory():
             "sheet": {"id": "S001"},
             "source_ref": {"path": "../../plan.dwg", "sha256": "a" * 64},
             "artifacts": {
-                "structure": {
-                    "path": "structure.json",
-                    "schema": "openviking.dwg-sheet-structure/v1",
+                "flat_dwg": {
+                    "path": "sheet.dwg",
+                    "schema": "dwg",
                     "sha256": "c" * 64,
                     "searchable": False,
                 }
@@ -254,7 +556,7 @@ async def test_nested_sheet_searches_nearest_but_mutations_resolve_document_owne
             "source_ref": {"path": "../../plan.dwg", "sha256": "a" * 64},
             "artifacts": {
                 "content": {
-                    "path": "content.md",
+                    "path": "context.md",
                     "schema": "text/markdown",
                     "sha256": "b" * 64,
                     "searchable": True,
@@ -263,7 +565,7 @@ async def test_nested_sheet_searches_nearest_but_mutations_resolve_document_owne
         }
     ).encode()
 
-    content_uri = f"{sheet}/content.md"
+    content_uri = f"{sheet}/context.md"
     assert await find_resource_bundle_root(viking_fs, content_uri, ctx=ctx) == sheet
     assert await find_resource_bundle_owner_root(viking_fs, content_uri, ctx=ctx) == root
 
@@ -321,14 +623,14 @@ async def test_add_raw_resource_bundle_writes_only_source_and_manifest(
 
 
 @pytest.mark.asyncio
-async def test_dwg_bundle_publishes_document_and_nested_sheet_bundle(tmp_path, monkeypatch, ctx):
+async def test_dwg_bundle_publishes_source_and_nested_sheet_bundle(tmp_path, monkeypatch, ctx):
     source = tmp_path / "plan.dwg"
     source.write_bytes(b"dwg snapshot")
     viking_fs = _BundleFS()
     service = _bundle_service(viking_fs)
     lock = _lease()
     service._plan_resource_target = AsyncMock(return_value=("viking://resources/plan", lock))
-    service._summarize_bundle_staging = AsyncMock(return_value={})
+    service._summarize_bundle_staging_batch = AsyncMock(return_value={})
 
     async def no_parent_bundle(*_args, **_kwargs):
         return None
@@ -337,11 +639,9 @@ async def test_dwg_bundle_publishes_document_and_nested_sheet_bundle(tmp_path, m
         staging = "viking://temp/job/plan_dwg"
         files = {
             "plan.dwg": b"dwg snapshot",
-            "document.json": b'{"schema":"openviking.dwg-document/v1","document_id":"dwg-doc-1"}',
-            "beam_topology.json": b'{"schema":"deterministic-dwg-topology-v2"}',
-            "sheets/S001/content.md": "# 一层平面图\n\n生产辅助间".encode(),
-            "sheets/S001/structure.json": b'{"schema":"openviking.dwg-sheet-structure/v1"}',
-            "sheets/S001/sheet.dwg": b"AC1027sheet",
+            "sheets/S001/context.md": "# 一层平面图\n\n生产辅助间".encode(),
+            "sheets/S001/views/V001/chunk_0001.json": b'{"OBJECTS": [{"handle": "1"}]}',
+            "shared/chunk_0001.json": b'{"HEADER": {"version": "AC1027"}}',
             "preview.png": b"png",
         }
         for name, content in files.items():
@@ -350,16 +650,24 @@ async def test_dwg_bundle_publishes_document_and_nested_sheet_bundle(tmp_path, m
             temp_dir_path="viking://temp/job",
             meta={
                 "temp_root_uri": staging,
-                "document_manifest": "document.json",
-                "beam_topology": "beam_topology.json",
+                "document_id": "dwg-doc-1",
+                "parse_status": "partial",
+                "json_artifacts": [
+                    {"path": "shared/chunk_0001.json", "schema": "openviking.dwg-json-chunk/v1"}
+                ],
                 "sheet_bundles": [
                     {
                         "sheet_id": "S001",
                         "directory": "sheets/S001",
                         "title": "一层平面图",
-                        "content_paths": ["sheets/S001/content.md"],
-                        "structure_path": "sheets/S001/structure.json",
-                        "dwg_path": "sheets/S001/sheet.dwg",
+                        "content_paths": ["sheets/S001/context.md"],
+                        "status": "partial",
+                        "json_artifacts": [
+                            {
+                                "path": "sheets/S001/views/V001/chunk_0001.json",
+                                "schema": "openviking.dwg-json-chunk/v1",
+                            }
+                        ],
                         "kind": "model_frame",
                     }
                 ],
@@ -380,23 +688,23 @@ async def test_dwg_bundle_publishes_document_and_nested_sheet_bundle(tmp_path, m
     root = "viking://resources/plan"
     assert result["semantic_status"] == "complete"
     assert result["document_id"] == "dwg-doc-1"
+    assert result["parse_status"] == "partial"
     assert result["sheet_uris"] == [f"{root}/sheets/S001"]
     assert set(viking_fs.files) == {
         f"{root}/plan.dwg",
-        f"{root}/document.json",
-        f"{root}/beam_topology.json",
-        f"{root}/sheets/S001/content.md",
-        f"{root}/sheets/S001/structure.json",
-        f"{root}/sheets/S001/sheet.dwg",
+        f"{root}/sheets/S001/context.md",
+        f"{root}/sheets/S001/views/V001/chunk_0001.json",
+        f"{root}/shared/chunk_0001.json",
         f"{root}/sheets/S001/manifest.json",
         f"{root}/manifest.json",
     }
     manifest = json.loads(viking_fs.files[f"{root}/manifest.json"])
-    assert set(manifest["artifacts"]) == {
-        "source",
-        "document",
-        "beam_topology",
-        "sheet_0000",
+    assert set(manifest["artifacts"]) == {"source", "sheet_0000", "json_0000"}
+    assert manifest["parse_status"] == "partial"
+    assert manifest["artifacts"]["json_0000"] == {
+        "path": "shared/chunk_0001.json",
+        "schema": "openviking.dwg-json-chunk/v1",
+        "sha256": hashlib.sha256(viking_fs.files[f"{root}/shared/chunk_0001.json"]).hexdigest(),
     }
     assert all(
         {"path", "schema", "sha256"} <= artifact.keys()
@@ -406,31 +714,70 @@ async def test_dwg_bundle_publishes_document_and_nested_sheet_bundle(tmp_path, m
     assert sheet_manifest["schema"] == "openviking.resource-bundle/v3"
     assert sheet_manifest["kind"] == "dwg-sheet"
     assert sheet_manifest["owner"] == {"document_id": "dwg-doc-1"}
+    assert sheet_manifest["sheet"]["status"] == "partial"
     assert sheet_manifest["source_ref"] == {
         "path": "../../plan.dwg",
         "sha256": hashlib.sha256(b"dwg snapshot").hexdigest(),
     }
-    assert sheet_manifest["artifacts"]["content"]["searchable"] is True
-    assert sheet_manifest["artifacts"]["structure"]["searchable"] is False
-    assert sheet_manifest["artifacts"]["flat_dwg"]["path"] == "sheet.dwg"
-    assert sheet_manifest["artifacts"]["flat_dwg"]["searchable"] is False
+    assert sheet_manifest["artifacts"]["content"] == {
+        "path": "context.md",
+        "schema": "text/markdown",
+        "sha256": hashlib.sha256("# 一层平面图\n\n生产辅助间".encode()).hexdigest(),
+        "searchable": True,
+    }
+    assert sheet_manifest["artifacts"]["json_0000"] == {
+        "path": "views/V001/chunk_0001.json",
+        "schema": "openviking.dwg-json-chunk/v1",
+        "sha256": hashlib.sha256(
+            viking_fs.files[f"{root}/sheets/S001/views/V001/chunk_0001.json"]
+        ).hexdigest(),
+        "searchable": False,
+    }
+    assert "flat_dwg" not in sheet_manifest["artifacts"]
+    assert not any(path.endswith("sheet.dwg") for path in viking_fs.files)
     assert not any(path.endswith("libredwg.json") for path in viking_fs.files)
-    assert not any("preview" in path for path in viking_fs.files)
-    service._summarize_bundle_staging.assert_awaited_once_with(
-        "viking://temp/job/plan_dwg/sheets/S001", ctx=ctx, timeout=None
+    assert not any(
+        token in path
+        for path in viking_fs.files
+        for token in ("preview", "document.json", "beam_topology.json", "structure.json")
+    )
+    service._summarize_bundle_staging_batch.assert_awaited_once_with(
+        [("viking://temp/job/plan_dwg/sheets/S001", ["context.md"])],
+        ctx=ctx,
+        timeout=None,
     )
     service._release_lock_ref.assert_awaited_once_with(lock)
 
 
 @pytest.mark.asyncio
-async def test_dwg_bundle_failure_leaves_no_published_tree(tmp_path, monkeypatch, ctx):
+@pytest.mark.parametrize(
+    ("failure", "message"),
+    [
+        ("semantic", "semantic failed"),
+        ("missing", "JSON artifact is missing"),
+        ("malformed", "not valid UTF-8 JSON"),
+        ("encoding", "not valid UTF-8 JSON"),
+        ("nan", "not valid UTF-8 JSON"),
+        ("duplicate", "duplicate JSON artifact"),
+        ("escape", "unsafe JSON artifact path"),
+        ("ownership", "must stay inside"),
+        ("root_ownership", "belongs to a sheet"),
+        ("reserved", "reserved JSON artifact path"),
+    ],
+)
+async def test_dwg_bundle_failure_leaves_no_published_tree(
+    tmp_path, monkeypatch, ctx, failure, message
+):
     source = tmp_path / "plan.dwg"
     source.write_bytes(b"dwg snapshot")
     viking_fs = _BundleFS()
     service = _bundle_service(viking_fs)
     lock = _lease()
     service._plan_resource_target = AsyncMock(return_value=("viking://resources/plan", lock))
-    service._summarize_bundle_staging = AsyncMock(side_effect=RuntimeError("semantic failed"))
+    service._summarize_bundle_staging_batch = AsyncMock(
+        side_effect=RuntimeError("semantic failed") if failure == "semantic" else None,
+        return_value={},
+    )
 
     async def no_parent_bundle(*_args, **_kwargs):
         return None
@@ -439,25 +786,46 @@ async def test_dwg_bundle_failure_leaves_no_published_tree(tmp_path, monkeypatch
         staging = "viking://temp/job/plan_dwg"
         files = {
             "plan.dwg": b"dwg snapshot",
-            "document.json": b'{"document_id":"dwg-doc-1"}',
-            "beam_topology.json": b"{}",
-            "sheets/S001/content.md": b"# Sheet",
-            "sheets/S001/structure.json": b"{}",
+            "sheets/S001/context.md": b"# Sheet",
         }
+        artifact_path = "sheets/S001/views/V001/chunk_0001.json"
+        artifact = {"path": artifact_path, "schema": "openviking.dwg-json-chunk/v1"}
+        sheet_json = [artifact]
+        root_json = []
+        files[artifact_path] = b"{}"
+        if failure == "missing":
+            del files[artifact_path]
+        elif failure == "malformed":
+            files[artifact_path] = b"{"
+        elif failure == "encoding":
+            files[artifact_path] = b'"\xff"'
+        elif failure == "nan":
+            files[artifact_path] = b'{"value": NaN}'
+        elif failure == "duplicate":
+            sheet_json.append(artifact.copy())
+        elif failure == "escape":
+            artifact["path"] = "sheets/S001/../S002/chunk_0001.json"
+        elif failure == "ownership":
+            artifact["path"] = "sheets/S002/chunk_0001.json"
+        elif failure == "root_ownership":
+            root_json = sheet_json
+            sheet_json = []
+        elif failure == "reserved":
+            artifact["path"] = "sheets/S001/manifest.json"
         for name, content in files.items():
             viking_fs.files[f"{staging}/{name}"] = content
         return SimpleNamespace(
             temp_dir_path="viking://temp/job",
             meta={
                 "temp_root_uri": staging,
-                "document_manifest": "document.json",
-                "beam_topology": "beam_topology.json",
+                "json_artifacts": root_json,
                 "sheet_bundles": [
                     {
                         "sheet_id": "S001",
                         "directory": "sheets/S001",
-                        "content_path": "sheets/S001/content.md",
-                        "structure_path": "sheets/S001/structure.json",
+                        "content_path": "sheets/S001/context.md",
+                        "json_artifacts": sheet_json,
+                        "kind": "model_frame",
                     }
                 ],
             },
@@ -466,7 +834,7 @@ async def test_dwg_bundle_failure_leaves_no_published_tree(tmp_path, monkeypatch
     monkeypatch.setattr(resource_service_module, "find_resource_bundle_root", no_parent_bundle)
     monkeypatch.setattr("openviking.parse.parsers.dwg.DWGParser.parse", parse_dwg)
 
-    with pytest.raises(RuntimeError, match="semantic failed"):
+    with pytest.raises(RuntimeError, match=message):
         await service.add_resource(
             path=str(source),
             ctx=ctx,
@@ -484,16 +852,14 @@ async def test_dwg_bundle_failure_leaves_no_published_tree(tmp_path, monkeypatch
 async def test_dwg_sheet_directories_cannot_overlap(ctx):
     viking_fs = _BundleFS()
     service = _bundle_service(viking_fs)
-    service._summarize_bundle_staging = AsyncMock(return_value={})
+    service._summarize_bundle_staging_batch = AsyncMock(return_value={})
     staging = "viking://temp/job/plan_dwg"
     files = {
         "plan.dwg": b"dwg snapshot",
-        "document.json": b'{"document_id":"dwg-doc-1"}',
-        "beam_topology.json": b"{}",
-        "sheets/S001/content.md": b"# Sheet",
-        "sheets/S001/structure.json": b"{}",
-        "sheets/S001/detail/content.md": b"# Nested",
-        "sheets/S001/detail/structure.json": b"{}",
+        "sheets/S001/context.md": b"# Sheet",
+        "sheets/S001/sheet.dwg": b"AC1027sheet",
+        "sheets/S001/detail/context.md": b"# Nested",
+        "sheets/S001/detail/sheet.dwg": b"AC1027nested",
     }
     for name, content in files.items():
         viking_fs.files[f"{staging}/{name}"] = content
@@ -502,20 +868,20 @@ async def test_dwg_sheet_directories_cannot_overlap(ctx):
         await service._assemble_dwg_sheet_bundles(
             staging_uri=staging,
             parsed_meta={
-                "document_manifest": "document.json",
-                "beam_topology": "beam_topology.json",
                 "sheet_bundles": [
                     {
                         "sheet_id": "S001",
                         "directory": "sheets/S001",
-                        "content_path": "sheets/S001/content.md",
-                        "structure_path": "sheets/S001/structure.json",
+                        "content_path": "sheets/S001/context.md",
+                        "dwg_path": "sheets/S001/sheet.dwg",
+                        "kind": "model_frame",
                     },
                     {
                         "sheet_id": "S002",
                         "directory": "sheets/S001/detail",
-                        "content_path": "sheets/S001/detail/content.md",
-                        "structure_path": "sheets/S001/detail/structure.json",
+                        "content_path": "sheets/S001/detail/context.md",
+                        "dwg_path": "sheets/S001/detail/sheet.dwg",
+                        "kind": "model_frame",
                     },
                 ],
             },
@@ -582,8 +948,8 @@ async def test_dwg_bundle_indexes_only_sheet_markdown(monkeypatch, ctx):
             {
                 "directory": "sheets/S001",
                 "content_paths": [
-                    "sheets/S001/content_001.md",
-                    "sheets/S001/content_002.md",
+                    "sheets/S001/context_001.md",
+                    "sheets/S001/context_002.md",
                 ],
             }
         ],
@@ -594,7 +960,7 @@ async def test_dwg_bundle_indexes_only_sheet_markdown(monkeypatch, ctx):
         "viking://resources/plan/sheets/S001",
         ctx,
         scalar_override={"search_tags": ["kind=dwg-sheet"]},
-        include_files={"content_001.md", "content_002.md"},
+        include_files={"context_001.md", "context_002.md"},
         include_directory_meta=False,
     )
 

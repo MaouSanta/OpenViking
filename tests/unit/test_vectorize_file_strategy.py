@@ -176,6 +176,83 @@ async def test_vectorize_file_uses_summary_first(monkeypatch):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("text_source", ["summary_first", "content_only"])
+@pytest.mark.parametrize(
+    "filename,content,blocked",
+    [
+        pytest.param(
+            "drawing.json",
+            '{\n  "schema": "openviking.dwg-json/v1",\n  "records": [{"x": 1}]}',
+            True,
+            id="dwg-whole-data-without-manifest",
+        ),
+        pytest.param(
+            "metadata.json",
+            '{\n  "schema": "openviking.dwg-json/v1",\n  "records": [',
+            True,
+            id="truncated-dwg-whole-data-without-manifest",
+        ),
+        pytest.param(
+            "arbitrary.json",
+            '{"schema":"openviking.dwg-json-chunk/v1","records":[{"x":1}]}',
+            True,
+            id="dwg-schema-without-manifest",
+        ),
+        pytest.param(
+            "arbitrary.json",
+            '{"schema":"openviking.dwg-json-chunk/v1","records":[',
+            True,
+            id="truncated-dwg-schema-without-manifest",
+        ),
+        pytest.param(
+            "arbitrary.json",
+            '{"note":"openviking.dwg-json-chunk/v1","records":[{"x":1}]}',
+            False,
+            id="ordinary-json",
+        ),
+        pytest.param(
+            "arbitrary.json",
+            '{"note":"openviking.dwg-json-chunk/v1","records":[',
+            False,
+            id="ordinary-malformed-json",
+        ),
+        pytest.param("context.md", "# Sheet\nConcrete notes", False, id="markdown"),
+    ],
+)
+async def test_vectorize_file_excludes_dwg_data_even_with_cached_summary(
+    monkeypatch, text_source, filename, content, blocked
+):
+    queue = DummyQueue()
+    fs = DummyFS(content)
+    monkeypatch.setattr(embedding_utils, "get_queue_manager", lambda: DummyQueueManager(queue))
+    monkeypatch.setattr(embedding_utils, "get_viking_fs", lambda: fs)
+    monkeypatch.setattr(
+        embedding_utils,
+        "get_openviking_config",
+        lambda: types.SimpleNamespace(
+            embedding=types.SimpleNamespace(text_source=text_source, max_input_tokens=1000)
+        ),
+    )
+    stale_summary = "Previously generated summary"
+
+    await embedding_utils.vectorize_file(
+        file_path=f"viking://user/default/resources/{filename}",
+        summary_dict={"name": filename, "summary": stale_summary},
+        parent_uri="viking://user/default/resources",
+        ctx=DummyReq(),
+    )
+
+    if blocked:
+        assert queue.items == []
+    else:
+        assert len(queue.items) == 1
+        assert queue.items[0].message == (
+            stale_summary if text_source == "summary_first" else content
+        )
+        assert queue.items[0].context_data["content"] == content
+
+
+@pytest.mark.asyncio
 async def test_vectorize_file_registers_request_wait_with_embedding_msg_id(monkeypatch):
     queue = DummyQueueWithId()
     registered = []
@@ -282,6 +359,7 @@ async def test_vectorize_file_propagates_enqueue_failure(monkeypatch):
 @pytest.mark.asyncio
 async def test_vectorize_directory_propagates_enqueue_failures_and_drains_tracker(monkeypatch):
     decrement = AsyncMock()
+    monkeypatch.setattr(embedding_utils, "get_viking_fs", lambda: DummyFS(""))
     monkeypatch.setattr(
         embedding_utils, "get_queue_manager", lambda: DummyQueueManager(FailingQueue())
     )
@@ -859,8 +937,8 @@ async def test_index_resource_can_limit_files_without_directory_meta(monkeypatch
 
         async def ls(self, uri, node_limit=None, ctx=None):
             return [
-                {"name": "content.md", "isDir": False},
-                {"name": "structure.json", "isDir": False},
+                {"name": "context.md", "isDir": False},
+                {"name": "sheet.dwg", "isDir": False},
                 {"name": "manifest.json", "isDir": False},
             ]
 
@@ -874,14 +952,62 @@ async def test_index_resource_can_limit_files_without_directory_meta(monkeypatch
     await embedding_utils.index_resource(
         "viking://resources/plan/sheets/S001",
         DummyReq(),
-        include_files={"content.md"},
+        include_files={"context.md"},
         include_directory_meta=False,
     )
 
     assert fs.meta_reads == []
     vectorize_meta.assert_not_awaited()
     vectorize_file.assert_awaited_once()
-    assert vectorize_file.await_args.kwargs["file_path"].endswith("/content.md")
+    assert vectorize_file.await_args.kwargs["file_path"].endswith("/context.md")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("has_ordinary_json", [False, True])
+async def test_index_resource_excludes_dwg_only_directory_cached_semantics(
+    monkeypatch, has_ordinary_json
+):
+    root = "viking://user/default/resources/arbitrary"
+    files = {
+        ".abstract.md": "Stale abstract of DWG JSON",
+        ".overview.md": "Stale overview of DWG JSON",
+        "evidence.json": '{"schema":"openviking.dwg-json-chunk/v1","records":[]}',
+    }
+    if has_ordinary_json:
+        files["ordinary.json"] = '{"note":"Process ordinary JSON"}'
+
+    class ArtifactFS(DummyFS):
+        async def ls(self, uri, **kwargs):
+            return [{"name": name, "isDir": False} for name in files] if uri == root else []
+
+        async def exists(self, uri, **kwargs):
+            return uri.removeprefix(f"{root}/") in files
+
+        async def read_file(self, uri, **kwargs):
+            return files[uri.removeprefix(f"{root}/")]
+
+    queue = DummyQueue()
+    monkeypatch.setattr(embedding_utils, "get_queue_manager", lambda: DummyQueueManager(queue))
+    monkeypatch.setattr(embedding_utils, "get_viking_fs", lambda: ArtifactFS(""))
+    monkeypatch.setattr(
+        embedding_utils,
+        "get_openviking_config",
+        lambda: types.SimpleNamespace(
+            embedding=types.SimpleNamespace(text_source="content_only", max_input_tokens=1000)
+        ),
+    )
+
+    await embedding_utils.index_resource(root, DummyReq())
+
+    if has_ordinary_json:
+        assert len(queue.items) == 3
+        assert {item.context_data["uri"] for item in queue.items} == {
+            root,
+            f"{root}/ordinary.json",
+        }
+        assert queue.items[-1].message == files["ordinary.json"]
+    else:
+        assert queue.items == []
 
 
 def test_truncate_abstract_bytes_caps_below_byte_limit():

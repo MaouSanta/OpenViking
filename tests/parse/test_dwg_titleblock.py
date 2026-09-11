@@ -1,4 +1,4 @@
-from openviking.parse.parsers.dwg_sheet import _extract_meta, _title
+from openviking.parse.parsers.dwg_sheet import _extract_meta, build_sheet_artifacts
 from openviking.parse.parsers.dwg_titleblock import extract_titleblock_meta
 
 
@@ -61,17 +61,39 @@ def test_extract_titleblock_meta_requires_a_titleblock_anchor_cluster():
     assert extract_titleblock_meta(records, (0, 0, 1000, 1000)) == ({}, set())
 
 
-def test_sheet_title_compacts_cjk_display_spacing_without_using_header_labels():
-    classified = {
-        "meta": {},
-        "labels": [
-            {"text": "图 纸 目 录", "role": "label", "count": 1},
-            {"text": "图 纸 名 称", "role": "label", "count": 1},
-        ],
-        "unassigned": [],
+def test_sheet_title_does_not_guess_from_body_or_directory_header_labels():
+    drawing = {
+        "OBJECTS": [
+            {"object": "BLOCK_HEADER", "handle": [0, 0, 1], "name": "*Model_Space"},
+            {
+                "entity": "LWPOLYLINE",
+                "handle": [0, 0, 2],
+                "ownerhandle": [0, 0, 1],
+                "flag": 1,
+                "points": [[0, 0], [100, 0], [100, 100], [0, 100]],
+            },
+            {
+                "entity": "TEXT",
+                "handle": [0, 0, 3],
+                "ownerhandle": [0, 0, 1],
+                "ins_pt": [10, 20],
+                "height": 2,
+                "text_value": "图 纸 目 录",
+            },
+            {
+                "entity": "TEXT",
+                "handle": [0, 0, 4],
+                "ownerhandle": [0, 0, 1],
+                "ins_pt": [30, 20],
+                "height": 2,
+                "text_value": "图 纸 名 称",
+            },
+        ]
     }
-
-    assert _title(classified, "Sheet 001") == "图纸目录"
+    result = build_sheet_artifacts(
+        drawing, source_name="headers.dwg", source_sha256="a" * 64, source_size_bytes=1
+    )
+    assert result["sheets"][0]["title"] == "Sheet 001"
 
 
 def test_sheet_meta_does_not_pair_adjacent_directory_headers_as_values():

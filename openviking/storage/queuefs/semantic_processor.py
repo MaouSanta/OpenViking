@@ -272,6 +272,12 @@ class SemanticProcessor(DequeueHandlerBase):
     async def _enqueue_parent_refresh(self, msg: SemanticMsg, uri: str) -> None:
         if msg.context_type not in {"resource", "skill"}:
             return
+        from openviking.resource.atomic_bundle import is_dwg_parser_data
+
+        if await is_dwg_parser_data(
+            get_viking_fs(), uri, ctx=self._ctx_from_semantic_msg(msg), is_directory=True
+        ):
+            return
         parent = VikingURI(uri).parent
         if parent is None:
             return
@@ -463,6 +469,7 @@ class SemanticProcessor(DequeueHandlerBase):
                                     skip_vectorization=msg.skip_vectorization,
                                     ingest_options=msg.ingest_options,
                                     bundle_assembly=msg.bundle_assembly,
+                                    summary_files=msg.summary_files,
                                     coalesce_key=msg.coalesce_key,
                                     coalesce_version=msg.coalesce_version,
                                 )
@@ -1225,6 +1232,10 @@ class SemanticProcessor(DequeueHandlerBase):
             decoded "content" so vectorization can avoid re-reading the same file.
         """
         file_name = file_path.split("/")[-1]
+        from openviking.resource.atomic_bundle import is_dwg_parser_data
+
+        if await is_dwg_parser_data(get_viking_fs(), file_path, ctx=ctx):
+            return {"name": file_name, "summary": ""}
         llm_sem = llm_sem or asyncio.Semaphore(self.max_concurrent_llm)
         media_type = get_media_type(file_name, None)
         if file_name.lower().endswith(".ts"):

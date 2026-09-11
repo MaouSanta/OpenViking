@@ -5,13 +5,14 @@
 from __future__ import annotations
 
 import hashlib
-import io
 import math
 import re
 import statistics
 import unicodedata
 from bisect import bisect_right
-from collections import Counter, defaultdict
+from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
+from contextvars import copy_context
 from typing import Any, Callable, Iterable
 
 from openviking.parse.parsers.dwg_sheet_geometry import (
@@ -23,7 +24,6 @@ from openviking_cli.utils.config.parser_config import ParserConfig
 from openviking_cli.utils.uri import VikingURI
 
 SHEET_DOCUMENT_SCHEMA = "openviking.dwg-document/v1"
-SHEET_STRUCTURE_SCHEMA = "openviking.dwg-sheet-structure/v1"
 
 _FORMAT_RE = re.compile(r"\\(?:A\d+|C\d+|F[^;]*|f[^;]*|H[^;]*|Q[^;]*|T[^;]*|W[^;]*);", re.I)
 _FIELD_RE = re.compile(
@@ -34,31 +34,18 @@ _META_KEYS = tuple(
     "项目名称 建设单位 设计单位 图纸名称 图名 图号 专业 比例 日期 出图日期 修订 版本 页码 设计 校对 审核 批准".split()
 )
 _META_HEADER_LABELS = set(_META_KEYS) | {"图别", "序号", "图幅", "备注", "图纸目录"}
-_DIRECTIVE_RE = re.compile(
-    r"(?:不得|严禁|应当|应按|应采用|须|封堵|预留|待.+后|施工要求|安装要求|注意事项)"
-)
-_ROOM_RE = re.compile(r"(?:室|间|厅|房|井|库|站|区|平台|楼梯|走道|通道)$")
-_IDENTIFIER_RE = re.compile(r"^(?=.*[A-Za-z])(?=.*\d)[A-Za-z0-9_.-]{3,}$")
-_DIMENSION_RE = re.compile(
-    r"^(?:[±+-]?\d+(?:\.\d+)?|[ΦØRr]\s*\d+|.*(?:标高|尺寸|\d\s*[xX×]\s*\d).*)$"
-)
 _MARKER_RE = re.compile(r"^\s*([□■☐☑☒○●◯✓√×✕])\s*(.*)$")
-_FRAME_NAME_RE = re.compile(
-    r"(?:图框|图签|图纸目录|title\s*block|border|sheet\s*frame)", re.I
-)
+_FRAME_NAME_RE = re.compile(r"(?:图框|图签|图纸目录|title\s*block|border|sheet\s*frame)", re.I)
 _CJK_RE = re.compile(r"[\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af]")
 _NONSPACE_RE = re.compile(r"[^\s]")
 _NUMBERED_RE = re.compile(
     r"^\s*((?:[1-9]\d?(?:\.\d+)+)(?=[^\d.])|"
     r"(?:[1-9]\d?(?:\.\d+){2,})$|(?:[1-9]\d?)[.．](?=\D))"
 )
-_TOP_LEVEL_RE = re.compile(r"^\s*([1-9]\d?)[.．](?=\D)")
 _FORM_SLOT_RE = re.compile(r"(?<=\S) {2,}(?=\S)")
-_TITLE_SUFFIX_RE = re.compile(
-    r"(?:图|说明|目录|清单|表|专篇|大样)(?:[一二三四五六七八九十]|[（(][一二三四五六七八九十][)）])?$"
-)
 
-SheetModeClassifier = Callable[[bytes, dict[str, Any]], dict[str, Any] | str | None]
+RegionClassifier = Callable[[bytes, dict[str, Any]], dict[str, Any] | None]
+SheetRenderer = Callable[[tuple[float, float, float, float]], bytes]
 
 
 def _ref(value: Any) -> Any:
@@ -81,8 +68,7 @@ def _decode_text_codes(text: str) -> str:
     text = re.sub(r"%%D", "°", text, flags=re.I)
     text = re.sub(r"%%C", "⌀", text, flags=re.I)
     return "".join(
-        f"⟦SHX:0x{ord(char):02X}⟧" if 0x80 <= ord(char) <= 0x9F else char
-        for char in text
+        f"⟦SHX:0x{ord(char):02X}⟧" if 0x80 <= ord(char) <= 0x9F else char for char in text
     )
 
 
@@ -288,6 +274,7 @@ def _walk_block(block_handle: Any, graph: dict[str, Any]) -> dict[str, list[dict
         "objects": [],
     }
     identity = (1.0, 0.0, 0.0, 1.0, 0.0, 0.0)
+    open_rectangles = []
 
     def visit(
         current: Any, matrix: tuple[float, ...], path: list[Any], stack: frozenset[Any]
@@ -368,24 +355,34 @@ def _walk_block(block_handle: Any, graph: dict[str, Any]) -> dict[str, list[dict
                     orthogonal = all(
                         abs(a[0] - b[0]) <= 1e-6 * max(1.0, abs(a[0]), abs(b[0]))
                         or abs(a[1] - b[1]) <= 1e-6 * max(1.0, abs(a[1]), abs(b[1]))
-                        for a, b in pairs
+                        for a, b in [*pairs, (points[-1], points[0])]
                     )
-                    if box and closed and len(vertices) == 4 and orthogonal:
-                        result["frames"].append(
-                            {
-                                "bbox": box,
-                                "source_kind": "closed_polyline",
-                                "source_ref": _source_ref(record, path),
-                                "confidence": "candidate",
-                            }
-                        )
+                    if box and len(vertices) == 4 and orthogonal:
+                        frame = {
+                            "bbox": box,
+                            "source_kind": "closed_polyline",
+                            "source_ref": _source_ref(record, path),
+                            "confidence": "candidate",
+                        }
+                        if closed:
+                            result["frames"].append(frame)
+                        elif (
+                            _box_area(box) > 0
+                            and len(set(vertices)) == 4
+                            and not any(record.get("bulges") or [])
+                        ):
+                            open_rectangles.append((frame, points[0], points[-1]))
             elif kind == "CIRCLE":
                 local_center = _point(record.get("center"))
                 radius = record.get("radius")
                 if local_center and isinstance(radius, (int, float)) and radius > 0:
                     center = _matrix_apply(matrix, local_center)
-                    edge_x = _matrix_apply(matrix, (local_center[0] + float(radius), local_center[1]))
-                    edge_y = _matrix_apply(matrix, (local_center[0], local_center[1] + float(radius)))
+                    edge_x = _matrix_apply(
+                        matrix, (local_center[0] + float(radius), local_center[1])
+                    )
+                    edge_y = _matrix_apply(
+                        matrix, (local_center[0], local_center[1] + float(radius))
+                    )
                     radius_x, radius_y = math.dist(center, edge_x), math.dist(center, edge_y)
                     result["frames"].append(
                         {
@@ -481,6 +478,20 @@ def _walk_block(block_handle: Any, graph: dict[str, Any]) -> dict[str, list[dict
                 )
 
     visit(block_handle, identity, [], frozenset())
+    # Some native borders are a three-sided polyline plus an independent LINE.
+    # Require its actual complete closing edge in the same placed block; do not
+    # invent a segment, bridge gaps, or change any native points/closed flags.
+    line_edges = {
+        (tuple(line["instance_path"]), frozenset((line["a"], line["b"]))): line["source_ref"]
+        for line in result["lines"]
+        if _kind(line["record"]) == "LINE"
+    }
+    for frame, start, end in open_rectangles:
+        key = (tuple(frame["source_ref"].get("instance_path", [])), frozenset((start, end)))
+        if closing_line := line_edges.get(key):
+            frame["source_kind"] = "polyline_with_line"
+            frame["source_ref"]["closing_line"] = closing_line
+            result["frames"].append(frame)
     deduplicated = {record["uid"]: record for record in result["texts"]}
     result["texts"] = list(deduplicated.values())
     return result
@@ -490,7 +501,8 @@ def _select_frames(space: dict[str, list[dict[str, Any]]]) -> list[dict[str, Any
     frames = [
         frame
         for frame in space["frames"]
-        if frame.get("source_kind") in {"frame_block", "block_bbox", "closed_polyline"}
+        if frame.get("source_kind")
+        in {"frame_block", "block_bbox", "closed_polyline", "polyline_with_line"}
     ]
     if not frames:
         return []
@@ -498,35 +510,21 @@ def _select_frames(space: dict[str, list[dict[str, Any]]]) -> list[dict[str, Any
     # objects. Nested rectangles are rooms, symbols, tables, and block internals.
     # ponytail: fall back to nested candidates only if a future corpus groups all
     # physical sheets inside one master INSERT.
-    top_level = [
-        frame for frame in frames if not frame.get("source_ref", {}).get("instance_path")
-    ]
+    top_level = [frame for frame in frames if not frame.get("source_ref", {}).get("instance_path")]
     candidates = top_level or frames
-    extent = _bbox(
-        [record["point"] for record in space["texts"] if record["point"]]
-        + [line[endpoint] for line in space["lines"] for endpoint in ("a", "b")]
-    )
-    span_x = max(1.0, (extent[2] - extent[0]) if extent else 1.0)
-    span_y = max(1.0, (extent[3] - extent[1]) if extent else 1.0)
-    repeated_blocks = {
-        name
-        for name, count in Counter(
-            frame.get("block_name") for frame in candidates if frame.get("block_name")
-        ).items()
-        if count >= 2
-    }
+    # Compare frame sizes to candidate frames, not distant unframed geometry.
+    # Otherwise one stray line can shrink every real Sheet below the size cutoff.
+    span_x = max(1.0, *(frame["bbox"][2] - frame["bbox"][0] for frame in candidates))
+    span_y = max(1.0, *(frame["bbox"][3] - frame["bbox"][1] for frame in candidates))
     filtered = []
     for frame in candidates:
         box = frame["bbox"]
         width, height = box[2] - box[0], box[3] - box[1]
-        block_name = frame.get("block_name")
+        if width <= 0 or height <= 0:
+            continue
         aspect = width / max(height, 1e-12)
         large_enough = max(width / span_x, height / span_y) >= 0.06
-        if frame["source_kind"] == "frame_block" or block_name in repeated_blocks or (
-            0.28 <= aspect <= 3.6 and large_enough
-        ):
-            text_count = sum(_inside(box, record["point"]) for record in space["texts"])
-            frame = {**frame, "text_count": text_count}
+        if frame["source_kind"] == "frame_block" or (0.28 <= aspect <= 3.6 and large_enough):
             filtered.append(frame)
     dimension_groups: list[list[dict[str, Any]]] = []
     for frame in filtered:
@@ -556,7 +554,7 @@ def _select_frames(space: dict[str, list[dict[str, Any]]]) -> list[dict[str, Any
         repeated_ids = {id(frame) for frame in repeated}
         retained_unique = []
         for frame in filtered:
-            if id(frame) in repeated_ids or frame["text_count"] < 1:
+            if id(frame) in repeated_ids:
                 continue
             contained_centers = {
                 (
@@ -564,14 +562,14 @@ def _select_frames(space: dict[str, list[dict[str, Any]]]) -> list[dict[str, Any
                     round((other["bbox"][1] + other["bbox"][3]) / 2, 6),
                 )
                 for other in repeated
-                if _contains(frame["bbox"], other["bbox"])
+                # Repeated component bounds are not evidence of separate Sheets.
+                if other["source_kind"] in {"closed_polyline", "polyline_with_line", "frame_block"}
+                and _contains(frame["bbox"], other["bbox"])
                 and _box_area(other["bbox"]) < _box_area(frame["bbox"])
             }
             if not contained_centers:
                 retained_unique.append(frame)
         filtered = repeated + retained_unique
-    else:
-        filtered = [frame for frame in filtered if frame["text_count"] >= 1]
     accepted: list[dict[str, Any]] = []
     for frame in sorted(filtered, key=lambda item: _box_area(item["bbox"]), reverse=True):
         box = frame["bbox"]
@@ -654,7 +652,10 @@ def _extract_meta(
     fields = {
         str(key): _clean_text(value)
         for key, value in summary.items()
-        if value not in (None, "", [], {}) and isinstance(value, (str, int, float))
+        if value not in (None, "", [], {})
+        and isinstance(value, (str, int, float))
+        and str(key).casefold() != "lastsavedby"
+        and not str(key).casefold().startswith("unknown")
     }
     used: set[str] = set()
     for record in records:
@@ -697,8 +698,6 @@ def _classify_sheet(
     sheet_bbox: tuple[float, float, float, float] | None,
 ) -> dict[str, Any]:
     meta, used = _extract_meta(records, summary, sheet_bbox)
-    category_uids: dict[str, set[str]] = defaultdict(set)
-    category_uids["meta"].update(used)
     tables = _native_tables(objects, sheet_bbox)
     # ponytail: dense plans contain hundreds of thousands of orthogonal segments;
     # exhaustive grid reconstruction is for document/table sheets, not floor plans.
@@ -712,8 +711,6 @@ def _classify_sheet(
         table_uids = table.pop("text_uids", [])
         table["_text_uids"] = table_uids
         used.update(table_uids)
-        category_uids["tables"].update(table_uids)
-    notes, directives = [], []
     option_groups = detect_marker_groups(frames, lines, records)
     markers = [marker for group in option_groups for marker in group["markers"]]
     text_uids_by_ref = {
@@ -729,15 +726,8 @@ def _classify_sheet(
             ),
             None,
         )
-    marker_label_uids = {
-        uid for group in option_groups for uid in group.pop("text_uids", [])
-    }
+    marker_label_uids = {uid for group in option_groups for uid in group.pop("text_uids", [])}
     used.update(marker_label_uids)
-    category_uids["markers"].update(marker_label_uids)
-    labels: Counter[tuple[str, str]] = Counter()
-    unassigned: Counter[str] = Counter()
-    refs: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
-    unassigned_refs: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for record in records:
         if record["uid"] in used:
             continue
@@ -769,58 +759,7 @@ def _classify_sheet(
                     "_label_uid": record["uid"],
                 }
             )
-            category_uids["markers"].add(record["uid"])
-        elif _DIRECTIVE_RE.search(text):
-            directives.append(
-                {
-                    "directive_id": f"D{len(directives) + 1:04d}",
-                    "text": text,
-                    "target": None,
-                    "binding": "unresolved",
-                    "source_refs": [source],
-                }
-            )
-            category_uids["directives"].add(record["uid"])
-        elif len(text) >= 100 or "\n" in text or re.match(r"^\d+(?:\.\d+)+[.、．\s]", text):
-            notes.append({"text": text, "source_refs": [source]})
-            category_uids["notes"].add(record["uid"])
-        else:
-            compact = text.replace("\n", " ").strip()
-            if _ROOM_RE.search(compact):
-                role = "spatial_label"
-            elif _IDENTIFIER_RE.match(compact):
-                role = "identifier"
-            elif _DIMENSION_RE.match(compact):
-                role = "dimension"
-            elif len(compact) <= 40:
-                role = "label"
-            else:
-                unassigned[compact] += 1
-                unassigned_refs[compact].append(source)
-                category_uids["unassigned"].add(record["uid"])
-                continue
-            labels[(compact, role)] += 1
-            refs[(compact, role)].append(source)
-            category_uids["labels"].add(record["uid"])
-    label_rows = [
-        {"text": text, "role": role, "count": count, "source_refs": refs[(text, role)]}
-        for (text, role), count in sorted(labels.items(), key=lambda item: (item[0][1], item[0][0]))
-    ]
-    unresolved = [
-        {"text": text, "count": count, "source_refs": unassigned_refs[text]}
-        for text, count in sorted(unassigned.items())
-    ]
-    return {
-        "meta": meta,
-        "tables": tables,
-        "notes": notes,
-        "directives": directives,
-        "markers": markers,
-        "option_groups": option_groups,
-        "labels": label_rows,
-        "unassigned": unresolved,
-        "_category_uids": {key: sorted(values) for key, values in category_uids.items()},
-    }
+    return {"meta": meta, "tables": tables, "markers": markers}
 
 
 def _document_column_anchors(
@@ -865,46 +804,136 @@ def _document_column_anchors(
     return anchors or ([min(positioned)] if positioned else [])
 
 
-def _native_sheet_mode(
+def _boxes_intersect(first: tuple[float, ...], second: tuple[float, ...]) -> bool:
+    return not (
+        first[2] < second[0] or second[2] < first[0] or first[3] < second[1] or second[3] < first[1]
+    )
+
+
+def _functional_regions(
+    candidate: dict[str, Any],
+    classifier: RegionClassifier | None,
+    renderer: SheetRenderer | None,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Select prose/table areas once; unselected drawing content stays native JSON."""
+    sheet_box = candidate.get("bbox")
+    if candidate["kind"] != "model_frame" or not sheet_box:
+        return [], {"status": "unsupported_sheet"}
+    if classifier is None:
+        return [], {"status": "unavailable"}
+    if renderer is None:
+        return [], {"status": "unavailable", "render_error": "sheet_renderer_not_supplied"}
+    render_error = None
+
+    def classify(box: tuple[float, ...]) -> dict[str, Any]:
+        nonlocal render_error
+        try:
+            image = renderer(box)
+            if not image:
+                raise ValueError("empty_sheet_render")
+        except Exception as exc:
+            # Only renderer errors are retained, never provider response details.
+            render_error = str(exc).replace("\n", " ")[:240]
+            raise
+        result = classifier(
+            image,
+            {
+                "bbox": list(box),
+                "sheet_bbox": list(sheet_box),
+                "coordinate_system": "CAD world coordinates; x right, y up",
+            },
+        )
+        if isinstance(result, dict) and result.get("is_sheet") is False:
+            return {"is_sheet": False}
+        values = result.get("regions") if isinstance(result, dict) else None
+        if not isinstance(values, list):
+            raise ValueError("missing_regions")
+        regions = []
+        for value in values:
+            if not isinstance(value, dict) or value.get("type") not in {
+                "document",
+                "table",
+                "unknown",
+            }:
+                raise ValueError("invalid_region_type")
+            raw_box = value.get("bbox")
+            if not isinstance(raw_box, (list, tuple)) or len(raw_box) != 4:
+                raise ValueError("invalid_region_bbox")
+            region_box = tuple(float(coordinate) for coordinate in raw_box)
+            if (
+                not all(math.isfinite(coordinate) for coordinate in region_box)
+                or _box_area(region_box) <= 0
+                or not _contains(box, region_box)
+            ):
+                raise ValueError("invalid_region_bbox")
+            regions.append(
+                {
+                    "type": value["type"],
+                    "bbox": list(region_box),
+                    "title": str(value.get("title") or ""),
+                }
+            )
+        return {"regions": regions}
+
+    try:
+        result = classify(tuple(sheet_box))
+    except Exception as exc:
+        diagnostic = {"status": "failed", "error": type(exc).__name__}
+        if render_error:
+            diagnostic["render_error"] = render_error
+        return [], diagnostic
+    if result.get("is_sheet") is False:
+        return [], {"status": "not_sheet"}
+    regions = result["regions"]
+    for index, region in enumerate(regions, 1):
+        region["id"] = f"R{index:03d}"
+    diagnostic = {"status": "used", "region_count": len(regions)}
+    return regions, diagnostic
+
+
+def _functional_documents(
+    regions: list[dict[str, Any]],
     records: list[dict[str, Any]],
     tables: list[dict[str, Any]],
-    sheet_bbox: tuple[float, float, float, float] | None,
-    excluded_uids: set[str],
-) -> dict[str, Any]:
-    body = [record for record in records if record["uid"] not in excluded_uids]
-    numbered = [record for record in body if _NUMBERED_RE.match(record["text"])]
-    top_levels = {
-        int(match.group(1))
-        for record in body
-        if (match := _TOP_LEVEL_RE.match(record["text"]))
-    }
-    anchors = _document_column_anchors(body, sheet_bbox, set())
-    narrative = sum(len(record["text"].replace("\n", "")) >= 24 for record in body)
-    score = sum(
-        (
-            2 if len(body) >= 80 else 0,
-            2 if len(numbered) >= 10 else 0,
-            2 if 2 <= len(anchors) <= 6 else 0,
-            2 if len(top_levels) >= 4 else 0,
-            1 if narrative >= 30 else 0,
-            1 if tables else 0,
+) -> tuple[list[dict[str, Any]], bool]:
+    """Select only text/table instances uniquely inside a prose region."""
+    selected: dict[str, set[str]] = defaultdict(set)
+    ambiguous = False
+    for record in records:
+        matches = [region for region in regions if _inside(region["bbox"], record["point"])]
+        if len(matches) > 1:
+            ambiguous = True
+        elif matches and matches[0]["type"] in {"document", "table"}:
+            selected[matches[0]["id"]].add(record["uid"])
+    documents = []
+    for region in regions:
+        if region["type"] not in {"document", "table"}:
+            continue
+        uids = selected[region["id"]]
+        table_indexes = []
+        for index, table in enumerate(tables):
+            box, anchor = table.get("bbox"), table.get("anchor")
+            inside = _contains(region["bbox"], box) if box else _inside(region["bbox"], anchor)
+            if not inside or not set(table.get("_text_uids", [])) <= uids:
+                continue
+            # Native tables may have only an insertion point, without TEXT records.
+            matches = [
+                other
+                for other in regions
+                if (_boxes_intersect(other["bbox"], box) if box else _inside(other["bbox"], anchor))
+            ]
+            if len(matches) == 1:
+                table_indexes.append(index)
+        documents.append(
+            {
+                "region_id": region["id"],
+                "bbox": region["bbox"],
+                "scope": "local",
+                "record_uids": uids,
+                "table_indexes": table_indexes,
+            }
         )
-    )
-    return {
-        "mode": "document" if score >= 7 else "drawing",
-        "method": "native_layout",
-        "confidence": min(0.98, 0.45 + score * 0.055),
-        "column_count": len(anchors),
-        "signals": {
-            "text_instances": len(body),
-            "numbered_instances": len(numbered),
-            "top_level_sections": len(top_levels),
-            "narrative_instances": narrative,
-            "table_count": len(tables),
-        },
-        "_column_anchors": anchors,
-        "_score": score,
-    }
+    return documents, ambiguous
 
 
 def _document_column_cuts(
@@ -929,136 +958,6 @@ def _document_column_cuts(
         # Keep right-aligned form values with the column that owns their template.
         cuts.append(max((gap_left + gap_right) / 2, right - (right - left) * 0.1))
     return cuts
-
-
-def _render_sheet_layout(
-    records: list[dict[str, Any]],
-    lines: list[dict[str, Any]],
-    sheet_bbox: tuple[float, float, float, float] | None,
-) -> bytes:
-    """Render one transient high-resolution layout image for mode classification."""
-    from PIL import Image, ImageDraw, ImageFont
-
-    box = sheet_bbox or _bbox(
-        [record["point"] for record in records if record.get("point")]
-        + [line[key] for line in lines for key in ("a", "b")]
-    )
-    if not box or box[2] <= box[0] or box[3] <= box[1]:
-        return b""
-    span_x, span_y = box[2] - box[0], box[3] - box[1]
-    max_dimension, margin = 1800, 24
-    scale = min((max_dimension - margin * 2) / span_x, (max_dimension - margin * 2) / span_y)
-    width = max(64, round(span_x * scale) + margin * 2)
-    height = max(64, round(span_y * scale) + margin * 2)
-    image = Image.new("RGB", (width, height), "black")
-    draw = ImageDraw.Draw(image)
-
-    def pixel(point: tuple[float, float]) -> tuple[int, int]:
-        return (
-            round((point[0] - box[0]) * scale) + margin,
-            height - margin - round((point[1] - box[1]) * scale),
-        )
-
-    anchors = _document_column_anchors(records, box, set())
-    cuts = _document_column_cuts(records, anchors, set()) if len(anchors) > 1 else []
-    nominal_column_width = span_x / max(len(anchors), 1)
-
-    def fitted(value: str, font: Any, max_width: float) -> str:
-        value = value.replace("\n", " ")[:120]
-        if draw.textlength(value, font=font) <= max_width:
-            return value
-        low, high = 0, len(value)
-        while low < high:
-            middle = (low + high + 1) // 2
-            if draw.textlength(value[:middle], font=font) <= max_width:
-                low = middle
-            else:
-                high = middle - 1
-        return value[:low]
-
-    for line in lines:
-        draw.line((pixel(line["a"]), pixel(line["b"])), fill=(105, 105, 105), width=1)
-    font_path = "/System/Library/Fonts/Supplemental/Arial Unicode.ttf"
-    fonts: dict[int, Any] = {}
-    for record in records:
-        if not record.get("point"):
-            continue
-        size = max(6, min(28, round(max(record.get("height", 0.0), span_y / 500) * scale)))
-        if size not in fonts:
-            try:
-                fonts[size] = ImageFont.truetype(font_path, size)
-            except OSError:
-                fonts[size] = ImageFont.load_default()
-        column = bisect_right(cuts, record["point"][0])
-        right = cuts[column] if column < len(cuts) else box[2]
-        max_width = max(1.0, min(right - record["point"][0], nominal_column_width * 0.95) * scale)
-        draw.text(
-            pixel(record["point"]),
-            fitted(record["text"], fonts[size], max_width),
-            fill="white",
-            font=fonts[size],
-        )
-    output = io.BytesIO()
-    image.save(output, format="PNG", optimize=True)
-    return output.getvalue()
-
-
-def _sheet_mode(
-    records: list[dict[str, Any]],
-    lines: list[dict[str, Any]],
-    tables: list[dict[str, Any]],
-    sheet_bbox: tuple[float, float, float, float] | None,
-    excluded_uids: set[str],
-    classifier: SheetModeClassifier | None,
-) -> dict[str, Any]:
-    mode = _native_sheet_mode(records, tables, sheet_bbox, excluded_uids)
-    should_look = (
-        classifier is not None
-        and mode["signals"]["text_instances"] >= 80
-        and (
-            mode["signals"]["numbered_instances"] >= 6
-            or mode["signals"]["narrative_instances"] >= 30
-        )
-    )
-    if not should_look:
-        return mode
-    try:
-        image = _render_sheet_layout(records, lines, sheet_bbox)
-    except Exception as exc:
-        mode["vlm"] = {"status": "render_failed", "error": type(exc).__name__}
-        return mode
-    if not image:
-        return mode
-    evidence = {key: value for key, value in mode.items() if not key.startswith("_")}
-    try:
-        result = classifier(image, evidence)
-    except Exception as exc:
-        mode["vlm"] = {"status": "failed", "error": type(exc).__name__}
-        return mode
-    if isinstance(result, str):
-        result = {"mode": result}
-    if not isinstance(result, dict) or result.get("mode") not in {"document", "drawing"}:
-        mode["vlm"] = {"status": "invalid_response"}
-        return mode
-    try:
-        confidence = float(result.get("confidence", 0.0) or 0.0)
-    except (TypeError, ValueError, OverflowError):
-        confidence = 0.0
-    confidence = min(1.0, max(0.0, confidence)) if math.isfinite(confidence) else 0.0
-    mode["vlm"] = {
-        "status": "used",
-        "mode": result["mode"],
-        "confidence": confidence,
-        "reason": str(result.get("reason") or "")[:240],
-    }
-    agrees = result["mode"] == mode["mode"]
-    if confidence >= 0.7 and (agrees or confidence > mode["confidence"]):
-        mode.update(
-            mode=result["mode"],
-            method="native_layout+vlm",
-            confidence=max(mode["confidence"], confidence) if agrees else confidence,
-        )
-    return mode
 
 
 def _form_raw_text(event: dict[str, Any]) -> str | None:
@@ -1131,9 +1030,10 @@ def _roman_i_glyph(segments: list[dict[str, Any]], height: float) -> str | None:
                 continue
             left, right = sorted((cap["a"][0], cap["b"][0]))
             y = (cap["a"][1] + cap["b"][1]) / 2
-            if left - height * 0.05 <= x <= right + height * 0.05 and min(
-                abs(y - bottom), abs(y - top)
-            ) <= height * 0.06:
+            if (
+                left - height * 0.05 <= x <= right + height * 0.05
+                and min(abs(y - bottom), abs(y - top)) <= height * 0.06
+            ):
                 caps.append((index, y))
         if len(caps) != 2 or abs(caps[0][1] - caps[1][1]) < height * 0.4:
             return None
@@ -1217,7 +1117,10 @@ def _exploded_form_glyphs(
                     "kind": "text",
                     "uid": f"glyph:{record['uid']}:{slot_number}",
                     "text": glyph,
-                    "point": (min(min(line["a"][0], line["b"][0]) for line in candidates), record["point"][1]),
+                    "point": (
+                        min(min(line["a"][0], line["b"][0]) for line in candidates),
+                        record["point"][1],
+                    ),
                     "height": height,
                     "layer": candidates[0].get("layer") or "",
                     "record": {"entity": "GEOMETRY_GLYPH"},
@@ -1271,9 +1174,13 @@ def _restore_form_slots(group: list[dict[str, Any]]) -> str:
                     "template": template,
                     "span": match.span(),
                     "left": item["point"][0]
-                    + _form_advance(raw[: match.start()], template["height"], template["width_factor"]),
+                    + _form_advance(
+                        raw[: match.start()], template["height"], template["width_factor"]
+                    ),
                     "right": item["point"][0]
-                    + _form_advance(raw[: match.end()], template["height"], template["width_factor"]),
+                    + _form_advance(
+                        raw[: match.end()], template["height"], template["width_factor"]
+                    ),
                 }
             )
     slot_specs.sort(key=lambda slot: slot["left"])
@@ -1282,14 +1189,12 @@ def _restore_form_slots(group: list[dict[str, Any]]) -> str:
         slot["partition_left"] = (
             -math.inf
             if index == 0
-            else ((slot_specs[index - 1]["left"] + slot_specs[index - 1]["right"]) / 2 + center)
-            / 2
+            else ((slot_specs[index - 1]["left"] + slot_specs[index - 1]["right"]) / 2 + center) / 2
         )
         slot["partition_right"] = (
             math.inf
             if index + 1 == len(slot_specs)
-            else (center + (slot_specs[index + 1]["left"] + slot_specs[index + 1]["right"]) / 2)
-            / 2
+            else (center + (slot_specs[index + 1]["left"] + slot_specs[index + 1]["right"]) / 2) / 2
         )
 
     def matches(slot: dict[str, Any], candidate: dict[str, Any]) -> bool:
@@ -1309,9 +1214,10 @@ def _restore_form_slots(group: list[dict[str, Any]]) -> str:
         height = template["height"]
         if not 0.6 <= candidate_height / height <= 1.6:
             return False
-        if abs(candidate["point"][1] - template["item"]["point"][1]) > max(
-            height, candidate_height
-        ) * 0.2:
+        if (
+            abs(candidate["point"][1] - template["item"]["point"][1])
+            > max(height, candidate_height) * 0.2
+        ):
             return False
         margin = max(height, candidate_height) * (
             0.35 if candidate["layer"] == template["item"].get("layer") else 3.0
@@ -1344,9 +1250,11 @@ def _restore_form_slots(group: list[dict[str, Any]]) -> str:
         for candidate in candidates
     ]
     mapped_slots = [indexes[0] for indexes in compatibility if len(indexes) == 1]
-    if not candidates or any(len(indexes) != 1 for indexes in compatibility) or len(
-        set(mapped_slots)
-    ) != len(mapped_slots):
+    if (
+        not candidates
+        or any(len(indexes) != 1 for indexes in compatibility)
+        or len(set(mapped_slots)) != len(mapped_slots)
+    ):
         return _join_fragments([item["text"] for item in group])
 
     assignments: dict[int, list[tuple[tuple[int, int], str]]] = defaultdict(list)
@@ -1458,7 +1366,8 @@ def _document_flow(
             [record for record in records if record["uid"] not in excluded], lines or []
         )
     )
-    for index, table in enumerate(tables, 1):
+    for fallback_index, table in enumerate(tables, 1):
+        index = int(table.get("_table_index", fallback_index))
         box, anchor = table.get("bbox"), table.get("anchor")
         if anchor and len(anchor) >= 2:
             point = (float(anchor[0]), float(anchor[1]))
@@ -1487,9 +1396,7 @@ def _document_flow(
                 else:
                     rows[row][column] = f"{prefix} {value}".strip()
                 inlined_marker_uids.add(uid)
-        markdown = _table_markdown(
-            rows, header_rows=table["header_rows"], spans=table["spans"]
-        )
+        markdown = _table_markdown(rows, header_rows=table["header_rows"], spans=table["spans"])
         if title and title != "几何表格":
             markdown = f"{_document_text(title)}\n\n{markdown}"
         events.append(
@@ -1542,9 +1449,7 @@ def _document_flow(
                 while (
                     index + len(group) < len(ordered)
                     and ordered[index + len(group)]["kind"] == "text"
-                    and abs(
-                        ordered[index + len(group)]["point"][1] - event["point"][1]
-                    )
+                    and abs(ordered[index + len(group)]["point"][1] - event["point"][1])
                     <= max(
                         float(event.get("height") or 0.0),
                         float(ordered[index + len(group)].get("height") or 0.0),
@@ -1607,9 +1512,7 @@ def _table_markdown(
         header.append(" / ".join(path))
     body = normalized[header_rows:]
     active_columns = [
-        column
-        for column in range(width)
-        if header[column] or any(row[column] for row in body)
+        column for column in range(width) if header[column] or any(row[column] for row in body)
     ]
     if not active_columns:
         return ""
@@ -1628,74 +1531,15 @@ def _table_markdown(
 
 
 def _sections(classified: dict[str, Any], sheet: dict[str, Any]) -> list[tuple[str, str]]:
-    if sheet["projection"]["mode"] == "document":
-        sections: list[tuple[str, str]] = []
-        if classified["meta"]:
-            sections.append(
-                (
-                    "图纸信息",
-                    "\n".join(
-                        f"- {key}：{value.replace(chr(10), '<br>')}"
-                        for key, value in classified["meta"].items()
-                    ),
-                )
-            )
-        sections.extend(("", block) for block in sheet["document_blocks"])
-        return sections
-
     meta = dict(classified["meta"])
     meta.setdefault("来源文件", sheet["source_name"])
-    meta.setdefault("Sheet ID", sheet["sheet_id"])
     if sheet.get("layout_name"):
         meta.setdefault("布局", sheet["layout_name"])
     sections: list[tuple[str, str]] = [
         ("图纸元数据", "\n".join(f"- {key}：{value}" for key, value in meta.items()))
     ]
-    for index, table in enumerate(classified["tables"], 1):
-        sections.append(
-            (
-                f"表格 {index}：{table['title']}",
-                _table_markdown(
-                    table["rows"],
-                    header_rows=table["header_rows"],
-                    spans=table["spans"],
-                ),
-            )
-        )
-    if classified["notes"]:
-        sections.append(("说明", "\n\n".join(item["text"] for item in classified["notes"])))
-    if classified["markers"]:
-        marker_lines = []
-        for marker in classified["markers"]:
-            box = (
-                "[x]"
-                if marker["state"] == "selected"
-                else "[ ]"
-                if marker["state"] == "unselected"
-                else "[?]"
-            )
-            marker_lines.append(f"- {box} {marker['label'] or '未命名选项'}")
-        sections.append(("选项与标记", "\n".join(marker_lines)))
-    if classified["directives"]:
-        sections.append(
-            (
-                "局部施工要求",
-                "\n".join(
-                    f"- [{item['directive_id']}] {item['text']}"
-                    for item in classified["directives"]
-                ),
-            )
-        )
-    if classified["labels"]:
-        rows = [["文字", "次数", "类型"]] + [
-            [item["text"], str(item["count"]), item["role"]] for item in classified["labels"]
-        ]
-        sections.append(("文字标签（聚合，无坐标）", _table_markdown(rows)))
-    if classified["unassigned"]:
-        rows = [["文字", "次数"]] + [
-            [item["text"], str(item["count"])] for item in classified["unassigned"]
-        ]
-        sections.append(("未分类文字", _table_markdown(rows)))
+    if sheet["document_blocks"]:
+        sections.append(("说明", "\n\n".join(sheet["document_blocks"])))
     return sections
 
 
@@ -1720,8 +1564,7 @@ def _split_body(heading: str, body: str, prefix: str, max_tokens: int, max_chars
     )
     repeated = "\n".join(table_header)
     if table_header and (
-        len(repeated) > max_chars // 2
-        or not _fits(f"{lead}{repeated}", max_tokens, max_chars)
+        len(repeated) > max_chars // 2 or not _fits(f"{lead}{repeated}", max_tokens, max_chars)
     ):
         table_header = []
         repeated = ""
@@ -1796,227 +1639,8 @@ def _bounded_markdown(
     return parts
 
 
-def _formal_title(records: list[dict[str, Any]]) -> str | None:
-    titleblock = [
-        record
-        for record in records
-        if "TB-ATTRIB" in str(record.get("layer") or "").upper()
-        and record.get("point")
-        and record.get("text")
-    ]
-    candidates: list[tuple[int, str]] = []
-    for record in titleblock:
-        text = _compact_cjk_spacing(record["text"].replace("\n", ""))
-        if not _TITLE_SUFFIX_RE.search(text) or len(text) > 64:
-            continue
-        x, y = record["point"]
-        height = max(float(record.get("height") or 0.0), 1.0)
-        prefixes = [
-            item
-            for item in titleblock
-            if item is not record
-            and 0 < item["point"][1] - y <= height * 3
-            and abs(item["point"][0] - x) <= height * 20
-            and not _IDENTIFIER_RE.fullmatch(item["text"])
-            and item["text"].rstrip().endswith(("、", "，", ",", "；", ";"))
-        ]
-        pieces = [
-            item["text"].replace("\n", "")
-            for item in sorted(prefixes, key=lambda item: -item["point"][1])
-        ]
-        pieces.append(text)
-        layer = str(record.get("layer") or "").upper()
-        priority = 2 if layer == "0-TB-ATTRIB" else 1 if "TK-JDB" in layer else 0
-        candidates.append((priority, "".join(pieces)))
-    return max(candidates, key=lambda item: (item[0], len(item[1])))[1] if candidates else None
-
-
-def _title(
-    classified: dict[str, Any], fallback: str, records: list[dict[str, Any]] | None = None
-) -> str:
-    formal = _formal_title(records or [])
-    if formal:
-        return formal
-    for key in ("图纸名称", "图名"):
-        if classified["meta"].get(key):
-            return classified["meta"][key]
-    boilerplate = {
-        "制图",
-        "制 图",
-        "设计",
-        "校对",
-        "审核",
-        "批准",
-        "图名",
-        "图纸名称",
-        "图号",
-    }
-    candidates = []
-    for item in classified["labels"] + classified["unassigned"]:
-        text = _compact_cjk_spacing(item["text"])
-        if (
-            _TITLE_SUFFIX_RE.search(text)
-            and text not in boilerplate
-            and not re.search(r"[，。；：,;]", text)
-            and 3 <= len(text) <= 48
-        ):
-            candidates.append({**item, "title_text": text})
-    if not candidates:
-        return fallback
-    candidates.sort(
-        key=lambda item: (
-            3
-            if re.search(r"(?:总说明|设计说明|图纸目录|清单|表)$", item["title_text"])
-            else 2
-            if re.search(r"(?:平面图|立面图|剖面图|详图)$", item["title_text"])
-            else 1,
-            len(item["title_text"]),
-            item["count"],
-        ),
-        reverse=True,
-    )
-    return candidates[0]["title_text"]
-
-
 def _sheet_id(source_sha256: str, locator: str) -> str:
     return "sheet-" + hashlib.sha256(f"{source_sha256}:{locator}".encode()).hexdigest()[:12]
-
-
-def _table_cells(table: dict[str, Any]) -> list[dict[str, Any]]:
-    spans = {
-        (int(span.get("row", 0)), int(span.get("column", span.get("col", 0)))): span
-        for span in table["spans"]
-        if isinstance(span, dict)
-    }
-    cells = []
-    for row_index, row in enumerate(table["rows"]):
-        for column_index, text in enumerate(row):
-            if not text:
-                continue
-            span = spans.get((row_index, column_index), {})
-            cells.append(
-                {
-                    "row": row_index,
-                    "column": column_index,
-                    "row_span": int(span.get("row_span", span.get("rowspan", 1))),
-                    "column_span": int(span.get("column_span", span.get("colspan", 1))),
-                    "role": "column_header" if row_index < table["header_rows"] else "body",
-                    "text": text,
-                    "source_refs": table.get("cell_source_refs", {}).get(
-                        f"{row_index}:{column_index}", table["source_refs"]
-                    ),
-                }
-            )
-    return cells
-
-
-def _public_marker(marker: dict[str, Any]) -> dict[str, Any]:
-    return {key: value for key, value in marker.items() if not key.startswith("_")}
-
-
-def _structure(
-    sheet: dict[str, Any], classified: dict[str, Any], content_paths: list[str]
-) -> dict[str, Any]:
-    document_mode = sheet["projection"]["mode"] == "document"
-    region_specs = (
-        (
-            ("meta", len(classified["meta"]), "图纸信息"),
-            ("document", len(classified.get("_document_flow", [])), ""),
-        )
-        if document_mode
-        else (
-            ("meta", len(classified["meta"]), "图纸元数据"),
-            ("table", len(classified["tables"]), "表格"),
-            ("notes", len(classified["notes"]), "说明"),
-            ("markers", len(classified["markers"]), "选项与标记"),
-            ("directives", len(classified["directives"]), "局部施工要求"),
-            ("labels", len(classified["labels"]), "文字标签（聚合，无坐标）"),
-            ("unassigned", len(classified["unassigned"]), "未分类文字"),
-        )
-    )
-    regions = [
-        {
-            "region_id": f"R{index:03d}",
-            "type": kind,
-            "item_count": count,
-            "markdown_heading": heading,
-        }
-        for index, (kind, count, heading) in enumerate(region_specs, 1)
-        if count
-    ]
-    category_counts = (
-        {
-            "title_block": len(classified["_category_uids"].get("meta", [])),
-            "document_body": sheet["source_text_count"]
-            - len(classified["_category_uids"].get("meta", [])),
-        }
-        if document_mode
-        else {key: len(values) for key, values in classified["_category_uids"].items()}
-    )
-    assigned_instances = (
-        sheet["source_text_count"]
-        if document_mode
-        else len({uid for values in classified["_category_uids"].values() for uid in values})
-    )
-    return {
-        "schema": SHEET_STRUCTURE_SCHEMA,
-        "sheet": {
-            "sheet_id": sheet["sheet_id"],
-            "title": sheet["title"],
-            "kind": sheet["kind"],
-            "layout_name": sheet.get("layout_name"),
-            "bbox": list(sheet["bbox"]) if sheet.get("bbox") else None,
-            "viewport_projection": sheet.get("viewport_projection", "not_applicable"),
-            "source_locator": sheet["source_locator"],
-            "content_paths": content_paths,
-            "projection": sheet["projection"],
-        },
-        "source": {
-            "file": sheet["source_name"],
-            "sha256": sheet["source_sha256"],
-            "sheet_refs": sheet["source_refs"],
-        },
-        "regions": regions,
-        "meta": classified["meta"],
-        "document_flow": classified.get("_document_flow", []),
-        "notes": [] if document_mode else classified["notes"],
-        "tables": [
-            {
-                "table_id": f"T{index:03d}",
-                "title": table["title"],
-                "source_kind": table["source_kind"],
-                "confidence": table["confidence"],
-                "row_count": len(table["rows"]),
-                "column_count": max(map(len, table["rows"]), default=0),
-                "header_rows": table["header_rows"],
-                "spans": table["spans"],
-                "cells": _table_cells(table),
-                "source_refs": table["source_refs"],
-            }
-            for index, table in enumerate(classified["tables"], 1)
-        ],
-        "markers": [_public_marker(marker) for marker in classified["markers"]],
-        "option_groups": [
-            {
-                **{key: value for key, value in group.items() if key != "markers"},
-                "markers": [_public_marker(marker) for marker in group["markers"]],
-            }
-            for group in classified["option_groups"]
-        ],
-        "directives": [] if document_mode else classified["directives"],
-        "labels": [] if document_mode else classified["labels"],
-        "unassigned": [] if document_mode else classified["unassigned"],
-        "coverage": {
-            "source_text_instances": sheet["source_text_count"],
-            "classified_text_instances": assigned_instances,
-            "category_source_instances": category_counts,
-            "unclassified_text_instances": sheet["source_text_count"] - assigned_instances,
-            "viewport_projection_complete": sheet.get("viewport_projection") != "unresolved",
-            "complete": assigned_instances == sheet["source_text_count"]
-            and sheet.get("viewport_projection") != "unresolved",
-            "no_per_label_coordinates": True,
-        },
-    }
 
 
 def build_sheet_artifacts(
@@ -2027,9 +1651,11 @@ def build_sheet_artifacts(
     source_size_bytes: int,
     max_section_tokens: int | None = None,
     max_section_chars: int | None = None,
-    sheet_mode_classifier: SheetModeClassifier | None = None,
+    region_classifier: RegionClassifier | None = None,
+    sheet_renderer: SheetRenderer | None = None,
+    max_concurrent_regions: int = 1,
 ) -> dict[str, Any]:
-    """Return one document manifest and one bounded Markdown/structure pair per Sheet."""
+    """Build Sheet Markdown from VLM-selected regions, preserving unresolved text."""
     defaults = ParserConfig()
     max_tokens = max_section_tokens or defaults.max_section_size
     max_chars = max_section_chars or defaults.max_section_chars
@@ -2135,6 +1761,26 @@ def build_sheet_artifacts(
                     "lines": [],
                 }
             )
+    with ThreadPoolExecutor(
+        max_workers=max(1, min(max_concurrent_regions, len(candidates)))
+    ) as pool:
+        pending = [
+            pool.submit(
+                copy_context().run,
+                _functional_regions,
+                candidate,
+                region_classifier,
+                sheet_renderer,
+            )
+            for candidate in candidates
+        ]
+        for candidate, future in zip(candidates, pending, strict=True):
+            candidate["_functional_regions"], candidate["_region_diagnostic"] = future.result()
+    candidates = [
+        candidate
+        for candidate in candidates
+        if candidate["_region_diagnostic"]["status"] != "not_sheet"
+    ]
     if not candidates:
         all_texts = []
         for record in graph["objects"]:
@@ -2167,6 +1813,8 @@ def build_sheet_artifacts(
                 "objects": graph["objects"],
                 "geometry_frames": [],
                 "lines": [],
+                "_functional_regions": [],
+                "_region_diagnostic": {"status": "unsupported_sheet"},
             }
         )
     sheets = []
@@ -2180,24 +1828,29 @@ def build_sheet_artifacts(
             candidate.get("lines", []),
             candidate.get("bbox"),
         )
-        meta_uids = set(classified["_category_uids"].get("meta", []))
-        projection = _sheet_mode(
-            candidate["texts"],
-            candidate.get("lines", []),
-            classified["tables"],
-            candidate.get("bbox"),
-            meta_uids,
-            sheet_mode_classifier,
-        )
         fallback = candidate.get("layout_name") or f"Sheet {ordinal:03d}"
-        title = _title(classified, fallback, candidate["texts"])
+        title = next(
+            (
+                classified["meta"][key]
+                for key in ("图纸名称", "图名")
+                if classified["meta"].get(key)
+            ),
+            fallback,
+        )
+        functional_regions = candidate.pop("_functional_regions")
+        region_diagnostic = candidate.pop("_region_diagnostic")
+        document_regions, ambiguous = _functional_documents(
+            functional_regions, candidate["texts"], classified["tables"]
+        )
+        partition_status = (
+            "partial"
+            if region_diagnostic["status"] != "used"
+            or ambiguous
+            or any(region["type"] == "unknown" for region in functional_regions)
+            else "complete"
+        )
         slug = VikingURI.sanitize_segment(title) or f"sheet-{ordinal:03d}"
         directory = f"sheets/{sheet_id}__{slug}"
-        public_projection = {
-            key: value for key, value in projection.items() if not key.startswith("_")
-        }
-        if projection["mode"] == "drawing":
-            public_projection["column_count"] = None
         sheet = {
             **candidate,
             "sheet_id": sheet_id,
@@ -2205,31 +1858,63 @@ def build_sheet_artifacts(
             "directory": directory,
             "source_name": source_name,
             "source_sha256": source_sha256,
-            "source_text_count": len(candidate["texts"]),
-            "projection": public_projection,
         }
-        if projection["mode"] == "document":
-            blocks, flow = _document_flow(
-                candidate["texts"],
-                classified["tables"],
-                meta_uids,
-                projection["_column_anchors"],
+        blocks: list[str] = []
+        flow: list[dict[str, Any]] = []
+        emitted_uids: set[str] = set()
+        emitted_tables: set[int] = set()
+        for region in document_regions:
+            region_uids = region["record_uids"] - emitted_uids
+            region_table_indexes = [
+                index for index in region["table_indexes"] if index not in emitted_tables
+            ]
+            emitted_uids.update(region_uids)
+            emitted_tables.update(region_table_indexes)
+            region_tables = [
+                {**classified["tables"][index], "_table_index": index + 1}
+                for index in region_table_indexes
+            ]
+            region_table_uids = {
+                uid for table in region_tables for uid in table.get("_text_uids", [])
+            }
+            region_records = [
+                record
+                for record in candidate["texts"]
+                if record["uid"] in region_uids | region_table_uids
+            ]
+            anchors = _document_column_anchors(region_records, region["bbox"], set())
+            region_lines = [
+                line
+                for line in candidate.get("lines", [])
+                if _inside(region["bbox"], line["a"]) and _inside(region["bbox"], line["b"])
+            ]
+            region_blocks, region_flow = _document_flow(
+                region_records,
+                region_tables,
+                set(),
+                anchors,
                 classified["markers"],
-                candidate.get("lines", []),
+                region_lines,
             )
-            sheet["document_blocks"] = blocks
-            classified["_document_flow"] = flow
+            blocks.extend(region_blocks)
+            for item in region_flow:
+                flow.append({**item, "order": len(flow) + 1, "region_id": region["region_id"]})
+        sheet["document_blocks"] = blocks
         parts = _bounded_markdown(
             title, sheet_id, _sections(classified, sheet), max_tokens, max_chars
         )
         names = (
-            ["content.md"]
+            ["context.md"]
             if len(parts) == 1
-            else [f"content_{index:03d}.md" for index in range(1, len(parts) + 1)]
+            else [f"context_{index:03d}.md" for index in range(1, len(parts) + 1)]
         )
         content_paths = [f"{directory}/{name}" for name in names]
-        structure_path = f"{directory}/structure.json"
-        structure = _structure(sheet, classified, content_paths)
+        source_keys = {repr(ref) for item in flow for ref in item["source_refs"]}
+        markdown_uids = [
+            record["uid"]
+            for record in candidate["texts"]
+            if repr(_source_ref(record["record"], record["instance_path"])) in source_keys
+        ]
         sheets.append(
             {
                 "sheet_id": sheet_id,
@@ -2237,10 +1922,14 @@ def build_sheet_artifacts(
                 "title": title,
                 "content_paths": content_paths,
                 "content_files": list(zip(names, parts, strict=True)),
-                "structure_path": structure_path,
-                "structure": structure,
+                "region_diagnostic": region_diagnostic,
                 "kind": candidate["kind"],
                 "source_locator": candidate["source_locator"],
+                "bbox": list(candidate["bbox"]) if candidate.get("bbox") else None,
+                "regions": functional_regions,
+                "_texts": candidate["texts"],
+                "markdown_uids": markdown_uids,
+                "status": partition_status,
             }
         )
     document_id = "dwg-" + source_sha256[:16]
@@ -2258,7 +1947,6 @@ def build_sheet_artifacts(
                     "directory",
                     "title",
                     "content_paths",
-                    "structure_path",
                     "kind",
                     "source_locator",
                 )
@@ -2273,38 +1961,8 @@ def build_sheet_artifacts(
                     if _kind(record) in {"TEXT", "MTEXT", "ATTRIB"}
                 }
             ),
-            "sheet_text_instances": sum(
-                sheet["structure"]["coverage"]["source_text_instances"] for sheet in sheets
-            ),
+            "sheet_text_instances": sum(len(sheet["_texts"]) for sheet in sheets),
             "fallback_sheet_used": any(sheet["kind"] == "synthetic" for sheet in sheets),
         },
     }
     return {"document": document, "sheets": sheets}
-
-
-def _demo() -> None:
-    drawing = {
-        "OBJECTS": [
-            {
-                "object": "BLOCK_HEADER",
-                "handle": [0, 1, 10],
-                "name": "*Model_Space",
-                "entities": [[0, 1, 20]],
-            },
-            {
-                "entity": "TEXT",
-                "handle": [0, 1, 20],
-                "ins_pt": [1, 2],
-                "text_value": "项目名称：示例",
-            },
-        ]
-    }
-    result = build_sheet_artifacts(
-        drawing, source_name="demo.dwg", source_sha256="a" * 64, source_size_bytes=1
-    )
-    assert result["document"]["sheet_count"] == 1
-    assert result["sheets"][0]["structure"]["coverage"]["no_per_label_coordinates"] is True
-
-
-if __name__ == "__main__":
-    _demo()

@@ -58,7 +58,7 @@ _Avoid_: CAD editor, source of truth, persisted preview artifact
 
 **Sheet**:
 A bounded drawing unit intended to stand alone for identification and retrieval. It may originate from a Paper Space Layout or a drawing frame in Model Space; its identity does not depend on a potentially missing or repeated drawing title.
-_Avoid_: page image, viewport, small drawing, region
+_Avoid_: page image, viewport, component, small drawing, region
 
 **Document Sheet**:
 A text-dominant Sheet, such as a multi-column design specification, whose numbered prose and inline tables form one reading-ordered document. It is restored as a document flow rather than regrouped into semantic buckets.
@@ -70,7 +70,23 @@ _Avoid_: generic metadata text, body notes, drawing title guess
 
 **Region**:
 A typed semantic area within one Sheet, such as metadata, a table, notes, a plan, or a detail. It provides containment and reading scope but is neither a fixed pixel tile nor an independent bundle.
-_Avoid_: crop tile, sheet, bundle
+_Avoid_: crop tile, sheet, bundle, storage chunk
+
+**Drawing View**:
+A spatially separate drawing within a Sheet, including its title, dimensions, leaders, annotations, and internal tables. Small reference diagrams and large plans are both Drawing Views.
+_Avoid_: sheet, pixel tile, independent bundle, storage chunk
+
+**Drawing Instance**:
+One placed occurrence of a native drawing object, including its enclosing block insertions. Multiple instances may share the same native object definition while appearing in different regions.
+_Avoid_: unique handle, copied object definition
+
+**DWG Data Artifact**:
+Preserved native drawing data belonging to one Sheet or to the document as a whole, including original object identities and references. Its ownership scope is independent of how much data a reader requests at once.
+_Avoid_: semantic summary, simplified geometry, drawing view, model-input-sized file
+
+**Document-level DWG Data**:
+Native data belonging to the DWG as a whole or lacking a unique Sheet owner, including document properties, reusable definitions and objects spanning Sheets. This scope does not itself imply a parsing failure.
+_Avoid_: error bucket, failed geometry, duplicated Sheet data
 
 **Beam Topology Index**:
 A deterministic derived DWG artifact that binds beam labels to available geometric and dimensional evidence while preserving confidence states and source-object references. It covers beam topology only, not the complete drawing.

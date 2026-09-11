@@ -23,6 +23,7 @@ from openviking.parse.parsers.media.utils import (
     MPEG_TS_PROBE_BYTES,
     is_mpeg_ts,
 )
+from openviking.resource.atomic_bundle import is_dwg_parser_data
 from openviking.server.identity import RequestContext
 from openviking.service.task_work_index import TaskWorkRejected
 from openviking.storage.queuefs import get_queue_manager
@@ -377,6 +378,9 @@ async def vectorize_directory_meta(
             logger.warning("No context provided for vectorization")
             return
 
+        if await is_dwg_parser_data(get_viking_fs(), uri, ctx=ctx, is_directory=True):
+            return
+
         queue_manager = get_queue_manager()
         embedding_queue = queue_manager.get_queue(queue_manager.EMBEDDING)
 
@@ -505,9 +509,12 @@ async def vectorize_file(
             logger.warning("No context provided for vectorization")
             return
 
+        viking_fs = get_viking_fs()
+        if await is_dwg_parser_data(viking_fs, file_path, ctx=ctx):
+            return
+
         queue_manager = get_queue_manager()
         embedding_queue = queue_manager.get_queue(queue_manager.EMBEDDING)
-        viking_fs = get_viking_fs()
 
         file_name = summary_dict.get("name") or os.path.basename(file_path)
         summary = summary_dict.get("summary", "")
@@ -536,9 +543,7 @@ async def vectorize_file(
             owner_space=owner_space_for_uri(file_path, ctx),
         )
 
-        content_type = await _resolve_resource_content_type(
-            file_path, file_name, viking_fs, ctx
-        )
+        content_type = await _resolve_resource_content_type(file_path, file_name, viking_fs, ctx)
         embedding_cfg = get_openviking_config().embedding
         configured_text_source = getattr(embedding_cfg, "text_source", "content_only")
         effective_text_source = "summary_only" if use_summary else configured_text_source

@@ -419,6 +419,14 @@ class ResourceProcessor:
                 "is_code_repo": parse_result.source_format == "repository",
                 "precomputed_semantics": parse_result.precomputed_semantics,
             }
+            if parse_result.source_format == "dwg":
+                # TreeBuilder preserves the document-relative parser paths when
+                # moving its root; only Sheet Markdown is semantic input.
+                prepared["summary_files"] = [
+                    path
+                    for sheet in parse_result.meta.get("sheet_bundles", [])
+                    for path in sheet.get("content_paths", [])
+                ]
             if defer_post_processing:
                 result["_post_process"] = prepared
                 result["_resource_lock"] = resource_lock
@@ -463,6 +471,14 @@ class ResourceProcessor:
         processing_mode = normalize_processing_mode(processing_mode)
         vectors_only = processing_mode == VECTORS_ONLY
         ingest_options = IngestOptions.from_value(kwargs.pop("ingest_options", None))
+        include_files = None
+        if prepared.get("summary_files") is not None:
+            include_files = set(prepared["summary_files"])
+            if kwargs.get("summary_files") is not None:
+                # Preserve an explicit narrower caller selection.
+                include_files.intersection_update(kwargs["summary_files"])
+            kwargs["summary_files"] = sorted(include_files)
+        vector_file_options = {"include_files": include_files} if include_files is not None else {}
         should_summarize = not vectors_only and (
             build_index or (summarize and not precomputed_semantics)
         )
@@ -548,6 +564,7 @@ class ResourceProcessor:
                         root_uri,
                         ctx=ctx,
                         ingest_options=ingest_options,
+                        **vector_file_options,
                     )
             finally:
                 await get_viking_fs()._async_agfs.pathlock_release(resource_lock)
@@ -558,6 +575,7 @@ class ResourceProcessor:
                 root_uri,
                 ctx=ctx,
                 ingest_options=ingest_options,
+                **vector_file_options,
             )
         return result
 
@@ -599,15 +617,19 @@ class ResourceProcessor:
         *,
         ctx: RequestContext,
         ingest_options: IngestOptions | None = None,
+        include_files: set[str] | None = None,
     ) -> None:
         ingest_options = IngestOptions.from_value(ingest_options)
         viking_fs = get_viking_fs()
-        entries = await viking_fs.tree(
-            root_uri,
-            node_limit=None,
-            level_limit=None,
-            ctx=ctx,
-        )
+        if include_files is None:
+            entries = await viking_fs.tree(
+                root_uri,
+                node_limit=None,
+                level_limit=None,
+                ctx=ctx,
+            )
+        else:
+            entries = [{"uri": f"{root_uri}/{path}"} for path in sorted(include_files)]
         for entry in entries:
             entry_uri = entry.get("uri") if isinstance(entry, dict) else None
             if not entry_uri or entry.get("isDir"):
