@@ -84,7 +84,8 @@ const convert = runInNewContext(
   `(${bundle.slice(start + prefix.length, end + 1)})`,
   {
     et: AcDbPolyline,
-    q: AcGePoint2d,
+    q: AcGePoint2d, // cad-simple-viewer 1.5.9
+    X: AcGePoint2d, // cad-simple-viewer 1.5.10
   },
 ) as (value: Record<string, unknown>) => AcDbPolyline
 

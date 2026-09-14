@@ -2,7 +2,7 @@ import { readFile, rename, rm, writeFile } from 'node:fs/promises'
 import { createRequire } from 'node:module'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 
-// cad-simple-viewer 1.5.9 bundles its DWG converter. Preserve plane metadata
+// Supported cad-simple-viewer releases bundle their DWG converter. Preserve plane metadata
 // here; src/lib/cad/dwg-polyline-ocs.ts applies it at draw/extent time.
 // Version and exact-source checks prevent silently patching a different release.
 const packageRoot = new URL(
@@ -12,7 +12,11 @@ const packageRoot = new URL(
 const info = JSON.parse(
   await readFile(new URL('package.json', packageRoot), 'utf8'),
 )
-if (info.version !== '1.5.9') {
+const supportedDependencies = {
+  '1.5.9': ['1.12.2', '3.12.2'],
+  '1.5.10': ['1.12.5', '3.12.5'],
+}[info.version]
+if (!supportedDependencies) {
   throw new Error(
     `Review the DWG polyline compatibility fix for cad-simple-viewer ${info.version}`,
   )
@@ -20,8 +24,8 @@ if (info.version !== '1.5.9') {
 const file = new URL('dist/cad-simple-viewer.js', packageRoot)
 let resolveFrom = createRequire(import.meta.url)
 for (const [name, version] of [
-  ['data-model', '1.12.2'],
-  ['geometry-engine', '3.12.2'],
+  ['data-model', supportedDependencies[0]],
+  ['geometry-engine', supportedDependencies[1]],
 ]) {
   // Resolve from the dependency itself so pnpm's non-hoisted layout works too.
   const entry = resolveFrom.resolve(`@mlightcad/${name}`)
