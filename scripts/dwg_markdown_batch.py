@@ -16,7 +16,7 @@ from dwg_sheet_smoke import _read_dwg, _sha256
 
 from openviking.parse.parsers.dwg import _region_classifier
 from openviking.parse.parsers.dwg_render import sheet_renderer
-from openviking.parse.parsers.dwg_sheet import build_sheet_artifacts
+from openviking.parse.parsers.dwg_sheet import DWG_PARSER_VERSION, build_sheet_artifacts
 from openviking_cli.utils.config import get_openviking_config
 
 
@@ -33,8 +33,10 @@ def _successes(events: Path, output: Path) -> tuple[set[str], dict[str, dict]]:
         return completed, by_sha
     for line in events.read_text(encoding="utf-8").splitlines():
         event = json.loads(line)
-        if event.get("status") == "success" and all(
-            (output / path).is_file() for path in event.get("files", [])
+        if (
+            event.get("status") == "success"
+            and event.get("parser_version") == DWG_PARSER_VERSION
+            and all((output / path).is_file() for path in event.get("files", []))
         ):
             completed.add(event["source"])
             digest = event.get("sha256") or _sha256(Path(event["source"]))
@@ -84,6 +86,8 @@ def main() -> int:
                 "sha256": digest,
                 "status": "success",
                 "sheet_count": previous["sheet_count"],
+                "sheet_bundle_count": previous.get("sheet_bundle_count"),
+                "parser_version": DWG_PARSER_VERSION,
                 "parse_status": previous.get("parse_status", "unknown"),
                 "files": output_files,
                 "reused_from": previous["source"],
@@ -99,7 +103,10 @@ def main() -> int:
         print(f"[{index:02d}/{len(files)}] parse {relative}", flush=True)
         try:
             if destination.exists():
-                raise RuntimeError(f"output already exists without a success event: {destination}")
+                raise RuntimeError(
+                    f"output exists without a success event for parser {DWG_PARSER_VERSION}: "
+                    f"{destination}; use a new output directory and events file for this version"
+                )
             drawing, warnings = _read_dwg(source)
             artifacts = build_sheet_artifacts(
                 drawing,
@@ -134,7 +141,9 @@ def main() -> int:
                 "relative_source": relative.as_posix(),
                 "sha256": digest,
                 "status": "success",
-                "sheet_count": len(artifacts["sheets"]),
+                "sheet_count": artifacts["document"]["sheet_count"],
+                "sheet_bundle_count": len(artifacts["sheets"]),
+                "parser_version": DWG_PARSER_VERSION,
                 "parse_status": "partial"
                 if any(sheet["status"] == "partial" for sheet in artifacts["sheets"])
                 else "complete",
@@ -146,7 +155,7 @@ def main() -> int:
             by_sha.setdefault(digest, event)
             print(
                 f"[{index:02d}/{len(files)}] success "
-                f"{len(artifacts['sheets'])} sheets, {len(written)} Markdown, "
+                f"{artifacts['document']['sheet_count']} sheets, {len(written)} Markdown, "
                 f"{time.monotonic() - started:.1f}s",
                 flush=True,
             )

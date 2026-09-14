@@ -198,8 +198,9 @@ def test_non_xy_and_bulged_geometry_does_not_get_vertex_only_bounds():
     }
     instances = list(iter_instances(drawing))
     assert len(instances) == 2
-    assert all(item["bbox"] is None for item in instances)
-    assert instances[0]["geometry_status"] == "unsupported_ocs"
+    assert instances[0]["bbox"] == pytest.approx([-1, 0, 1, 0])
+    assert instances[0]["geometry_status"] == "exact"
+    assert instances[1]["bbox"] is None
 
 
 def test_numeric_overflow_and_unknown_entity_owner_are_preserved_without_infinite_bounds():

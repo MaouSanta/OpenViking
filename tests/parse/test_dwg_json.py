@@ -27,7 +27,7 @@ def drawing_fixture():
                 "entity": "LWPOLYLINE",
                 "handle": [0, 0, 2],
                 "ownerhandle": [0, 0, 1],
-                "flag": 1,
+                "flag": 512,
                 "points": [[0, 0], [100, 0], [100, 100], [0, 100]],
             },
             {
@@ -381,10 +381,15 @@ async def test_production_parser_writes_whole_json_independent_of_embedding_budg
         described.update(item["path"] for item in sheet["json_artifacts"])
     assert json_paths == described
     assert len(json_paths) == 3
-    assert result.parser_version == "10.0"
+    assert result.parser_version == "10.1"
     assert result.meta["parse_status"] == "complete"
     assert any(len(fs.files[f"{root}/{path}"]) > 6000 for path in json_paths)
     restored = read_json_records(fs.files[f"{root}/{path}"].decode() for path in json_paths)
+    assert result.meta["sheet_count"] == result.meta["sheet_bundle_count"] == 1
+    diagnostics = next(row for row in restored if row["kind"] == "sheet_detection")
+    assert diagnostics["statistics"] == result.meta["detection_statistics"]
+    assert diagnostics["statistics"]["detected_sheet_count"] == 1
+    assert diagnostics["candidates"][0]["region_diagnostic"]["status"] == "used"
     assert (
         next(
             row["value"]
@@ -532,7 +537,7 @@ def test_cross_sheet_objects_and_containers_stay_at_document_scope():
             "entity": "LWPOLYLINE",
             "handle": [0, 0, 6],
             "ownerhandle": [0, 0, 1],
-            "flag": 1,
+            "flag": 512,
             "points": [[200, 0], [300, 0], [300, 100], [200, 100]],
         }
     )

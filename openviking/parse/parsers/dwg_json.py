@@ -81,6 +81,8 @@ def _spatial_order(items: list[tuple[tuple[float, float], dict]]) -> list[dict]:
 def build_json_artifacts(
     drawing: dict[str, Any],
     sheets: list[dict[str, Any]],
+    *,
+    detection_diagnostics: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Keep native objects once: definitions in metadata, placed records by drawing scope.
 
@@ -88,7 +90,8 @@ def build_json_artifacts(
     instance paths needed to trace Markdown; readers recover source order by ordinal.
     """
     from openviking.parse.parsers.dwg_json_geometry import iter_instances
-    from openviking.parse.parsers.dwg_sheet import _contains, _drawing_graph, _kind, _ref
+    from openviking.parse.parsers.dwg_sheet import _drawing_graph, _kind, _ref
+    from openviking.parse.parsers.dwg_sheet_frames import contains_box, intersects_box
 
     objects = drawing.get("OBJECTS", [])
     if not isinstance(objects, list):
@@ -181,19 +184,25 @@ def build_json_artifacts(
         reliable = (
             instance.get("geometry_status") in {"exact", "conservative", "anchor_only", "container"}
             and location is not None
-            and instance.get("space_kind") == "model"
+            and instance.get("space_kind") in {"model", "paper"}
         )
         matches = [
             sheet
             for sheet in sheets
-            if sheet.get("kind") == "model_frame"
+            if sheet.get("kind") in {"model_frame", "layout_frame"}
+            and instance.get("space_kind")
+            == ("paper" if sheet.get("kind") == "layout_frame" else "model")
+            and (
+                sheet.get("source_locator", {}).get("block_handle") is None
+                or sheet["source_locator"]["block_handle"] == instance.get("space_handle")
+            )
             and sheet.get("bbox")
             and location is not None
-            and _intersects(location, sheet["bbox"])
+            and intersects_box(sheet, location)
         ]
         target = (
             matches[0]["directory"]
-            if reliable and len(matches) == 1 and _contains(matches[0]["bbox"], location)
+            if reliable and len(matches) == 1 and contains_box(matches[0], location)
             else None
         )
         owners[index].add(target)
@@ -258,6 +267,8 @@ def build_json_artifacts(
             "value": {key: value for key, value in drawing.items() if key != "OBJECTS"},
         },
     )
+    if detection_diagnostics is not None:
+        add("metadata", {"kind": "sheet_detection", **detection_diagnostics})
     for sheet in sheets:
         add(
             "metadata",
@@ -266,7 +277,13 @@ def build_json_artifacts(
                 "sheet_id": sheet["sheet_id"],
                 "status": sheet["status"],
                 "bbox": sheet.get("bbox"),
+                "boundary": sheet.get("boundary"),
+                "boundary_sources": sheet.get("boundary_sources", []),
                 "source_locator": sheet.get("source_locator"),
+                "sheet_kind": sheet.get("kind"),
+                "region_diagnostic": sheet.get("region_diagnostic"),
+                "detection_evidence": sheet.get("detection_evidence"),
+                "viewport_projection": sheet.get("viewport_projection", "not_applicable"),
             },
         )
     for index, original in enumerate(objects):

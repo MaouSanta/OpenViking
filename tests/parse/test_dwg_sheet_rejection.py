@@ -118,7 +118,8 @@ def test_rejecting_every_candidate_keeps_one_partial_synthetic_sheet_without_a_r
     result = _build(drawing, classifier, renderer)
 
     assert classifier.call_count == renderer.call_count == 22
-    assert result["document"]["sheet_count"] == 1
+    assert result["document"]["sheet_count"] == 0
+    assert result["document"]["sheet_bundle_count"] == 1
     sheet = result["sheets"][0]
     assert sheet["kind"] == "synthetic"
     assert sheet["status"] == "partial"

@@ -20,7 +20,7 @@ def _drawing():
                     "entity": "LWPOLYLINE",
                     "handle": [0, 0, 10 + index],
                     "entmode": 2,
-                    "flag": 1,
+                    "flag": 512,
                     "points": [[x, 0], [x + 100, 0], [x + 100, 80], [x, 80]],
                 },
                 {

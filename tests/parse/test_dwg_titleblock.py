@@ -69,7 +69,7 @@ def test_sheet_title_does_not_guess_from_body_or_directory_header_labels():
                 "entity": "LWPOLYLINE",
                 "handle": [0, 0, 2],
                 "ownerhandle": [0, 0, 1],
-                "flag": 1,
+                "flag": 512,
                 "points": [[0, 0], [100, 0], [100, 100], [0, 100]],
             },
             {

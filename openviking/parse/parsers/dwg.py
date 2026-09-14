@@ -17,7 +17,7 @@ from openviking.parse.base import NodeType, ParseResult, ResourceNode
 from openviking.parse.parsers.base_parser import BaseParser
 from openviking.parse.parsers.dwg_json import build_json_artifacts
 from openviking.parse.parsers.dwg_render import sheet_renderer
-from openviking.parse.parsers.dwg_sheet import build_sheet_artifacts
+from openviking.parse.parsers.dwg_sheet import DWG_PARSER_VERSION, build_sheet_artifacts
 from openviking_cli.utils.async_utils import run_async
 from openviking_cli.utils.config import get_openviking_config
 from openviking_cli.utils.llm import parse_json_from_response
@@ -109,12 +109,16 @@ class DWGParser(BaseParser):
                             "json_artifacts",
                             "status",
                             "kind",
+                            "region_diagnostic",
+                            "detection_evidence",
                         )
                         if key in sheet
                     }
                     for sheet in sheet_artifacts["sheets"]
                 ],
-                "sheet_count": len(sheet_artifacts["sheets"]),
+                "sheet_count": sheet_artifacts["document"]["sheet_count"],
+                "sheet_bundle_count": len(sheet_artifacts["sheets"]),
+                "detection_statistics": sheet_artifacts["document"]["detection_statistics"],
                 "json_artifacts": sheet_artifacts["json_artifacts"],
                 "parse_status": sheet_artifacts["parse_status"],
                 "summary_info": _nonempty_mapping(summary_info),
@@ -128,7 +132,7 @@ class DWGParser(BaseParser):
             temp_dir_path=temp_uri,
             source_format="dwg",
             parser_name="DWGParser",
-            parser_version="10.0",
+            parser_version=DWG_PARSER_VERSION,
             parse_time=time.perf_counter() - started_at,
             parse_timestamp=datetime.now(timezone.utc),
             meta=root_node.meta,
@@ -212,7 +216,15 @@ def build_dwg_artifacts(
         sheet_renderer=renderer,
         max_concurrent_regions=config.vlm.max_concurrent,
     )
-    preserved = build_json_artifacts(drawing, artifacts["sheets"])
+    preserved = build_json_artifacts(
+        drawing,
+        artifacts["sheets"],
+        detection_diagnostics={
+            "statistics": artifacts["document"]["detection_statistics"],
+            "candidates": artifacts["document"]["candidate_diagnostics"],
+            "geometry_diagnostics": artifacts["document"]["geometry_diagnostics"],
+        },
+    )
     artifacts.update(
         json_files=preserved["files"],
         json_artifacts=preserved["json_artifacts"],

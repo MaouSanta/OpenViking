@@ -99,6 +99,8 @@ def main(argv: list[str] | None = None) -> int:
     summary = {
         "document_id": artifacts["document"]["document_id"],
         "sheet_count": artifacts["document"]["sheet_count"],
+        "sheet_bundle_count": artifacts["document"]["sheet_bundle_count"],
+        "detection_statistics": artifacts["document"]["detection_statistics"],
         "output": str(output),
         "written": written,
         "warnings": warnings,
@@ -107,7 +109,10 @@ def main(argv: list[str] | None = None) -> int:
     if args.json:
         print(json.dumps(summary, ensure_ascii=False, indent=2))
     else:
-        print(f"Wrote {summary['sheet_count']} Sheet bundle(s) to {output}")
+        print(
+            f"Detected {summary['sheet_count']} Sheet(s); "
+            f"wrote {summary['sheet_bundle_count']} bundle(s) to {output}"
+        )
         for path in written:
             print(f"  {path}")
         for warning in warnings:

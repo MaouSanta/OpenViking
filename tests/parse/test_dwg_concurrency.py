@@ -32,8 +32,19 @@ def test_parallel_sheet_classifier_preserves_context_and_usage_on_one_loop(monke
                     "handle": [0, 0, 20 + index],
                     "index": 20 + index,
                     "entmode": 2,
-                    "flag": 1,
+                    "flag": 512,
                     "points": [[x, 0], [x + 100, 0], [x + 100, 100], [x, 100]],
+                }
+                for index, x in enumerate(range(0, 800, 200))
+            ),
+            *(
+                {
+                    "entity": "TEXT",
+                    "handle": [0, 0, 30 + index],
+                    "entmode": 2,
+                    "ins_pt": [x + 10, 20],
+                    "height": 2,
+                    "text_value": f"图号：E-{index}",
                 }
                 for index, x in enumerate(range(0, 800, 200))
             ),

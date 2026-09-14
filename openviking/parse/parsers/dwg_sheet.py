@@ -15,6 +15,34 @@ from concurrent.futures import ThreadPoolExecutor
 from contextvars import copy_context
 from typing import Any, Callable, Iterable
 
+from openviking.parse.parsers.dwg_coordinates import (
+    IDENTITY,
+    apply3,
+    entity_matrix,
+    point3,
+    projected_height,
+    text_point,
+)
+from openviking.parse.parsers.dwg_coordinates import (
+    apply2 as _matrix_apply,
+)
+from openviking.parse.parsers.dwg_coordinates import (
+    insert_matrix as _insert_matrix,
+)
+from openviking.parse.parsers.dwg_coordinates import (
+    multiply as _matrix_multiply,
+)
+from openviking.parse.parsers.dwg_sheet_frames import (
+    contains_box as _frame_contains_box,
+)
+from openviking.parse.parsers.dwg_sheet_frames import (
+    contains_point as _inside_frame,
+)
+from openviking.parse.parsers.dwg_sheet_frames import (
+    line_frames,
+    rectangle,
+    select_frames,
+)
 from openviking.parse.parsers.dwg_sheet_geometry import (
     detect_marker_groups,
     detect_table_grids,
@@ -24,6 +52,7 @@ from openviking_cli.utils.config.parser_config import ParserConfig
 from openviking_cli.utils.uri import VikingURI
 
 SHEET_DOCUMENT_SCHEMA = "openviking.dwg-document/v1"
+DWG_PARSER_VERSION = "10.1"
 
 _FORMAT_RE = re.compile(r"\\(?:A\d+|C\d+|F[^;]*|f[^;]*|H[^;]*|Q[^;]*|T[^;]*|W[^;]*);", re.I)
 _FIELD_RE = re.compile(
@@ -35,7 +64,9 @@ _META_KEYS = tuple(
 )
 _META_HEADER_LABELS = set(_META_KEYS) | {"图别", "序号", "图幅", "备注", "图纸目录"}
 _MARKER_RE = re.compile(r"^\s*([□■☐☑☒○●◯✓√×✕])\s*(.*)$")
-_FRAME_NAME_RE = re.compile(r"(?:图框|图签|图纸目录|title\s*block|border|sheet\s*frame)", re.I)
+_FRAME_NAME_RE = re.compile(
+    r"(?:^A[0-4](?:\b|[-_]|\d)|图框|图签|图纸目录|title\s*block|border|sheet\s*frame)", re.I
+)
 _CJK_RE = re.compile(r"[\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af]")
 _NONSPACE_RE = re.compile(r"[^\s]")
 _NUMBERED_RE = re.compile(
@@ -90,42 +121,6 @@ def _kind(record: dict[str, Any]) -> str:
     return str(record.get("entity") or record.get("object") or "").upper()
 
 
-def _matrix_apply(matrix: tuple[float, ...], point: tuple[float, float]) -> tuple[float, float]:
-    a, b, c, d, e, f = matrix
-    return a * point[0] + c * point[1] + e, b * point[0] + d * point[1] + f
-
-
-def _matrix_multiply(left: tuple[float, ...], right: tuple[float, ...]) -> tuple[float, ...]:
-    a, b, c, d, e, f = left
-    g, h, i, j, k, l = right
-    return (
-        a * g + c * h,
-        b * g + d * h,
-        a * i + c * j,
-        b * i + d * j,
-        a * k + c * l + e,
-        b * k + d * l + f,
-    )
-
-
-def _insert_matrix(record: dict[str, Any], block: dict[str, Any]) -> tuple[float, ...]:
-    insertion = _point(record.get("ins_pt")) or (0.0, 0.0)
-    base = _point(block.get("base_pt")) or (0.0, 0.0)
-    scale = record.get("scale")
-    sx = float(scale[0]) if isinstance(scale, list) and scale else 1.0
-    sy = float(scale[1]) if isinstance(scale, list) and len(scale) > 1 else sx
-    angle = float(record.get("rotation") or 0.0)
-    cosine, sine = math.cos(angle), math.sin(angle)
-    return (
-        sx * cosine,
-        sx * sine,
-        -sy * sine,
-        sy * cosine,
-        insertion[0] - sx * cosine * base[0] + sy * sine * base[1],
-        insertion[1] - sx * sine * base[0] - sy * cosine * base[1],
-    )
-
-
 def _bbox(points: Iterable[tuple[float, float]]) -> tuple[float, float, float, float] | None:
     points = list(points)
     if not points:
@@ -169,15 +164,22 @@ def _drawing_graph(drawing: dict[str, Any]) -> dict[str, Any]:
         handle: record for handle, record in by_handle.items() if _kind(record) == "BLOCK_HEADER"
     }
     members: dict[Any, list[Any]] = defaultdict(list)
+    member_sets: dict[Any, set[Any]] = defaultdict(set)
+
+    def add_member(owner, handle):
+        if handle not in member_sets[owner]:
+            members[owner].append(handle)
+            member_sets[owner].add(handle)
+
     for block_handle, block in blocks.items():
         for value in block.get("entities") or []:
             handle = _ref(value)
             if handle in by_handle:
-                members[block_handle].append(handle)
+                add_member(block_handle, handle)
     for record in objects:
         handle, owner = _ref(record.get("handle")), _ref(record.get("ownerhandle"))
-        if handle is not None and owner in blocks and handle not in members[owner]:
-            members[owner].append(handle)
+        if handle is not None and owner in blocks:
+            add_member(owner, handle)
     model_blocks = [
         handle
         for handle, block in blocks.items()
@@ -205,8 +207,7 @@ def _drawing_graph(drawing: dict[str, Any]) -> dict[str, Any]:
         except (TypeError, ValueError):
             targets = []
         for block_handle in targets:
-            if handle not in members[block_handle]:
-                members[block_handle].append(handle)
+            add_member(block_handle, handle)
     children: dict[Any, list[dict[str, Any]]] = defaultdict(list)
     for record in objects:
         owner = _ref(record.get("ownerhandle"))
@@ -227,369 +228,306 @@ def _drawing_graph(drawing: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _block_bbox(
-    block_handle: Any,
-    graph: dict[str, Any],
-    seen: frozenset[Any] = frozenset(),
-) -> tuple[float, float, float, float] | None:
+def _block_bbox3(block_handle, graph, seen=frozenset()):
     if block_handle in seen or len(seen) >= 12:
         return None
-    points: list[tuple[float, float]] = []
+    cache = graph.setdefault("bbox_cache", {})
+    key = block_handle, seen
+    if key in cache:
+        return cache[key]
+    points = []
     for handle in graph["members"].get(block_handle, []):
         record = graph["by_handle"].get(handle, {})
         kind = _kind(record)
-        if kind == "LINE":
-            points.extend(point for key in ("start", "end") if (point := _point(record.get(key))))
-        elif kind == "LWPOLYLINE":
-            points.extend(point for value in record.get("points") or [] if (point := _point(value)))
-        elif kind in {"TEXT", "MTEXT", "ATTRIB", "ATTDEF"}:
-            point = _point(record.get("ins_pt")) or _point(record.get("alignment_pt"))
-            if point:
-                points.append(point)
-        elif kind == "INSERT":
-            nested_handle = _ref(record.get("block_header"))
-            nested = graph["blocks"].get(nested_handle)
-            nested_box = (
-                _block_bbox(nested_handle, graph, seen | {block_handle}) if nested else None
-            )
-            if nested_box:
-                matrix = _insert_matrix(record, nested)
+        try:
+            matrix = entity_matrix(record, IDENTITY)
+            if kind == "LINE":
                 points.extend(
-                    _matrix_apply(matrix, point)
-                    for point in (
-                        (nested_box[0], nested_box[1]),
-                        (nested_box[0], nested_box[3]),
-                        (nested_box[2], nested_box[1]),
-                        (nested_box[2], nested_box[3]),
-                    )
+                    p for name in ("start", "end") if (p := point3(record.get(name))) is not None
                 )
-    return _bbox(points)
+            elif kind == "LWPOLYLINE":
+                for value in record.get("points") or []:
+                    if (p := point3(value)) is not None:
+                        points.append(
+                            apply3(matrix, (p[0], p[1], float(record.get("elevation") or 0.0)))
+                        )
+            elif kind in {"TEXT", "MTEXT", "ATTRIB", "ATTDEF"}:
+                if (
+                    _clean_text(record.get("text_value") or record.get("text"))
+                    and (p := text_point(record)) is not None
+                ):
+                    points.append(apply3(matrix, p))
+            elif kind == "INSERT":
+                nested_handle = _ref(record.get("block_header"))
+                nested = graph["blocks"].get(nested_handle)
+                box = _block_bbox3(nested_handle, graph, seen | {block_handle}) if nested else None
+                if box:
+                    transform = _insert_matrix(record, nested)
+                    points.extend(
+                        apply3(transform, (x, y, z))
+                        for x in (box[0], box[3])
+                        for y in (box[1], box[4])
+                        for z in (box[2], box[5])
+                    )
+        except (ValueError, TypeError, OverflowError):
+            continue  # bounds are only auxiliary; malformed primitives remain native JSON
+    box = (
+        tuple(min(p[d] for p in points) for d in range(3))
+        + tuple(max(p[d] for p in points) for d in range(3))
+        if points
+        else None
+    )
+    cache[key] = box
+    return box
+
+
+def _block_bbox(block_handle, graph, seen=frozenset()):
+    box = _block_bbox3(block_handle, graph, seen)
+    return (box[0], box[1], box[3], box[4]) if box else None
 
 
 def _walk_block(block_handle: Any, graph: dict[str, Any]) -> dict[str, list[dict[str, Any]]]:
-    result: dict[str, list[dict[str, Any]]] = {
+    result = {
         "texts": [],
         "lines": [],
         "frames": [],
         "objects": [],
+        "diagnostics": [],
+        "images": [],
     }
-    identity = (1.0, 0.0, 0.0, 1.0, 0.0, 0.0)
     open_rectangles = []
+    frame_hints = {}
 
-    def visit(
-        current: Any, matrix: tuple[float, ...], path: list[Any], stack: frozenset[Any]
-    ) -> None:
-        if current in stack or len(stack) >= 12:
+    def add_text(record, matrix, path):
+        raw = record.get("text") if _kind(record) == "MTEXT" else record.get("text_value")
+        text = _clean_text(
+            raw if raw is not None else record.get("text_value") or record.get("text")
+        )
+        if not text:
             return
+        point = text_point(record)
+        result["texts"].append(
+            {
+                "uid": f"{_ref(record.get('handle'))}@{'/'.join(map(str, path))}",
+                "record": record,
+                "text": text,
+                "point": _matrix_apply(entity_matrix(record, matrix), point)
+                if point is not None
+                else None,
+                "height": projected_height(record, matrix),
+                "layer": graph["layers"].get(_ref(record.get("layer")), ""),
+                "instance_path": list(path),
+            }
+        )
+
+    def add_line(a, b, record, path):
+        if math.dist(a, b) <= 1e-9:
+            return
+        result["lines"].append(
+            {
+                "a": a,
+                "b": b,
+                "record": record,
+                "layer": graph["layers"].get(_ref(record.get("layer")), ""),
+                "instance_path": list(path),
+                "source_ref": _source_ref(record, path),
+                "frame_hint": frame_hints.get(tuple(path)),
+            }
+        )
+
+    def visit(current, matrix, path, stack):
+        if current in stack or len(stack) >= 12:
+            result["diagnostics"].append(
+                {"block_handle": current, "reason": "cyclic_or_deep_block"}
+            )
+            return
+        name = str(graph["blocks"].get(current, {}).get("name") or "")
+        inherited = frame_hints.get(tuple(path[:-1])) if path else None
+        frame_hints[tuple(path)] = name if _FRAME_NAME_RE.search(name) else inherited
         for handle in graph["members"].get(current, []):
             record = graph["by_handle"].get(handle)
             if not record:
                 continue
             kind = _kind(record)
             result["objects"].append(record)
-            if kind in {"TEXT", "MTEXT", "ATTRIB"}:
-                raw = record.get("text") if kind == "MTEXT" else record.get("text_value")
-                if raw is None:
-                    raw = record.get("text_value") if kind == "MTEXT" else record.get("text")
-                text = _clean_text(raw)
-                if not text:
-                    continue
-                local_point = _point(record.get("ins_pt")) or _point(record.get("alignment_pt"))
-                height = record.get("text_height") if kind == "MTEXT" else record.get("height")
-                result["texts"].append(
-                    {
-                        "uid": f"{handle}@{'/'.join(map(str, path))}",
-                        "record": record,
-                        "text": text,
-                        "point": _matrix_apply(matrix, local_point) if local_point else None,
-                        "height": abs(float(height)) if isinstance(height, (int, float)) else 0.0,
-                        "layer": graph["layers"].get(_ref(record.get("layer")), ""),
-                        "instance_path": list(path),
-                    }
-                )
-            elif kind == "LINE":
-                start, end = _point(record.get("start")), _point(record.get("end"))
-                if start and end:
-                    result["lines"].append(
-                        {
-                            "a": _matrix_apply(matrix, start),
-                            "b": _matrix_apply(matrix, end),
-                            "record": record,
-                            "layer": graph["layers"].get(_ref(record.get("layer")), ""),
-                            "instance_path": list(path),
-                            "source_ref": _source_ref(record, path),
-                        }
-                    )
-            elif kind == "LWPOLYLINE":
-                points = [
-                    _matrix_apply(matrix, point)
-                    for value in record.get("points") or []
-                    if (point := _point(value))
-                ]
-                if len(points) >= 2:
-                    tolerance = 1e-9 * max(
-                        1.0,
-                        *(abs(coordinate) for point in points for coordinate in point),
-                    )
-                    repeated_endpoint = (
-                        len(points) >= 3 and math.dist(points[0], points[-1]) <= tolerance
-                    )
-                    closed = bool(int(record.get("flag") or 0) & (1 | 512)) or repeated_endpoint
-                    vertices = points[:-1] if repeated_endpoint else points
-                    pairs = list(zip(points, points[1:], strict=False))
-                    if closed and not repeated_endpoint:
-                        pairs.append((points[-1], points[0]))
-                    pairs = [(a, b) for a, b in pairs if math.dist(a, b) > 1e-9]
-                    result["lines"].extend(
-                        {
-                            "a": a,
-                            "b": b,
-                            "record": record,
-                            "layer": graph["layers"].get(_ref(record.get("layer")), ""),
-                            "instance_path": list(path),
-                            "source_ref": _source_ref(record, path),
-                        }
-                        for a, b in pairs
-                    )
-                    box = _bbox(points)
-                    orthogonal = all(
-                        abs(a[0] - b[0]) <= 1e-6 * max(1.0, abs(a[0]), abs(b[0]))
-                        or abs(a[1] - b[1]) <= 1e-6 * max(1.0, abs(a[1]), abs(b[1]))
-                        for a, b in [*pairs, (points[-1], points[0])]
-                    )
-                    if box and len(vertices) == 4 and orthogonal:
-                        frame = {
-                            "bbox": box,
-                            "source_kind": "closed_polyline",
-                            "source_ref": _source_ref(record, path),
-                            "confidence": "candidate",
-                        }
-                        if closed:
-                            result["frames"].append(frame)
-                        elif (
-                            _box_area(box) > 0
-                            and len(set(vertices)) == 4
-                            and not any(record.get("bulges") or [])
-                        ):
-                            open_rectangles.append((frame, points[0], points[-1]))
-            elif kind == "CIRCLE":
-                local_center = _point(record.get("center"))
-                radius = record.get("radius")
-                if local_center and isinstance(radius, (int, float)) and radius > 0:
-                    center = _matrix_apply(matrix, local_center)
-                    edge_x = _matrix_apply(
-                        matrix, (local_center[0] + float(radius), local_center[1])
-                    )
-                    edge_y = _matrix_apply(
-                        matrix, (local_center[0], local_center[1] + float(radius))
-                    )
-                    radius_x, radius_y = math.dist(center, edge_x), math.dist(center, edge_y)
-                    result["frames"].append(
-                        {
-                            "bbox": (
-                                center[0] - radius_x,
-                                center[1] - radius_y,
-                                center[0] + radius_x,
-                                center[1] + radius_y,
-                            ),
-                            "center": center,
-                            "radius": max(radius_x, radius_y),
-                            "source_kind": "circle",
-                            "source_ref": _source_ref(record, path),
-                            "confidence": "candidate",
-                        }
-                    )
-            elif kind == "INSERT":
-                insert_handle = _ref(record.get("handle"))
-                for attribute in graph["children"].get(insert_handle, []):
-                    if _kind(attribute) != "ATTRIB":
+            try:
+                if kind in {"TEXT", "MTEXT", "ATTRIB"}:
+                    add_text(record, matrix, path)
+                elif kind == "LINE":
+                    a, b = point3(record.get("start")), point3(record.get("end"))
+                    if a is not None and b is not None:
+                        add_line(_matrix_apply(matrix, a), _matrix_apply(matrix, b), record, path)
+                elif kind == "LWPOLYLINE":
+                    vertices = [
+                        p
+                        for value in record.get("points") or []
+                        if (p := point3(value)) is not None
+                    ]
+                    if len(vertices) != len(record.get("points") or []):
+                        raise ValueError("invalid_polyline_points")
+                    if len(vertices) < 2:
                         continue
-                    text = _clean_text(attribute.get("text_value") or attribute.get("text"))
-                    point = _point(attribute.get("ins_pt")) or _point(attribute.get("alignment_pt"))
-                    if text:
-                        result["texts"].append(
-                            {
-                                "uid": f"{_ref(attribute.get('handle'))}@{'/'.join(map(str, path + [insert_handle]))}",
-                                "record": attribute,
-                                "text": text,
-                                "point": _matrix_apply(matrix, point) if point else None,
-                                "height": abs(float(attribute.get("height") or 0.0)),
-                                "layer": graph["layers"].get(_ref(attribute.get("layer")), ""),
-                                "instance_path": path + [insert_handle],
-                            }
-                        )
-                nested_handle = _ref(record.get("block_header"))
-                nested = graph["blocks"].get(nested_handle)
-                if not nested:
-                    continue
-                nested_matrix = _matrix_multiply(matrix, _insert_matrix(record, nested))
-                name = str(nested.get("name") or "")
-                local_box = _block_bbox(nested_handle, graph)
-                if local_box:
-                    transformed = _bbox(
-                        _matrix_apply(nested_matrix, point)
-                        for point in (
-                            (local_box[0], local_box[1]),
-                            (local_box[0], local_box[3]),
-                            (local_box[2], local_box[1]),
-                            (local_box[2], local_box[3]),
-                        )
+                    local = [(p[0], p[1], float(record.get("elevation") or 0.0)) for p in vertices]
+                    transform = entity_matrix(record, matrix)
+                    points = [_matrix_apply(transform, p) for p in local]
+                    tol = max(
+                        1e-9,
+                        max(math.ulp(v) for p in points for v in p) * 16,
+                        max(math.dist(a, b) for a, b in zip(points, points[1:], strict=False))
+                        * 1e-8,
                     )
-                    if transformed:
+                    repeated = len(points) >= 3 and math.dist(points[0], points[-1]) <= tol
+                    # LibreDWG JSON stores the DWG flag: 512 closed, 1 extrusion.
+                    closed = bool(int(record.get("flag") or 0) & 512) or repeated
+                    pairs = list(zip(points, points[1:], strict=False))
+                    if closed and not repeated:
+                        pairs.append((points[-1], points[0]))
+                    bulges = record.get("bulges") or []
+                    for i, (a, b) in enumerate(pairs):
+                        if i >= len(bulges) or not bulges[i]:
+                            add_line(a, b, record, path)
+                    local_polygon = rectangle(local) if not any(bulges) else None
+                    if local_polygon:
+                        # Retain the projected polygon, even when a tilted OCS makes its AABB misleading.
+                        polygon = [
+                            _matrix_apply(transform, (p[0], p[1], local[0][2]))
+                            for p in local_polygon
+                        ]
+                        box = _bbox(polygon)
+                        origin = polygon[0]
+                        projected_area = (
+                            abs(
+                                sum(
+                                    (a[0] - origin[0]) * (b[1] - origin[1])
+                                    - (a[1] - origin[1]) * (b[0] - origin[0])
+                                    for a, b in zip(
+                                        polygon, polygon[1:] + polygon[:1], strict=False
+                                    )
+                                )
+                            )
+                            / 2
+                        )
+                        if box and projected_area > tol * tol:
+                            frame = {
+                                "bbox": box,
+                                "boundary": polygon,
+                                "source_kind": "closed_polyline",
+                                "source_ref": _source_ref(record, path),
+                                "confidence": "candidate",
+                                "frame_hint": frame_hints.get(tuple(path)),
+                            }
+                            if closed:
+                                result["frames"].append(frame)
+                            elif len(local) == 4:
+                                open_rectangles.append((frame, points[0], points[-1], tol))
+                elif kind == "CIRCLE":
+                    p = point3(record.get("center"))
+                    radius = float(record.get("radius") or 0.0)
+                    if p is not None and radius > 0:
+                        transform = entity_matrix(record, matrix)
+                        center = _matrix_apply(transform, p)
+                        a = _matrix_apply(transform, (p[0] + radius, p[1], p[2]))
+                        b = _matrix_apply(transform, (p[0], p[1] + radius, p[2]))
+                        rx = math.hypot(a[0] - center[0], b[0] - center[0])
+                        ry = math.hypot(a[1] - center[1], b[1] - center[1])
                         result["frames"].append(
                             {
-                                "bbox": transformed,
-                                "source_kind": "frame_block"
-                                if _FRAME_NAME_RE.search(name)
-                                else "block_bbox",
-                                "block_name": name,
+                                "bbox": (
+                                    center[0] - rx,
+                                    center[1] - ry,
+                                    center[0] + rx,
+                                    center[1] + ry,
+                                ),
+                                "center": center,
+                                "radius": max(rx, ry),
+                                "source_kind": "circle",
                                 "source_ref": _source_ref(record, path),
-                                "confidence": "exact"
-                                if _FRAME_NAME_RE.search(name)
-                                else "candidate",
+                                "confidence": "candidate",
                             }
                         )
-                visit(nested_handle, nested_matrix, path + [insert_handle], stack | {current})
-
-        # Attached ATTRIBs and older LibreDWG records are not always listed in entities.
+                elif kind == "INSERT":
+                    insertion_handle = _ref(record.get("handle"))
+                    for attr in graph["children"].get(insertion_handle, []):
+                        if _kind(attr) == "ATTRIB":
+                            add_text(attr, matrix, path + [insertion_handle])
+                    nested_handle = _ref(record.get("block_header"))
+                    nested = graph["blocks"].get(nested_handle)
+                    if nested:
+                        transform = _matrix_multiply(matrix, _insert_matrix(record, nested))
+                        # Extents are auxiliary geometry, never standalone sheet candidates.
+                        box = _block_bbox3(nested_handle, graph)
+                        if box:
+                            world = _bbox(
+                                _matrix_apply(transform, (x, y, z))
+                                for x in (box[0], box[3])
+                                for y in (box[1], box[4])
+                                for z in (box[2], box[5])
+                            )
+                            result["frames"].append(
+                                {
+                                    "bbox": world,
+                                    "source_kind": "block_bbox",
+                                    "block_name": str(nested.get("name") or ""),
+                                    "source_ref": _source_ref(record, path),
+                                    "confidence": "extent_only",
+                                }
+                            )
+                        visit(
+                            nested_handle, transform, path + [insertion_handle], stack | {current}
+                        )
+                elif kind in {"IMAGE", "OLE2FRAME"}:
+                    p = point3(record.get("ins_pt")) or point3(record.get("pt0"))
+                    if p is not None:
+                        result["images"].append(
+                            {
+                                "point": _matrix_apply(matrix, p),
+                                "source_ref": _source_ref(record, path),
+                            }
+                        )
+            except (TypeError, ValueError, OverflowError) as exc:
+                result["diagnostics"].append(
+                    {"source_ref": _source_ref(record, path), "reason": str(exc)}
+                )
         listed = set(graph["members"].get(current, []))
         for record in graph["children"].get(current, []):
-            if _ref(record.get("handle")) in listed:
-                continue
-            kind = _kind(record)
-            if kind not in {"TEXT", "MTEXT", "ATTRIB"}:
-                continue
-            raw = record.get("text") if kind == "MTEXT" else record.get("text_value")
-            text = _clean_text(raw if raw is not None else record.get("text"))
-            point = _point(record.get("ins_pt")) or _point(record.get("alignment_pt"))
-            if text:
-                result["texts"].append(
-                    {
-                        "uid": f"{_ref(record.get('handle'))}@{'/'.join(map(str, path))}",
-                        "record": record,
-                        "text": text,
-                        "point": _matrix_apply(matrix, point) if point else None,
-                        "height": abs(
-                            float(record.get("text_height") or record.get("height") or 0.0)
-                        ),
-                        "layer": graph["layers"].get(_ref(record.get("layer")), ""),
-                        "instance_path": list(path),
-                    }
-                )
+            if _ref(record.get("handle")) not in listed and _kind(record) in {
+                "TEXT",
+                "MTEXT",
+                "ATTRIB",
+            }:
+                try:
+                    add_text(record, matrix, path)
+                except (TypeError, ValueError, OverflowError) as exc:
+                    result["diagnostics"].append(
+                        {"source_ref": _source_ref(record, path), "reason": str(exc)}
+                    )
 
-    visit(block_handle, identity, [], frozenset())
-    # Some native borders are a three-sided polyline plus an independent LINE.
-    # Require its actual complete closing edge in the same placed block; do not
-    # invent a segment, bridge gaps, or change any native points/closed flags.
-    line_edges = {
-        (tuple(line["instance_path"]), frozenset((line["a"], line["b"]))): line["source_ref"]
-        for line in result["lines"]
-        if _kind(line["record"]) == "LINE"
-    }
-    for frame, start, end in open_rectangles:
-        key = (tuple(frame["source_ref"].get("instance_path", [])), frozenset((start, end)))
-        if closing_line := line_edges.get(key):
-            frame["source_kind"] = "polyline_with_line"
-            frame["source_ref"]["closing_line"] = closing_line
-            result["frames"].append(frame)
-    deduplicated = {record["uid"]: record for record in result["texts"]}
-    result["texts"] = list(deduplicated.values())
+    visit(block_handle, IDENTITY, [], frozenset())
+    # Preserve the older, specific source locator when a native LINE closes an open U.
+    for frame, start, end, tol in open_rectangles:
+        for line in result["lines"]:
+            if _kind(line["record"]) != "LINE" or line["instance_path"] != frame["source_ref"].get(
+                "instance_path", []
+            ):
+                continue
+            if (
+                min(
+                    max(math.dist(start, line["a"]), math.dist(end, line["b"])),
+                    max(math.dist(start, line["b"]), math.dist(end, line["a"])),
+                )
+                <= tol
+            ):
+                frame["source_kind"] = "polyline_with_line"
+                frame["source_ref"]["closing_line"] = line["source_ref"]
+                result["frames"].append(frame)
+                break
+    result["frames"].extend(line_frames(result["lines"]))
+    result["texts"] = list({record["uid"]: record for record in result["texts"]}.values())
     return result
 
 
-def _select_frames(space: dict[str, list[dict[str, Any]]]) -> list[dict[str, Any]]:
-    frames = [
-        frame
-        for frame in space["frames"]
-        if frame.get("source_kind")
-        in {"frame_block", "block_bbox", "closed_polyline", "polyline_with_line"}
-    ]
-    if not frames:
-        return []
-    # Sheet frames in the supported Model-Space corpus are top-level drawing
-    # objects. Nested rectangles are rooms, symbols, tables, and block internals.
-    # ponytail: fall back to nested candidates only if a future corpus groups all
-    # physical sheets inside one master INSERT.
-    top_level = [frame for frame in frames if not frame.get("source_ref", {}).get("instance_path")]
-    candidates = top_level or frames
-    # Compare frame sizes to candidate frames, not distant unframed geometry.
-    # Otherwise one stray line can shrink every real Sheet below the size cutoff.
-    span_x = max(1.0, *(frame["bbox"][2] - frame["bbox"][0] for frame in candidates))
-    span_y = max(1.0, *(frame["bbox"][3] - frame["bbox"][1] for frame in candidates))
-    filtered = []
-    for frame in candidates:
-        box = frame["bbox"]
-        width, height = box[2] - box[0], box[3] - box[1]
-        if width <= 0 or height <= 0:
-            continue
-        aspect = width / max(height, 1e-12)
-        large_enough = max(width / span_x, height / span_y) >= 0.06
-        if frame["source_kind"] == "frame_block" or (0.28 <= aspect <= 3.6 and large_enough):
-            filtered.append(frame)
-    dimension_groups: list[list[dict[str, Any]]] = []
-    for frame in filtered:
-        box = frame["bbox"]
-        width, height = box[2] - box[0], box[3] - box[1]
-        block_name = frame.get("block_name")
-        group = next(
-            (
-                group
-                for group in dimension_groups
-                if (
-                    group[0].get("block_name") == block_name
-                    if group[0].get("block_name") or block_name
-                    else True
-                )
-                if abs((group[0]["bbox"][2] - group[0]["bbox"][0]) - width) <= width * 0.02
-                and abs((group[0]["bbox"][3] - group[0]["bbox"][1]) - height) <= height * 0.02
-            ),
-            None,
-        )
-        if group is None:
-            dimension_groups.append([frame])
-        else:
-            group.append(frame)
-    repeated = [frame for group in dimension_groups if len(group) >= 2 for frame in group]
-    if repeated:
-        repeated_ids = {id(frame) for frame in repeated}
-        retained_unique = []
-        for frame in filtered:
-            if id(frame) in repeated_ids:
-                continue
-            contained_centers = {
-                (
-                    round((other["bbox"][0] + other["bbox"][2]) / 2, 6),
-                    round((other["bbox"][1] + other["bbox"][3]) / 2, 6),
-                )
-                for other in repeated
-                # Repeated component bounds are not evidence of separate Sheets.
-                if other["source_kind"] in {"closed_polyline", "polyline_with_line", "frame_block"}
-                and _contains(frame["bbox"], other["bbox"])
-                and _box_area(other["bbox"]) < _box_area(frame["bbox"])
-            }
-            if not contained_centers:
-                retained_unique.append(frame)
-        filtered = repeated + retained_unique
-    accepted: list[dict[str, Any]] = []
-    for frame in sorted(filtered, key=lambda item: _box_area(item["bbox"]), reverse=True):
-        box = frame["bbox"]
-        if any(
-            _contains(existing["bbox"], box) and _box_area(box) < _box_area(existing["bbox"])
-            for existing in accepted
-        ):
-            continue
-        accepted.append(frame)
-    # De-duplicate coincident frame geometry without rounding drawing units.
-    unique: list[dict[str, Any]] = []
-    tolerance = 1e-5 * max(span_x, span_y)
-    for frame in accepted:
-        if any(
-            all(abs(a - b) <= tolerance for a, b in zip(frame["bbox"], item["bbox"], strict=True))
-            for item in unique
-        ):
-            continue
-        unique.append(frame)
-    return sorted(unique, key=lambda item: (-item["bbox"][3], item["bbox"][0]))
+def _select_frames(space):
+    return select_frames(space)
 
 
 def _native_tables(
@@ -696,8 +634,12 @@ def _classify_sheet(
     frames: list[dict[str, Any]],
     lines: list[dict[str, Any]],
     sheet_bbox: tuple[float, float, float, float] | None,
+    *,
+    extract_document_geometry: bool = True,
 ) -> dict[str, Any]:
     meta, used = _extract_meta(records, summary, sheet_bbox)
+    if not extract_document_geometry:
+        return {"meta": meta, "tables": [], "markers": []}
     tables = _native_tables(objects, sheet_bbox)
     # ponytail: dense plans contain hundreds of thousands of orthogonal segments;
     # exhaustive grid reconstruction is for document/table sheets, not floor plans.
@@ -1673,6 +1615,54 @@ def build_sheet_artifacts(
         if str(block.get("name") or "").casefold() == "*model_space"
     )
     candidates: list[dict[str, Any]] = []
+    geometry_diagnostics = []
+
+    def add_frames(space, frames, space_kind, block_handle, layout=None):
+        for frame in frames:
+            source_ref = frame["source_ref"]
+            locator = f"frame:{source_ref.get('handle')}:{'/'.join(map(str, source_ref.get('instance_path', [])))}"
+            if frame["source_kind"] == "line_frame":
+                # Several adjacent frames may share the same long source LINE.
+                signature = repr((frame["boundary"], frame.get("boundary_sources", [])))
+                locator += ":" + hashlib.sha256(signature.encode()).hexdigest()[:16]
+            source_locator = {
+                "kind": frame["source_kind"],
+                "source_ref": source_ref,
+                "space_kind": space_kind,
+                "block_handle": block_handle,
+            }
+            if layout is not None:
+                source_locator["layout_handle"] = _ref(layout.get("handle"))
+                locator = f"layout:{source_locator['layout_handle']}:" + locator
+            candidates.append(
+                {
+                    "kind": "model_frame" if space_kind == "model" else "layout_frame",
+                    "layout_name": None
+                    if layout is None
+                    else str(layout.get("layout_name") or layout.get("name") or "Layout"),
+                    "locator": locator,
+                    "source_locator": source_locator,
+                    "source_refs": frame.get("boundary_sources", [source_ref]),
+                    "texts": [r for r in space["texts"] if _inside_frame(frame, r["point"])],
+                    "objects": space["objects"],
+                    "geometry_frames": [
+                        g for g in space["frames"] if _frame_contains_box(frame, g["bbox"])
+                    ],
+                    "lines": [
+                        line
+                        for line in space["lines"]
+                        if _inside_frame(frame, line["a"]) and _inside_frame(frame, line["b"])
+                    ],
+                    "bbox": frame["bbox"],
+                    "boundary": frame["boundary"],
+                    "boundary_sources": frame.get("boundary_sources", [source_ref]),
+                    "detection_evidence": frame.get("detection_evidence", {}),
+                    "viewport_projection": "unresolved"
+                    if layout is not None and any(_kind(r) == "VIEWPORT" for r in space["objects"])
+                    else "not_applicable",
+                }
+            )
+
     for layout in layouts:
         name = str(layout.get("layout_name") or layout.get("name") or "Layout")
         block_handle = _ref(layout.get("block_header"))
@@ -1683,79 +1673,90 @@ def build_sheet_artifacts(
         ):
             continue
         space = _walk_block(block_handle, graph)
+        viewports = sorted(
+            {
+                _ref(r.get("handle"))
+                for r in space["objects"]
+                if _kind(r) == "VIEWPORT" and _ref(r.get("handle")) is not None
+            },
+            key=str,
+        )
         meaningful = [
-            record for record in space["objects"] if _kind(record) not in {"BLOCK", "ENDBLK"}
+            r
+            for r in space["objects"]
+            if _kind(r) not in {"BLOCK", "ENDBLK", "SEQEND", "VIEWPORT", "DICTIONARY"}
+            and r.get("entity")
         ]
         if not space["texts"] and not meaningful:
-            continue
-        viewport_handles = {
-            _ref(value) for value in layout.get("viewports") or [] if _ref(value) is not None
-        }
-        viewport_handles.update(
-            _ref(record.get("handle"))
-            for record in meaningful
-            if _kind(record) == "VIEWPORT" and _ref(record.get("handle")) is not None
-        )
-        candidates.append(
-            {
-                "kind": "layout",
-                "layout_name": name,
-                "locator": f"layout:{_ref(layout.get('handle'))}:{block_handle}",
-                "source_locator": {
-                    "kind": "layout",
-                    "layout_handle": _ref(layout.get("handle")),
+            geometry_diagnostics.append(
+                {
+                    "space_kind": "paper",
                     "block_handle": block_handle,
-                    "viewport_handles": sorted(viewport_handles, key=str),
-                },
-                "source_refs": [_source_ref(layout, [])],
-                "texts": space["texts"],
-                "objects": space["objects"],
-                "geometry_frames": space["frames"],
-                "lines": space["lines"],
-                "viewport_projection": "unresolved" if viewport_handles else "not_applicable",
-            }
-        )
-    for block_handle in model_blocks:
+                    "layout_handle": _ref(layout.get("handle")),
+                    "reason": "viewport_only_or_empty_layout",
+                    "viewport_handles": viewports,
+                }
+            )
+            continue
+        selected = _select_frames(space)
+        # Paper-space table cells and loose title strips have real rectangular
+        # edges too. Without sheet identity evidence or viewport projection they
+        # cannot establish independent sheets; retain the layout as unresolved.
+        frames = [f for f in selected if f["detection_evidence"]["identity_supported"]]
+        for frame in selected:
+            if not frame["detection_evidence"]["identity_supported"]:
+                geometry_diagnostics.append(
+                    {
+                        "space_kind": "paper",
+                        "block_handle": block_handle,
+                        "reason": "paper_boundary_without_sheet_identity",
+                        "bbox": list(frame["bbox"]),
+                        "source_ref": frame["source_ref"],
+                    }
+                )
+        add_frames(space, frames, "paper", block_handle, layout)
+        geometry_diagnostics.extend(space["diagnostics"])
+        if not frames:
+            candidates.append(
+                {
+                    "kind": "layout_unframed",
+                    "layout_name": name,
+                    "locator": f"layout:{_ref(layout.get('handle'))}:{block_handle}:unframed",
+                    "source_locator": {
+                        "kind": "layout",
+                        "layout_handle": _ref(layout.get("handle")),
+                        "block_handle": block_handle,
+                        "viewport_handles": viewports,
+                        "space_kind": "paper",
+                    },
+                    "source_refs": [_source_ref(layout, [])],
+                    "texts": space["texts"],
+                    "objects": space["objects"],
+                    "geometry_frames": [],
+                    "lines": [],
+                    "viewport_projection": "unresolved" if viewports else "not_applicable",
+                }
+            )
+    for block_handle in sorted(model_blocks, key=str):
         if block_handle not in graph["blocks"]:
             continue
         space = _walk_block(block_handle, graph)
         frames = _select_frames(space)
-        assigned: set[str] = set()
-        for frame in frames:
-            texts = [record for record in space["texts"] if _inside(frame["bbox"], record["point"])]
-            assigned.update(record["uid"] for record in texts)
-            source_ref = frame["source_ref"]
-            locator = f"frame:{source_ref.get('handle')}:{'/'.join(map(str, source_ref.get('instance_path', [])))}"
-            candidates.append(
-                {
-                    "kind": "model_frame",
-                    "layout_name": None,
-                    "locator": locator,
-                    "source_locator": {"kind": frame["source_kind"], "source_ref": source_ref},
-                    "source_refs": [source_ref],
-                    "texts": texts,
-                    "objects": space["objects"],
-                    "geometry_frames": [
-                        item for item in space["frames"] if _contains(frame["bbox"], item["bbox"])
-                    ],
-                    "lines": [
-                        line
-                        for line in space["lines"]
-                        if _inside(frame["bbox"], line["a"]) and _inside(frame["bbox"], line["b"])
-                    ],
-                    "bbox": frame["bbox"],
-                }
-            )
-        outside = [record for record in space["texts"] if record["uid"] not in assigned]
-        if outside and not frames:
+        add_frames(space, frames, "model", block_handle)
+        geometry_diagnostics.extend(space["diagnostics"])
+        if space["texts"] and not frames:
             candidates.append(
                 {
                     "kind": "model_unframed",
                     "layout_name": "Model",
                     "locator": f"model:{block_handle}:unframed",
-                    "source_locator": {"kind": "model_space", "block_handle": block_handle},
+                    "source_locator": {
+                        "kind": "model_space",
+                        "block_handle": block_handle,
+                        "space_kind": "model",
+                    },
                     "source_refs": [{"block_handle": block_handle}],
-                    "texts": outside,
+                    "texts": space["texts"],
                     "objects": space["objects"],
                     "geometry_frames": [],
                     "lines": [],
@@ -1776,6 +1777,15 @@ def build_sheet_artifacts(
         ]
         for candidate, future in zip(candidates, pending, strict=True):
             candidate["_functional_regions"], candidate["_region_diagnostic"] = future.result()
+    candidate_diagnostics = [
+        {
+            "kind": c["kind"],
+            "source_locator": c["source_locator"],
+            "bbox": c.get("bbox"),
+            "region_diagnostic": c["_region_diagnostic"],
+        }
+        for c in candidates
+    ]
     candidates = [
         candidate
         for candidate in candidates
@@ -1820,6 +1830,7 @@ def build_sheet_artifacts(
     sheets = []
     for ordinal, candidate in enumerate(candidates, 1):
         sheet_id = _sheet_id(source_sha256, candidate["locator"])
+        functional_regions = candidate.pop("_functional_regions")
         classified = _classify_sheet(
             candidate["texts"],
             candidate["objects"],
@@ -1827,6 +1838,9 @@ def build_sheet_artifacts(
             candidate.get("geometry_frames", []),
             candidate.get("lines", []),
             candidate.get("bbox"),
+            extract_document_geometry=any(
+                region["type"] in {"document", "table"} for region in functional_regions
+            ),
         )
         fallback = candidate.get("layout_name") or f"Sheet {ordinal:03d}"
         title = next(
@@ -1837,7 +1851,6 @@ def build_sheet_artifacts(
             ),
             fallback,
         )
-        functional_regions = candidate.pop("_functional_regions")
         region_diagnostic = candidate.pop("_region_diagnostic")
         document_regions, ambiguous = _functional_documents(
             functional_regions, candidate["texts"], classified["tables"]
@@ -1926,19 +1939,45 @@ def build_sheet_artifacts(
                 "kind": candidate["kind"],
                 "source_locator": candidate["source_locator"],
                 "bbox": list(candidate["bbox"]) if candidate.get("bbox") else None,
+                "boundary": candidate.get("boundary"),
+                "boundary_sources": candidate.get("boundary_sources", []),
+                "detection_evidence": candidate.get("detection_evidence", {}),
+                "viewport_projection": candidate.get("viewport_projection", "not_applicable"),
                 "regions": functional_regions,
                 "_texts": candidate["texts"],
                 "markdown_uids": markdown_uids,
                 "status": partition_status,
             }
         )
+    bounded_kinds = {"model_frame", "layout_frame"}
+    statistics = {
+        "candidate_count": sum(c["kind"] in bounded_kinds for c in candidate_diagnostics),
+        "detected_sheet_count": sum(s["kind"] in bounded_kinds for s in sheets),
+        "rejected_candidate_count": sum(
+            c["region_diagnostic"]["status"] == "not_sheet" for c in candidate_diagnostics
+        ),
+        "unframed_bundle_count": sum(
+            s["kind"] in {"model_unframed", "layout_unframed"} for s in sheets
+        ),
+        "synthetic_fallback_count": sum(s["kind"] == "synthetic" for s in sheets),
+        "boundary_only_sheet_count": sum(
+            s["kind"] in bounded_kinds
+            and not s.get("detection_evidence", {}).get("identity_supported")
+            for s in sheets
+        ),
+        "sheet_bundle_count": len(sheets),
+    }
     document_id = "dwg-" + source_sha256[:16]
     document = {
         "schema": SHEET_DOCUMENT_SCHEMA,
         "document_id": document_id,
         "source": {"file": source_name, "sha256": source_sha256, "size_bytes": source_size_bytes},
         "summary_info": summary,
-        "sheet_count": len(sheets),
+        "sheet_count": statistics["detected_sheet_count"],
+        "sheet_bundle_count": len(sheets),
+        "detection_statistics": statistics,
+        "candidate_diagnostics": candidate_diagnostics,
+        "geometry_diagnostics": geometry_diagnostics,
         "sheets": [
             {
                 key: sheet[key]

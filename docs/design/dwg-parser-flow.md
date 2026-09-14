@@ -1,8 +1,8 @@
 # DWGParser 当前链路流程说明
 
-版本：DWGParser 10.0，含区域请求并发、摘要队列补位及已验证的 OVPack 恢复修复。
+版本：DWGParser 10.1，新增无需模型的坐标、图框及数量统计修正。区域模型调用、提示词及摘要链路未调整。
 
-核对日期：2026-09-10。
+核对日期：2026-09-14（10.1 几何回归）；正式导入和 OVPack 的历史验证日期见下文。
 适用范围：通过 `add_resource(bundle=true)` 正式导入 DWG，启用索引并等待处理完成。
 
 当前链路以 **LibreDWG 的完整、规范化 JSON 为数据底稿**：先识别 Sheet，用临时图像辅助选择说明和独立表格，将这些正文整理成 Markdown，其余原生数据保存在文档级或 Sheet 级完整 JSON 中。OV 以 Sheet 为检索单位，自动摘要和 Embedding 只处理 Sheet Markdown；JSON 作为命中 Sheet 后可按需读取的证据。
@@ -13,7 +13,7 @@
 flowchart TD
     A[原始 DWG] --> B[读取源文件并计算 SHA-256]
     B --> C[LibreDWG 转换与 JSON 规范化]
-    C --> D[依据原生 Layout / Model 图框识别 Sheet 候选]
+    C --> D[展开块实例并验证 Model / Paper Space 的独立图框]
     D --> E[仅为 Model 图框候选生成临时图像]
     A -. 渲染使用源 DWG .-> E
     E --> F[VLM 选择说明区和独立表格区]
@@ -39,7 +39,7 @@ flowchart TD
 |---|---|---|---|
 | 读取源文件 | 读取原始字节，计算 SHA-256，确定来源标识 | 源 DWG 快照、来源信息 | 否 |
 | LibreDWG 转换 | 调用 `dwgread`，完整读取顶层字段和 `OBJECTS`，处理不合法的编码和数值表示 | 内存中的规范化 JSON | 否 |
-| Sheet 识别 | 遍历 Layout、Model Space 和块实例，复用现有图框识别逻辑 | Sheet 候选、范围、稳定标识 | 否 |
+| Sheet 识别 | 展开 Model / Paper Space 的块实例，核验实际边界及标题栏证据 | Sheet 候选、多边形、范围、稳定标识及诊断 | 否 |
 | 临时渲染与区域选择 | 渲染 Sheet 图像，让 VLM 选择说明、独立表格区域，并校验候选是否为 Sheet | 区域类型和范围 | VLM |
 | Markdown / JSON 整理 | 从原生文字生成 Markdown；保留其余字段，按作用域和空间顺序组织 JSON | `context*.md`、`metadata.json`、`drawing.json` | 否 |
 | 暂存与产物校验 | 写入源文件和产物，校验目录、白名单、JSON 语法及哈希等 | 待发布目录、产物清单信息 | 否 |
@@ -53,7 +53,18 @@ flowchart TD
 
 Sheet 的标识由源文件和原生位置标识生成，图名、图号用于展示，不靠 VLM 命名每张图。识别 Sheet 不会导出独立的 `sheet.dwg`。
 
-当前已验证的主要路径是 **Model Space 图框**。代码可以发现 Paper Space Layout 候选，但当前不对它们进行这一步图像渲染和 VLM 区域选择，也没有完整实现 Viewport 投影和对应的空间归属；相关原始数据仍保留，状态标记为 `partial`。
+当前已验证的主要路径是 **Model Space 图框**。10.1 的确定性识别步骤为：
+
+1. 按 LibreDWG 的 OCS/extrusion、块基点、插入点、缩放和旋转，在三维中组合嵌套实例变换，最后投影到二维；Sheet 识别与 JSON 归属共用坐标实现。
+2. 核验闭合直边多段线，或能由真实 LINE 拼成的矩形；保留旋转边界，不把任意块的包围盒当作图框。LibreDWG LWPOLYLINE 的闭合标志为 `512`，`1` 不能用作闭合标志。
+3. 使用局部文字尺寸、标题字段、目录、图框块名称等证据筛选，排除空占位格、打印样式示例、重复内框及普通构件；不再以全图最大包围盒的百分比决定最小图纸尺寸。外框包含多个独立标题栏时才考虑拆为子图纸。
+4. 文字和原生对象使用实际边界多边形判断归属；旋转图框的轴对齐包围盒只用于粗筛。
+
+Paper Space 可以包含多个独立图框；仅有 VIEWPORT 的 Layout 不单独计数。零散表格边框或标题栏不足以确认独立 Sheet，会保留为 `layout_unframed`。当前不对 Paper Space 执行图像渲染和 VLM 区域选择，Viewport 投影及 Model/Paper 重复图纸对应关系仍未完整实现，相关内容保持 `partial`。
+
+`document.sheet_count` 表示保留下来的有图框 Sheet 数量；`sheet_bundle_count` 表示实际存储的 Bundle 数量，包含未确定图框的内容容器和 synthetic 回退，因此两者可能不同。`detection_statistics` 记录候选、模型拒绝、无框容器、回退容器等数量；其中 `boundary_only_sheet_count` 表示只有边界证据的弱候选，不能视为已核实的带编号图纸。候选模型诊断、几何问题、边界及来源引用会写入 metadata JSON。
+
+几何识别仍是启发式推断，不是 DWG 自带的子图纸清单。代理对象、未支持的曲线/图框、缺失标题证据和复杂空间对应关系仍可能影响数量。
 
 视觉输入另走临时渲染路径：通过 ODA File Converter 和 ezdxf 读取用于显示的内容，生成 Model Space 绘制记录，再按 Sheet 范围裁出图像。该渲染结果在一次解析中复用，图像不作为长期 parser 产物保存。临时显示文字的修复不改写原始 DWG 或原生 JSON 字段。
 
@@ -67,11 +78,13 @@ VLM 接收 Sheet 图像和区域选择指令，不接收保存下来的 JSON 数
 - 不再划分、命名或保存独立 View，不进行第二轮局部复看。
 - 纯图纸返回空区域列表是正常情况，图区内的文字仍留在 JSON。
 - 仅明确返回 `is_sheet=false` 的候选会被排除；未知区域、渲染或识别不可用会记录不确定状态。
-- 若最终没有有效候选，保留一个合成的 `partial` Sheet 表示，原始数据仍保留。
+- 若最终没有有效候选，保留一个合成的 `partial` Bundle 表示；它不计入 `sheet_count`，原始数据仍保留。
 
 ### Markdown 整理与正文迁移
 
 现有文字、表格和阅读顺序逻辑生成 `context.md`；内容超过 Markdown 配置预算时生成 `context_001.md` 等多份文件。标题栏中可解析的图名、图号等信息仍由原有逻辑整理为 Sheet 元数据，不属于 VLM 选择的说明正文。
+
+没有 document/table 区域时，10.1 跳过不参与正文输出的表格网格和选项框重建，仍提取元数据并保留原生 JSON。
 
 只有正文实际写入 Markdown、且相应文字对象的所有真实使用实例均被覆盖后，才移除 JSON 中对应的正文字符串字段。对象的其他字段和必要的 Markdown 来源引用继续保留；如果还有实例用作图内标注，或归属不确定，则保留原文。原生表格结构也不会因生成 Markdown 而被删除。
 
@@ -116,7 +129,7 @@ VLM 接收 Sheet 图像和区域选择指令，不接收保存下来的 JSON 数
 
 JSON 按最终保留的 Sheet 范围判断归属，不按 VLM 的说明区或 View 边界切分。
 
-每个文档固定有根 metadata 和 drawing，每个 Sheet 有一份 drawing；空作用域保留空数组。因此有 N 个 Sheet 时，parser JSON 共 **N + 2 份**，不含系统 manifest。JSON 不再受 2048 tokens / 6000 字符的持久化分片限制，也不生成 fragment。旧版本分片仍可读取和重组。
+每个文档固定有根 metadata 和 drawing，每个 Sheet Bundle 有一份 drawing；空作用域保留空数组。因此有 N 个 Bundle 时，parser JSON 共 **N + 2 份**，不含系统 manifest。JSON 不再受 2048 tokens / 6000 字符的持久化分片限制，也不生成 fragment。旧版本分片仍可读取和重组。
 
 ## 4. 哪些内容进入模型
 
@@ -161,7 +174,9 @@ flowchart LR
 
 当前仍有多栏阅读顺序、表格规整、SHX 字符以及不支持几何等局限。数据保全、成功入库和答题正确率分别验证，不用其中一项代替其他项。
 
-## 7. T0202 的已验证实例
+## 7. T0202 的历史导入记录（10.0）
+
+以下是 10.0 的历史运行数据，19 是旧算法结果，包含误识别，不能作为实际图纸数量。10.1 不调用模型的原始 JSON 回归识别为 18 张，与已复核的 17 张编号图纸和 1 张目录一致；没有重新执行整套正式导入、摘要或索引来更新下表耗时。
 
 2026-09-10 对同一份 T0202 实测得到：
 

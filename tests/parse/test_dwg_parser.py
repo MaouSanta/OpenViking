@@ -117,7 +117,7 @@ async def test_dwg_parser_preserves_json_and_never_exports_sheet_dwg(tmp_path: P
         result = await parser.parse(source, sheet_dwg_exporter=fake_sheet_export)
 
     assert result.precomputed_semantics is False
-    assert result.parser_version == "10.0"
+    assert result.parser_version == "10.1"
     assert any(uri.endswith("/building-plan.dwg") for uri in fake_fs.files)
     assert not any(uri.endswith("/libredwg.json") for uri in fake_fs.files)
     assert not any(uri.endswith("/.overview.md") for uri in fake_fs.files)
@@ -143,6 +143,9 @@ async def test_dwg_parser_preserves_json_and_never_exports_sheet_dwg(tmp_path: P
         for segment in ("catalog", "shared", "unassigned", "views", "chunks")
     )
     assert result.meta["parse_status"] == "partial"
+    assert result.meta["sheet_count"] == 0
+    assert result.meta["sheet_bundle_count"] == 1
+    assert result.meta["detection_statistics"]["unframed_bundle_count"] == 1
     assert result.meta["source_sha256"]
     assert any("proxy objects" in warning for warning in result.warnings)
 
@@ -464,8 +467,9 @@ def test_layout_with_viewport_is_explicitly_marked_incomplete_until_projection()
     )
 
     sheet = result["sheets"][0]
-    assert sheet["kind"] == "layout"
-    assert sheet["source_locator"]["viewport_handles"] == [22]
+    assert sheet["kind"] == "synthetic"
+    assert result["document"]["sheet_count"] == 0
+    assert result["document"]["geometry_diagnostics"][0]["viewport_handles"] == [22]
     assert sheet["region_diagnostic"]["status"] == "unsupported_sheet"
     assert sheet["status"] == "partial"
     assert not sheet["markdown_uids"]
@@ -526,7 +530,7 @@ def test_named_title_block_does_not_suppress_the_outer_sheet_frame():
 def test_repeated_electrical_block_bounds_do_not_displace_the_real_outer_frame():
     # Source 89fdddd5: one real frame and two repeated narrow electrical symbols.
     outer = {
-        "source_kind": "frame_block",
+        "source_kind": "closed_polyline",
         "source_ref": {"object_index": 5768, "handle": 43419},
         "block_name": "华天图框标准",
         "bbox": [53747748.438134015, 8671345.958182577, 53895588.438134015, 8775889.958182577],
@@ -552,7 +556,11 @@ def test_repeated_electrical_block_bounds_do_not_displace_the_real_outer_frame()
         )
     ]
 
-    assert _select_frames({"frames": [outer, *symbols]}) == [outer]
+    x0, y0, x1, y1 = outer["bbox"]
+    outer["boundary"] = [[x0, y0], [x1, y0], [x1, y1], [x0, y1]]
+    texts = [{"uid": "title", "text": "图号：E-01", "point": [x0 + 1000, y0 + 1000], "height": 250}]
+    selected = _select_frames({"frames": [outer, *symbols], "texts": texts})
+    assert [f["source_ref"]["handle"] for f in selected] == [43419]
 
 
 def test_repeated_component_palette_does_not_create_sheets_outside_real_frame_blocks():
@@ -594,7 +602,21 @@ def test_repeated_component_palette_does_not_create_sheets_outside_real_frame_bl
         )
     ]
 
-    assert _select_frames({"frames": [*frames, *palette]}) == frames
+    texts = []
+    for index, frame in enumerate(frames):
+        x0, y0, x1, y1 = frame["bbox"]
+        frame["source_kind"] = "closed_polyline"
+        frame["boundary"] = [[x0, y0], [x1, y0], [x1, y1], [x0, y1]]
+        texts.append(
+            {
+                "uid": str(index),
+                "text": f"图号：E-{index}",
+                "point": [x0 + 1000, y0 + 1000],
+                "height": 250,
+            }
+        )
+    selected = _select_frames({"frames": [*frames, *palette], "texts": texts})
+    assert [f["source_ref"]["handle"] for f in selected] == [125467, 125472]
 
 
 def test_repeated_top_level_frames_win_over_one_cross_sheet_container():
@@ -688,7 +710,7 @@ def test_graphical_sheet_keeps_labels_native_without_a_figure_catalog():
                 "entity": "LWPOLYLINE",
                 "handle": [0, 0, 20],
                 "entmode": 2,
-                "flag": 1,
+                "flag": 512,
                 "points": [[0, 0], [100, 0], [100, 100], [0, 100]],
             },
             {

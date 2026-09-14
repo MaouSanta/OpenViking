@@ -34,7 +34,7 @@ def _drawing(*records):
                 "handle": [0, 0, 11],
                 "index": 11,
                 "entmode": 2,
-                "flag": 1,
+                "flag": 512,
                 "points": [[0, 0], [100, 0], [100, 100], [0, 100]],
             },
             *records,
@@ -230,7 +230,9 @@ def test_render_failure_excludes_provider_error_contents():
         raise RuntimeError("ODA File Converter not found")
 
     assert (
-        _build(_drawing(), lambda *_: {}, unavailable)["region_diagnostic"]["render_error"]
+        _build(_drawing(_text(20, "施工要求。", 10, 80)), lambda *_: {}, unavailable)[
+            "region_diagnostic"
+        ]["render_error"]
         == "ODA File Converter not found"
     )
 

@@ -13,7 +13,19 @@ import math
 from collections import defaultdict
 from typing import Any, Iterator
 
-_IDENTITY = (1.0, 0.0, 0.0, 1.0, 0.0, 0.0)
+from openviking.parse.parsers.dwg_coordinates import (
+    IDENTITY as _IDENTITY,
+)
+from openviking.parse.parsers.dwg_coordinates import (
+    affine,
+    apply2,
+    entity_matrix,
+    multiply,
+    ocs,
+    point3,
+    text_point,
+)
+
 _SUPPORT_ENTITIES = {"BLOCK", "ENDBLK", "SEQEND"}
 _TEXT_ENTITIES = {"TEXT", "MTEXT", "ATTRIB", "ATTDEF"}
 
@@ -26,99 +38,105 @@ def _number(value: Any) -> float | None:
     return result if math.isfinite(result) else None
 
 
-def _is_xy(record: dict[str, Any]) -> bool:
-    normal = record.get("extrusion")
-    if normal is None:
-        return True
-    if not isinstance(normal, list) or len(normal) < 3:
-        return False
-    values = [_number(value) for value in normal[:3]]
-    return values[0] == 0.0 and values[1] == 0.0 and values[2] == 1.0
-
-
 def _location(record: dict[str, Any], matrix: tuple[float, ...]) -> dict[str, Any]:
-    from openviking.parse.parsers.dwg_sheet import _bbox, _kind, _matrix_apply, _point
+    from openviking.parse.parsers.dwg_sheet import _bbox, _kind
 
     kind = _kind(record)
-    result: dict[str, Any] = {"bbox": None, "point": None, "geometry_status": "unsupported"}
-    if not _is_xy(record):
-        result["geometry_status"] = "unsupported_ocs"
+    result = {"bbox": None, "point": None, "geometry_status": "unsupported"}
+    try:
+        transform = entity_matrix(record, matrix)
+        if kind == "INSERT":
+            transform = multiply(matrix, ocs(record))
+    except (ValueError, TypeError, OverflowError):
+        result["geometry_status"] = "invalid_ocs"
         return result
-    anchor = next(
-        (
-            point
-            for key in ("ins_pt", "alignment_pt", "center", "text_midpt", "def_pt", "pt0")
-            if (point := _point(record.get(key))) is not None
-        ),
-        None,
+    anchor = (
+        text_point(record)
+        if kind in _TEXT_ENTITIES
+        else next(
+            (
+                p
+                for key in ("ins_pt", "alignment_pt", "center", "text_midpt", "def_pt", "pt0")
+                if (p := point3(record.get(key))) is not None
+            ),
+            None,
+        )
     )
     if anchor is not None:
-        point = _matrix_apply(matrix, anchor)
+        point = apply2(transform, anchor)
         if all(math.isfinite(value) for value in point):
             result["point"] = list(point)
-    points: list[tuple[float, float]] = []
+    points = []
     if kind == "LINE":
-        points = [_point(record.get(key)) for key in ("start", "end")]
+        points = [point3(record.get(key)) for key in ("start", "end")]
     elif kind == "LWPOLYLINE":
         raw = record.get("points")
         if not isinstance(raw, list) or not raw:
             return result
-        # Bulged/variable-width polylines need their own curve/width evaluation.
-        # A vertex-only bound would silently understate their visible geometry.
-        if any(_number(value) != 0.0 for value in record.get("bulges") or []):
+        if any(_number(value) != 0.0 for value in record.get("bulges") or []) or record.get(
+            "widths"
+        ):
             return result
-        if record.get("widths"):
+        z = _number(record.get("elevation", 0.0))
+        if z is None:
             return result
-        points = [_point(point) for point in raw]
+        points = [(p[0], p[1], z) if (p := point3(value)) is not None else None for value in raw]
         width = _number(record.get("const_width", 0.0))
         if width is None or width < 0:
             return result
-        if all(point is not None for point in points) and width:
+        if all(p is not None for p in points) and width:
             box = _bbox(points)
             half = width / 2
             points = [
-                (box[0] - half, box[1] - half),
-                (box[0] - half, box[3] + half),
-                (box[2] + half, box[1] - half),
-                (box[2] + half, box[3] + half),
+                (box[0] - half, box[1] - half, z),
+                (box[0] - half, box[3] + half, z),
+                (box[2] + half, box[1] - half, z),
+                (box[2] + half, box[3] + half, z),
             ]
     elif kind in {"CIRCLE", "ARC", "ELLIPSE"}:
-        center = _point(record.get("center"))
+        center = point3(record.get("center"))
         radius = _number(record.get("radius"))
         if kind == "ELLIPSE":
-            axis = _point(record.get("sm_axis"))
+            axis = point3(record.get("sm_axis"))
             ratio = _number(record.get("axis_ratio"))
-            radius = math.hypot(*axis) * max(1.0, abs(ratio)) if axis and ratio else None
+            radius = (
+                math.sqrt(sum(v * v for v in axis)) * max(1.0, abs(ratio))
+                if axis and ratio
+                else None
+            )
         if center is None or radius is None or radius < 0:
             return result
-        x, y = _matrix_apply(matrix, center)
-        a, b, c, d, _, _ = matrix
-        rx, ry = radius * math.hypot(a, c), radius * math.hypot(b, d)
+        x, y = apply2(transform, center)
+        m = affine(transform)
+        dimensions = 3 if kind == "ELLIPSE" else 2
+        rx = radius * math.sqrt(sum(m[k] * m[k] for k in range(dimensions)))
+        ry = radius * math.sqrt(sum(m[4 + k] * m[4 + k] for k in range(dimensions)))
         box = [x - rx, y - ry, x + rx, y + ry]
         if not all(math.isfinite(value) for value in box):
             result["geometry_status"] = "invalid_coordinates"
             return result
-        result.update(
-            bbox=box,
-            geometry_status="exact" if kind == "CIRCLE" else "conservative",
-        )
+        result.update(bbox=box, geometry_status="exact" if kind == "CIRCLE" else "conservative")
         return result
     elif kind in {"SOLID", "TRACE", "3DFACE"}:
-        points = [_point(record.get(f"corner{index}")) for index in range(1, 5)]
+        points = [point3(record.get(f"corner{i}")) for i in range(1, 5)]
     elif kind == "POINT":
-        point = _point(record.get("point"))
-        if point is None:
-            x, y = _number(record.get("x")), _number(record.get("y"))
-            point = (x, y) if x is not None and y is not None else None
-        points = [point]
+        p = point3(record.get("point"))
+        if p is None:
+            x, y, z = (
+                _number(record.get("x")),
+                _number(record.get("y")),
+                _number(record.get("z", 0.0)),
+            )
+            p = (x, y, z) if all(v is not None for v in (x, y, z)) else None
+        points = [p]
     elif kind in _TEXT_ENTITIES or kind.startswith("DIMENSION"):
         result["geometry_status"] = (
             "anchor_only" if result["point"] is not None else "missing_coordinates"
         )
         return result
-    if not points or any(point is None for point in points):
+    if not points or any(p is None for p in points):
         return result
-    box = _bbox(_matrix_apply(matrix, point) for point in points)
+    box = _bbox(apply2(transform, p) for p in points)
     if box and all(math.isfinite(value) for value in box):
         result.update(bbox=list(box), geometry_status="conservative")
     return result
@@ -138,7 +156,6 @@ def iter_instances(drawing: dict[str, Any]) -> Iterator[dict[str, Any]]:
         _insert_matrix,
         _kind,
         _matrix_multiply,
-        _point,
         _ref,
     )
 
@@ -204,9 +221,9 @@ def iter_instances(drawing: dict[str, Any]) -> Iterator[dict[str, Any]]:
                 raise ValueError("missing_block")
             if nested_handle in stack or len(stack) >= 12:
                 raise ValueError("cyclic_or_deep_block")
-            if not _is_xy(record) or _point(record.get("ins_pt")) is None:
+            if point3(record.get("ins_pt")) is None:
                 raise ValueError("invalid_insert_transform")
-            if block.get("base_pt") is not None and _point(block["base_pt"]) is None:
+            if block.get("base_pt") is not None and point3(block["base_pt"]) is None:
                 raise ValueError("invalid_insert_transform")
             scale = record.get("scale")
             if scale is not None and (
