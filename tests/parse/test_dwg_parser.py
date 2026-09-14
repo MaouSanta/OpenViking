@@ -117,7 +117,7 @@ async def test_dwg_parser_preserves_json_and_never_exports_sheet_dwg(tmp_path: P
         result = await parser.parse(source, sheet_dwg_exporter=fake_sheet_export)
 
     assert result.precomputed_semantics is False
-    assert result.parser_version == "10.1"
+    assert result.parser_version == "10.2"
     assert any(uri.endswith("/building-plan.dwg") for uri in fake_fs.files)
     assert not any(uri.endswith("/libredwg.json") for uri in fake_fs.files)
     assert not any(uri.endswith("/.overview.md") for uri in fake_fs.files)

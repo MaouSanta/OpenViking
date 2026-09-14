@@ -65,9 +65,7 @@ def _contains(
     )
 
 
-def _bbox_distance(
-    box: tuple[float, float, float, float], point: tuple[float, float]
-) -> float:
+def _bbox_distance(box: tuple[float, float, float, float], point: tuple[float, float]) -> float:
     return math.hypot(
         max(box[0] - point[0], 0.0, point[0] - box[2]),
         max(box[1] - point[1], 0.0, point[1] - box[3]),
@@ -416,9 +414,7 @@ def _table_from_cells(
         for text in texts
         if isinstance(text.get("height"), (int, float)) and text["height"] > 0
     ]
-    title_gap = max(
-        (statistics.median(heights) * 3 if heights else 0.0), (box[3] - box[1]) * 0.08
-    )
+    title_gap = max((statistics.median(heights) * 3 if heights else 0.0), (box[3] - box[1]) * 0.08)
     titles = [
         text
         for text in texts
@@ -440,8 +436,7 @@ def _table_from_cells(
         choices = [
             (_bbox_distance(cell["bbox"], point), _bbox_area(cell["bbox"]), index)
             for index, cell in enumerate(cells)
-            if point
-            and _bbox_distance(cell["bbox"], point) <= _text_margin(text, tolerance)
+            if point and _bbox_distance(cell["bbox"], point) <= _text_margin(text, tolerance)
         ]
         if choices:
             _, _, index = min(choices)
@@ -611,6 +606,8 @@ def _mark(
     box = frame["bbox"]
     width, height = box[2] - box[0], box[3] - box[1]
     scale = max(width, height)
+    if frame.get("filled"):
+        return "fill", []
     expanded = (
         box[0] - scale * 0.2,
         box[1] - scale * 0.2,
@@ -620,19 +617,15 @@ def _mark(
     frame_key = repr(frame["source_ref"])
     diagonals = []
     for segment in segments:
-        if repr(segment["source_ref"]) == frame_key:
-            continue
         a, b = segment["a"], segment["b"]
-        dx, dy = abs(b[0] - a[0]), abs(b[1] - a[1])
+        if not (_contains(expanded, a) and _contains(expanded, b)):
+            continue
         if (
-            _contains(expanded, a)
-            and _contains(expanded, b)
-            and dx >= width * 0.12
-            and dy >= height * 0.12
+            abs(b[0] - a[0]) >= width * 0.12
+            and abs(b[1] - a[1]) >= height * 0.12
+            and repr(segment["source_ref"]) != frame_key
         ):
             diagonals.append(segment)
-    if frame.get("filled"):
-        return "fill", []
     if not diagonals:
         return "none", []
     endpoint_tolerance = scale * 0.22

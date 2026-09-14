@@ -40,7 +40,8 @@ def test_dwg_sheet_smoke_writes_only_inspection_artifacts(tmp_path, monkeypatch,
     summary = json.loads(capsys.readouterr().out)
     files = [path.relative_to(output).as_posix() for path in output.rglob("*") if path.is_file()]
 
-    assert summary["sheet_count"] == 1
+    assert summary["sheet_count"] == 0
+    assert summary["sheet_bundle_count"] == 1
     assert set(summary["written"]) == set(files)
     assert any(path.endswith("/context.md") for path in files)
     assert not any(path.endswith("/sheet.dwg") for path in files)

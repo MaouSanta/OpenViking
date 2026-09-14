@@ -110,7 +110,7 @@ def records(result):
     return read_json_records(result["files"].values())
 
 
-def test_json_preserves_every_object_and_header_and_moves_only_prose():
+def test_json_preserves_every_object_and_header_including_markdown_text():
     drawing = drawing_fixture()
     before = copy.deepcopy(drawing)
     sheets, result = build(drawing)
@@ -122,14 +122,9 @@ def test_json_preserves_every_object_and_header_and_moves_only_prose():
         key: value for key, value in drawing.items() if key != "OBJECTS"
     }
     for index, original in enumerate(drawing["OBJECTS"]):
-        if index == 3:
-            assert objects[index]["value"] == {
-                key: value for key, value in original.items() if key != "text"
-            }
-            assert objects[index]["markdown_fields"] == ["text"]
-            assert objects[index]["markdown"]
-        else:
-            assert objects[index]["value"] == original
+        assert objects[index]["value"] == original
+        assert "markdown_fields" not in objects[index]
+    assert objects[3]["markdown"]
     markdown = "\n".join(content for sheet in sheets for _, content in sheet["content_files"])
     assert "施工前应核对现场尺寸" in markdown
     assert "图中标注 KL1" not in markdown
@@ -158,7 +153,39 @@ def test_ablation_without_vlm_keeps_all_native_fields_in_scope_files():
     assert baseline["parse_status"] == "complete"
     assert any(path.startswith("sheets/S001/drawing.json") for path in baseline["files"])
     assert not any("/views/" in path for path in partitioned["files"])
-    assert len(objects) == sum(item.get("kind") == "object" for item in records(partitioned))
+    partitioned_objects = sorted(
+        (item for item in records(partitioned) if item.get("kind") == "object"),
+        key=lambda item: item["object_index"],
+    )
+    assert [item["value"] for item in partitioned_objects] == drawing["OBJECTS"]
+
+
+@pytest.mark.parametrize(
+    "entity,field", [("TEXT", "text_value"), ("MTEXT", "text"), ("ATTRIB", "text_value")]
+)
+def test_label_selected_for_markdown_keeps_text_and_coordinates_in_json(entity, field):
+    drawing = drawing_fixture()
+    label = {
+        "entity": entity,
+        "handle": [0, 0, 4],
+        "ownerhandle": [0, 0, 1],
+        "ins_pt": [15, 15],
+        "height": 2,
+        field: "JKDY02（电源挂壁箱-#2电房内）",
+    }
+    drawing["OBJECTS"][3] = label
+    # A region decision has included a graphical label in the Markdown body.
+    sheet = fixed_sheet(drawing)
+    markdown_before = copy.deepcopy(sheet["content_files"])
+    assert label[field] in markdown_before[0][1]
+    result = build_json_artifacts(drawing, [sheet])
+    record = scoped_objects(result, "sheets/S001/drawing.json")[3]
+    assert record["value"] == label
+    assert record["markdown"] == [
+        {"instance_path": [], "sheet_id": "S001", "paths": sheet["content_paths"]}
+    ]
+    assert "markdown_fields" not in record
+    assert sheet["content_files"] == markdown_before
 
 
 def test_large_objects_and_metadata_stay_whole_in_pretty_scope_json():
@@ -244,17 +271,17 @@ def test_reader_accepts_new_scope_files_and_unfragmented_v8_records():
     assert read_json_records([old]) == read_json_records([new]) == expected
 
 
-def test_unused_text_alias_is_not_deleted():
+@pytest.mark.parametrize("alias", ["备用字段也必须保留", "1. 施工前应核对现场尺寸。"])
+def test_primary_text_and_alias_are_both_retained(alias):
     drawing = drawing_fixture()
-    drawing["OBJECTS"][3]["text_value"] = "备用字段也必须保留"
+    drawing["OBJECTS"][3]["text_value"] = alias
     _, result = build(drawing)
     raw = next(
         item["value"]
         for item in records(result)
         if item.get("kind") == "object" and item["object_index"] == 3
     )
-    assert "text" not in raw
-    assert raw["text_value"] == "备用字段也必须保留"
+    assert raw == drawing["OBJECTS"][3]
 
 
 def test_shared_block_text_in_view_and_prose_stays_in_native_json():
@@ -381,7 +408,7 @@ async def test_production_parser_writes_whole_json_independent_of_embedding_budg
         described.update(item["path"] for item in sheet["json_artifacts"])
     assert json_paths == described
     assert len(json_paths) == 3
-    assert result.parser_version == "10.1"
+    assert result.parser_version == "10.2"
     assert result.meta["parse_status"] == "complete"
     assert any(len(fs.files[f"{root}/{path}"]) > 6000 for path in json_paths)
     restored = read_json_records(fs.files[f"{root}/{path}"].decode() for path in json_paths)
@@ -441,14 +468,14 @@ def by_handle(rows):
     }
 
 
-def test_every_markdown_use_is_required_and_only_its_paths_are_persisted():
+def test_all_markdown_instances_keep_native_text_and_source_paths():
     drawing = drawing_fixture()
     add_text_block(drawing, [(20, 20), (70, 20)])
     _, result = build(drawing)
     metadata = by_handle(scoped_objects(result, "metadata.json"))
     note = metadata[21]
-    assert "text_value" not in note["value"]
-    assert note["markdown_fields"] == ["text_value"]
+    assert note["value"] == drawing["OBJECTS"][8]
+    assert "markdown_fields" not in note
     assert {tuple(ref["instance_path"]) for ref in note["markdown"]} == {(22,), (23,)}
     assert "bbox" not in note
     placed = by_handle(scoped_objects(result, "sheets/S001/drawing.json"))
@@ -457,7 +484,7 @@ def test_every_markdown_use_is_required_and_only_its_paths_are_persisted():
     assert not any(row["kind"] == "instance" for row in records(result))
 
 
-def test_unknown_insert_use_prevents_removing_shared_definition_text():
+def test_unknown_insert_use_keeps_native_text_and_valid_markdown_reference():
     drawing = drawing_fixture()
     add_text_block(drawing, [(20, 20)])
     sheet = fixed_sheet(drawing)
@@ -579,7 +606,8 @@ def test_cross_sheet_objects_and_containers_stay_at_document_scope():
     metadata = by_handle(scoped_objects(result, "metadata.json"))
     assert {20, 21, 40, 41} <= metadata.keys()
     assert {ref["sheet_id"] for ref in metadata[21]["markdown"]} == {"S001", "S002"}
-    assert "text_value" not in metadata[21]["value"]
+    assert metadata[21]["value"]["text_value"] == "每个实例均需保全"
+    assert "markdown_fields" not in metadata[21]
     assert result["parse_status"] == "complete"
 
 

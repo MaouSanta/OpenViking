@@ -57,12 +57,6 @@ def read_json_records(contents: Iterable[str]) -> list[dict[str, Any]]:
     return records
 
 
-def _intersects(box: list[float], bounds: list[float]) -> bool:
-    return (
-        box[0] <= bounds[2] and bounds[0] <= box[2] and box[1] <= bounds[3] and bounds[1] <= box[3]
-    )
-
-
 def _spatial_order(items: list[tuple[tuple[float, float], dict]]) -> list[dict]:
     """Bisect the longest spatial axis; stable ties retain source/instance order."""
     if len(items) <= 1:
@@ -88,6 +82,7 @@ def build_json_artifacts(
 
     Instance traversal is temporary. Persist native INSERT references and only the
     instance paths needed to trace Markdown; readers recover source order by ordinal.
+    Markdown is a searchable copy and never replaces native text fields.
     """
     from openviking.parse.parsers.dwg_json_geometry import iter_instances
     from openviking.parse.parsers.dwg_sheet import _drawing_graph, _kind, _ref
@@ -144,30 +139,26 @@ def build_json_artifacts(
         or _kind(record) in {"BLOCK", "ENDBLK", "SEQEND"}
     }
     sheet_by_directory = {sheet["directory"]: sheet for sheet in sheets}
-    markdown: dict[tuple[int, tuple], list[dict]] = defaultdict(list)
+    markdown_by_object: dict[int, list[dict]] = defaultdict(list)
     for sheet in sheets:
         sheet["json_artifacts"] = []
         sheet.setdefault("status", "partial")
-        converted = set(sheet.get("markdown_uids", []))
+        included = set(sheet.get("markdown_uids", []))
         for text in sheet.get("_texts", []):
-            if text["uid"] in converted and id(text["record"]) in ordinals:
-                markdown[
-                    (ordinals[id(text["record"])], tuple(text.get("instance_path", [])))
-                ].append({"sheet_id": sheet["sheet_id"], "paths": sheet["content_paths"]})
-
-    markdown_by_object: dict[int, list[dict]] = defaultdict(list)
-    for (index, path), references in markdown.items():
-        markdown_by_object[index].extend(
-            {"instance_path": list(path), **reference} for reference in references
-        )
+            if text["uid"] in included and id(text["record"]) in ordinals:
+                markdown_by_object[ordinals[id(text["record"])]].append(
+                    {
+                        "instance_path": list(text.get("instance_path", [])),
+                        "sheet_id": sheet["sheet_id"],
+                        "paths": sheet["content_paths"],
+                    }
+                )
 
     owners: dict[int, set[str | None]] = defaultdict(set)
     uses: dict[int, int] = defaultdict(int)
-    covered: dict[int, bool] = {}
     bounds: dict[int, list[float]] = {}
     anchors: dict[int, tuple[float, float]] = {}
     unknown: set[int] = set()
-    unsafe_blocks = set()
     insert_ordinals = {
         handle if (handle := _ref(record.get("handle"))) is not None else f"object:{index}": index
         for index, record in enumerate(objects)
@@ -214,12 +205,6 @@ def build_json_artifacts(
             bounds[index] = box
         if point is not None or box is not None:
             anchors[index] = tuple(point or ((box[0] + box[2]) / 2, (box[1] + box[3]) / 2))
-        refs = markdown.get((index, path), [])
-        covered[index] = (
-            covered.get(index, True)
-            and target is not None
-            and any(ref["sheet_id"] == sheet_by_directory[target]["sheet_id"] for ref in refs)
-        )
         # A container whose contents cross a Sheet or have unknown placement must
         # not be assigned using its insertion anchor alone.
         for ancestor in path:
@@ -228,10 +213,6 @@ def build_json_artifacts(
                 owners[parent].add(target)
                 if not reliable:
                     unknown.add(parent)
-        if instance["entity_type"] in {"INSERT", "MINSERT"} and not instance.get("is_container"):
-            unsafe_blocks.add(_ref(objects[index].get("block_header")))
-
-    unsafe_definitions = definitions_for(unsafe_blocks)
     unknown.update(
         index for index in range(len(objects)) if index not in metadata and not uses[index]
     )
@@ -300,23 +281,6 @@ def build_json_artifacts(
         refs = markdown_by_object.get(index, [])
         if refs:
             entry["markdown"] = refs
-        if (
-            isinstance(original, dict)
-            and _kind(original) in {"TEXT", "MTEXT", "ATTRIB"}
-            and covered.get(index)
-            and index not in unsafe_definitions
-        ):
-            primary = "text" if _kind(original) == "MTEXT" else "text_value"
-            secondary = "text_value" if primary == "text" else "text"
-            consumed = primary if original.get(primary) is not None else secondary
-            moved = [
-                key
-                for key in ("text", "text_value")
-                if isinstance(original.get(key), str) and original[key] == original.get(consumed)
-            ]
-            if moved:
-                entry["value"] = {key: value for key, value in original.items() if key not in moved}
-                entry["markdown_fields"] = moved
         if index not in metadata:
             if index in unknown:
                 entry["status"] = "partial"

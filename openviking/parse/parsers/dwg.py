@@ -25,7 +25,7 @@ from openviking_cli.utils.uri import VikingURI
 
 
 class DWGParser(BaseParser):
-    """Keep the source, move prose to Markdown, and store native JSON by scope."""
+    """Keep the source, copy prose to Markdown, and store native JSON by scope."""
 
     @property
     def supported_extensions(self) -> List[str]:

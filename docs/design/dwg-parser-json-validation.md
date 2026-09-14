@@ -1,6 +1,25 @@
 # DWG Markdown / JSON parser validation
 
-最新 v10 的区域并发、队列修复及固定返回回放见[并发消融验证](dwg-parser-concurrency-validation.md)。本页保留 v9 及更早版本的存储与恢复记录。
+当前 10.2 在保留 Markdown 输出的同时，完整保留 JSON 原文字段；相关回归验证覆盖被选入 Markdown 的 TEXT/MTEXT/ATTRIB 标签、文字别名和重复块实例。区域并发、队列修复及固定返回回放见[并发消融验证](dwg-parser-concurrency-validation.md)。本页下文保留 v9 及更早版本的存储与恢复记录，其中的正文迁移描述属于历史行为。
+
+## 10.2 text preservation regression
+
+101 targeted tests pass across JSON preservation, region concurrency/rejection,
+parser output, smoke inspection, Bundle publication and OVPack handling. The smoke
+fixture contains no frame: its pre-existing assertion was corrected to expect zero
+Sheets and one fallback Bundle, matching the behavior already present in 10.1.
+
+An offline replay of the monitoring DWG uses the ten recorded 10.1 region responses
+without calling models. All ten Markdown files remain byte-identical to the prior
+published import; all 68,781 native objects retain every original field. JKDY02,
+JK21 and JK22 retain their text and coordinates in JSON while remaining in Markdown.
+This is a fixed-input parser regression, not a new live import or question-answering
+score. Existing stores and frozen OVPack artifacts are unchanged.
+
+The subsequent [10.2 fixed-input ablation](dwg-parser-v102-ablation.md) verifies
+byte-identical output after removing redundant marker work and reusing frame
+tolerances, with 212 related tests passing. It reports deterministic parser timings
+separately from complete import/model latency.
 
 **Scope:** v9 checks are recorded first, followed by frozen v8 and v7
 historical contracts and results. The [spatial-chunk design](dwg-parser-spatial-chunks.md)

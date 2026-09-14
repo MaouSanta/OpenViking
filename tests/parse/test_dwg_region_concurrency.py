@@ -112,10 +112,8 @@ def test_out_of_order_selection_preserves_markdown_json_and_failure_isolation():
     records = {row["object_index"]: row for row in restored if row["kind"] == "object"}
     assert set(records) == set(range(len(drawing["OBJECTS"])))
     for index, record in records.items():
-        expected = copy.deepcopy(drawing["OBJECTS"][index])
-        for field in record.get("markdown_fields", []):
-            del expected[field]
-        assert record["value"] == expected
+        assert record["value"] == drawing["OBJECTS"][index]
+        assert "markdown_fields" not in record
 
 
 def test_concurrent_all_rejected_and_no_vlm_keep_existing_fallbacks():

@@ -176,6 +176,9 @@ def test_detect_marker_group_distinguishes_tick_cross_and_empty():
         _line(12, (0.8, 20.4), (1.7, 21.7)),
         _line(13, (0.3, 10.3), (1.7, 11.7)),
         _line(14, (0.3, 11.7), (1.7, 10.3)),
+        # A same-source edge and a remote diagonal must not become selection marks.
+        {**_line(1, (0.1, 20.1), (1.9, 21.9)), "source_ref": frames[0]["source_ref"]},
+        _line(15, (1000, 1000), (1002, 1002)),
     ]
     texts = [
         _text(101, "现浇", (3, 21), height=1),

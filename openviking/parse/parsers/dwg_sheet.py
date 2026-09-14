@@ -43,6 +43,9 @@ from openviking.parse.parsers.dwg_sheet_frames import (
     rectangle,
     select_frames,
 )
+from openviking.parse.parsers.dwg_sheet_frames import (
+    tolerance as _frame_tolerance,
+)
 from openviking.parse.parsers.dwg_sheet_geometry import (
     detect_marker_groups,
     detect_table_grids,
@@ -52,7 +55,7 @@ from openviking_cli.utils.config.parser_config import ParserConfig
 from openviking_cli.utils.uri import VikingURI
 
 SHEET_DOCUMENT_SCHEMA = "openviking.dwg-document/v1"
-DWG_PARSER_VERSION = "10.1"
+DWG_PARSER_VERSION = "10.2"
 
 _FORMAT_RE = re.compile(r"\\(?:A\d+|C\d+|F[^;]*|f[^;]*|H[^;]*|Q[^;]*|T[^;]*|W[^;]*);", re.I)
 _FIELD_RE = re.compile(
@@ -1619,6 +1622,8 @@ def build_sheet_artifacts(
 
     def add_frames(space, frames, space_kind, block_handle, layout=None):
         for frame in frames:
+            # Reuse the boundary tolerance for all objects tested against this frame.
+            frame = {**frame, "_tolerance": _frame_tolerance(frame["boundary"])}
             source_ref = frame["source_ref"]
             locator = f"frame:{source_ref.get('handle')}:{'/'.join(map(str, source_ref.get('instance_path', [])))}"
             if frame["source_kind"] == "line_frame":

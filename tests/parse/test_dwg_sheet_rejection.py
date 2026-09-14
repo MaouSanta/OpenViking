@@ -3,7 +3,6 @@
 """Sheet rejection reuses region selection while preserving every native object."""
 
 import copy
-import json
 from unittest.mock import Mock
 
 import pytest
@@ -51,7 +50,7 @@ def _build(drawing, classifier, renderer):
     )
 
 
-def _assert_preserved(drawing, sheets, moved_handles):
+def _assert_preserved(drawing, sheets, markdown_handles):
     preserved = build_json_artifacts(drawing, sheets)
     records = read_json_records(preserved["files"].values())
     objects = {row["object_index"]: row for row in records if row["kind"] == "object"}
@@ -61,14 +60,9 @@ def _assert_preserved(drawing, sheets, moved_handles):
     }
     for index, original in enumerate(drawing["OBJECTS"]):
         record = objects[index]
-        moved = original["handle"][-1] in moved_handles
-        expected = (
-            {key: value for key, value in original.items() if key != "text_value"}
-            if moved
-            else original
-        )
-        assert json.dumps(record["value"], sort_keys=True) == json.dumps(expected, sort_keys=True)
-        assert record.get("markdown_fields", []) == (["text_value"] if moved else [])
+        assert record["value"] == original
+        assert "markdown_fields" not in record
+        assert bool(record.get("markdown")) == (original["handle"][-1] in markdown_handles)
     return preserved, records
 
 

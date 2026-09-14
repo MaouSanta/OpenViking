@@ -1,11 +1,13 @@
 # DWGParser 当前链路流程说明
 
-版本：DWGParser 10.1，新增无需模型的坐标、图框及数量统计修正。区域模型调用、提示词及摘要链路未调整。
+版本：DWGParser 10.2，在 10.1 的坐标、图框及数量修正基础上，完整保留 JSON 原始文字。Markdown 输出规则、区域模型调用、提示词及摘要链路未调整。
 
-核对日期：2026-09-14（10.1 几何回归）；正式导入和 OVPack 的历史验证日期见下文。
+核对日期：2026-09-14（10.2 文字保全）；正式导入和 OVPack 的历史验证日期见下文。
 适用范围：通过 `add_resource(bundle=true)` 正式导入 DWG，启用索引并等待处理完成。
 
-当前链路以 **LibreDWG 的完整、规范化 JSON 为数据底稿**：先识别 Sheet，用临时图像辅助选择说明和独立表格，将这些正文整理成 Markdown，其余原生数据保存在文档级或 Sheet 级完整 JSON 中。OV 以 Sheet 为检索单位，自动摘要和 Embedding 只处理 Sheet Markdown；JSON 作为命中 Sheet 后可按需读取的证据。
+当前链路以 **LibreDWG 的完整、规范化 JSON 为数据底稿**：先识别 Sheet，用临时图像辅助选择说明和独立表格，将这些正文整理成 Markdown，全部原生数据（包括已写入 Markdown 的文字）保存在文档级或 Sheet 级完整 JSON 中。OV 以 Sheet 为检索单位，自动摘要和 Embedding 只处理 Sheet Markdown；JSON 作为命中 Sheet 后可按需读取的证据。
+
+10.2 的[固定输入消融](dwg-parser-v102-ablation.md)保留了选项框线段过滤和图框容差复用两项结果等价的优化，并删除已无调用入口的旧梁拓扑/文字切片生成器。JSON、Markdown 和模型处理边界不变。
 
 ## 1. 首次导入总流程
 
@@ -80,13 +82,15 @@ VLM 接收 Sheet 图像和区域选择指令，不接收保存下来的 JSON 数
 - 仅明确返回 `is_sheet=false` 的候选会被排除；未知区域、渲染或识别不可用会记录不确定状态。
 - 若最终没有有效候选，保留一个合成的 `partial` Bundle 表示；它不计入 `sheet_count`，原始数据仍保留。
 
-### Markdown 整理与正文迁移
+### Markdown 整理与原文保留
 
 现有文字、表格和阅读顺序逻辑生成 `context.md`；内容超过 Markdown 配置预算时生成 `context_001.md` 等多份文件。标题栏中可解析的图名、图号等信息仍由原有逻辑整理为 Sheet 元数据，不属于 VLM 选择的说明正文。
 
 没有 document/table 区域时，10.1 跳过不参与正文输出的表格网格和选项框重建，仍提取元数据并保留原生 JSON。
 
-只有正文实际写入 Markdown、且相应文字对象的所有真实使用实例均被覆盖后，才移除 JSON 中对应的正文字符串字段。对象的其他字段和必要的 Markdown 来源引用继续保留；如果还有实例用作图内标注，或归属不确定，则保留原文。原生表格结构也不会因生成 Markdown 而被删除。
+Markdown 是用于召回的派生副本，不再替代 JSON 原文。即使标签被区域分类选入 Markdown，JSON 仍完整保留 `text`、`text_value`、坐标及对象的其他字段；原生表格结构和块定义同样保留。已有 Markdown 内容不做额外删减，必要的 Markdown 来源引用继续保留，新产物不再生成表示字段迁移的 `markdown_fields`。
+
+这一规则随 10.2 生效。已有入库产物或旧 OVPack 不会自动补回被删除的文字；需要重新解析原始 DWG，不能仅通过 reindex 恢复。
 
 ### 摘要并发与发布顺序
 
