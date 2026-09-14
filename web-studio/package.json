@@ -13,7 +13,8 @@
     "lint": "eslint src --ignore-pattern 'src/gen/**' --ignore-pattern 'src/routeTree.gen.ts' --ignore-pattern 'src/components/ui/**'",
     "format": "prettier --check 'src/**/*.{ts,tsx}'",
     "check": "prettier --write 'src/**/*.{ts,tsx}' && eslint src --fix --ignore-pattern 'src/gen/**' --ignore-pattern 'src/routeTree.gen.ts' --ignore-pattern 'src/components/ui/**'",
-    "gen-server-client": "sh ./script/gen-server-client/gen-server-client.sh"
+    "gen-server-client": "sh ./script/gen-server-client/gen-server-client.sh",
+    "postinstall": "node script/apply-dwg-preview-patch.mjs"
   },
   "dependencies": {
     "@base-ui/react": "^1.3.0",

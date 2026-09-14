@@ -13,6 +13,8 @@ import type { AcDbProgressdEventArgs } from '@mlightcad/data-model'
 import { Button } from '#/components/ui/button'
 import { Progress } from '#/components/ui/progress'
 import { getContentDownload } from '#/lib/ov-client'
+import { installDwgPolylineOcsFix } from '#/lib/cad/dwg-polyline-ocs'
+import { fitDwgView } from '#/lib/cad/dwg-fit-view'
 
 import { fetchFsStat } from '../-lib/api'
 import type { VikingFsEntry } from '../-types/viking-fm'
@@ -262,6 +264,7 @@ export function DwgPreview({ file }: { file: VikingFsEntry }) {
         }
         if (cancelled()) return
 
+        installDwgPolylineOcsFix()
         AcApSettingManager.instance.isShowCommandLine = false
         const createdManager = AcApDocManager.createInstance({
           autoResize: true,
@@ -434,7 +437,10 @@ export function DwgPreview({ file }: { file: VikingFsEntry }) {
           disabled={!ready && !partial && loadStage !== 'render'}
           aria-label={t('filePreview.dwg.fit')}
           title={t('filePreview.dwg.fit')}
-          onClick={() => managerRef.current?.curView.zoomToFitDrawing()}
+          onClick={() => {
+            const view = managerRef.current?.curView
+            if (view) fitDwgView(view)
+          }}
         >
           <Scan className="mr-1 size-4" />
           {t('filePreview.dwg.fit')}

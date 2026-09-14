@@ -31,6 +31,7 @@ const mocks = vi.hoisted(() => ({
   openDocument: vi.fn(),
   progressHandlers: new Set<(event: OpenProgressEvent) => void>(),
   stat: vi.fn(),
+  installOcs: vi.fn(),
 }))
 
 vi.mock('react-i18next', () => ({
@@ -43,6 +44,14 @@ vi.mock('#/lib/ov-client', () => ({
 
 vi.mock('../-lib/api', () => ({
   fetchFsStat: mocks.stat,
+}))
+
+vi.mock('#/lib/cad/dwg-polyline-ocs', () => ({
+  installDwgPolylineOcsFix: mocks.installOcs,
+}))
+
+vi.mock('#/lib/cad/dwg-fit-view', () => ({
+  fitDwgView: mocks.fit,
 }))
 
 vi.mock('@mlightcad/cad-simple-viewer', () => ({
@@ -115,6 +124,7 @@ describe('DwgPreview', () => {
       data: new Uint8Array([65, 67, 49, 48, 51, 50]).buffer,
     })
     mocks.fit.mockReset()
+    mocks.installOcs.mockClear()
     mocks.openDocument.mockReset().mockResolvedValue(true)
     mocks.stat.mockReset().mockResolvedValue({
       ...file,
@@ -131,6 +141,10 @@ describe('DwgPreview', () => {
     const view = render(<DwgPreview file={file} />)
 
     expect(await screen.findByText('filePreview.dwg.ready')).toBeTruthy()
+    expect(mocks.installOcs).toHaveBeenCalledOnce()
+    expect(mocks.installOcs.mock.invocationCallOrder[0]).toBeLessThan(
+      mocks.createInstance.mock.invocationCallOrder[0],
+    )
     expect(
       screen
         .getByLabelText('filePreview.dwg.canvas')
@@ -492,6 +506,11 @@ describe('DwgPreview', () => {
       }).disabled,
     ).toBe(false)
     expect(mocks.destroy).not.toHaveBeenCalled()
+
+    fireEvent.click(screen.getByRole('button', { name: 'filePreview.dwg.fit' }))
+    expect(mocks.fit).toHaveBeenCalledWith(
+      mocks.createInstance.mock.results[0].value.curView,
+    )
 
     view.unmount()
     await new Promise((resolve) => setTimeout(resolve, 0))
