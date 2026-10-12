@@ -569,6 +569,18 @@ class VikingClient:
     async def read_raw(self, uri: str, offset: int = 0, limit: int = -1) -> str:
         return await self.client.read_raw(uri, offset=offset, limit=limit)
 
+    async def read_image(self, uri: str, **region) -> dict:
+        client = self.client
+        should_close = False
+        scoped_user_id = self._owner_user_id_for_uri(uri)
+        if scoped_user_id:
+            client, should_close = await self._get_user_scoped_client(scoped_user_id)
+        try:
+            return await client.read_image(uri, **region)
+        finally:
+            if should_close:
+                await client.close()
+
     async def download_bytes(self, uri: str) -> bytes:
         client = self.client
         should_close = False

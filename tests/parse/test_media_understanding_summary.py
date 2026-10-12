@@ -28,6 +28,8 @@ class _FS:
         return self.content[offset : offset + size]
 
     async def read_file_bytes(self, _uri, ctx=None):
+        if _uri.endswith("/image-source.json"):
+            raise FileNotFoundError(_uri)
         return self.content
 
 

@@ -195,7 +195,10 @@ async def test_agent_loop_gates_multimodal_result_by_provider(make_loop, support
         assert tool_message["content"] == content
     else:
         assert tool_message["content"].startswith("Image resource.")
-        assert "does not support media in tool results" in tool_message["content"]
+        visual = next(m for m in provider.calls[1] if m.get("name") == "tool_result_media")
+        assert visual["role"] == "user"
+        assert visual["content"][-1] == content[-1]
+        assert provider.calls[1].index(visual) > provider.calls[1].index(tool_message)
     assert tools_used[0]["result"] == "Image resource."
 
 
@@ -906,3 +909,119 @@ async def test_agent_loop_post_turn_clears_local_session_after_openviking_commit
     )
     assert persisted_session.metadata["openviking"]["last_synced_local_index"] == -1
     assert persisted_session.metadata["openviking"]["last_commit_local_index"] == -1
+
+
+@pytest.mark.asyncio
+async def test_image_fallback_follows_all_parallel_tool_responses(make_loop):
+    provider = _MediaProvider(
+        [[_image_call("call-1", "first"), _image_call("call-2", "second")]],
+        supports_media=False,
+    )
+    loop = make_loop(provider=provider, max_iterations=2)
+    await loop._run_agent_loop(
+        messages=[{"role": "user", "content": "read both"}],
+        session_key=SessionKey(type="cli", channel_id="default", chat_id="fallback"),
+        publish_events=False,
+        tool_registry=_ImageRegistry(),
+    )
+    request = provider.calls[1]
+    image_index = next(i for i, msg in enumerate(request) if msg.get("name") == "tool_result_media")
+    assert all(i < image_index for i, msg in enumerate(request) if msg["role"] == "tool")
+    assert sum(part["type"] == "image_url" for part in request[image_index]["content"]) == 2
+
+
+@pytest.mark.asyncio
+async def test_image_fallback_reclaims_previous_crop_budget(make_loop, monkeypatch):
+    monkeypatch.setattr(loop_module, "MAX_INLINE_TOOL_RESULT_MEDIA_BYTES", 5)
+    provider = _MediaProvider(
+        [[_image_call("call-1", "preview")], [_image_call("call-2", "crop")]],
+        supports_media=False,
+    )
+    loop = make_loop(provider=provider, max_iterations=3)
+    await loop._run_agent_loop(
+        messages=[{"role": "user", "content": "zoom in"}],
+        session_key=SessionKey(type="cli", channel_id="default", chat_id="fallback-budget"),
+        publish_events=False,
+        tool_registry=_ImageRegistry(),
+    )
+    visual = [msg for msg in provider.calls[-1] if msg.get("name") == "tool_result_media"]
+    assert isinstance(visual[0]["content"], str)
+    assert isinstance(visual[1]["content"], list)
+
+
+@pytest.mark.asyncio
+async def test_bot_preview_crop_images_reach_next_model_requests(make_loop, monkeypatch):
+    import base64
+    import io
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    from PIL import Image, ImageDraw
+    from vikingbot.agent.tools.base import ToolContext
+    from vikingbot.agent.tools.ov_file import VikingMultiReadTool
+
+    from openviking.utils.image_read import read_image
+
+    uri = "viking://resources/source.png"
+    image = Image.new("RGB", (5000, 3000), "white")
+    ImageDraw.Draw(image).rectangle((2450, 1450, 2549, 1549), fill="red")
+    buf = io.BytesIO()
+    image.save(buf, "PNG")
+    data = buf.getvalue()
+
+    class FS:
+        async def stat(self, path, **kwargs):
+            if path != uri:
+                raise FileNotFoundError(path)
+            return {"size": len(data)}
+
+        async def read_file_bytes(self, path, **kwargs):
+            if path != uri:
+                raise FileNotFoundError(path)
+            return data
+
+    async def image_read(path, **region):
+        return await read_image(FS(), path, ctx=None, **region)
+
+    tool = VikingMultiReadTool()
+    monkeypatch.setattr(
+        tool, "_get_client", AsyncMock(return_value=SimpleNamespace(read_image=image_read))
+    )
+    monkeypatch.setattr(tool, "_release_client", AsyncMock())
+
+    class Registry:
+        def get_definitions(self, **kwargs):
+            return [tool.to_schema()]
+
+        async def execute_detailed(self, name, params, **kwargs):
+            return ToolExecutionResult(
+                result=await tool.execute(ToolContext(), **params), effective_params=params
+            )
+
+    calls = [
+        ToolCallRequest(id="preview", name=tool.name, arguments={"uris": [uri]}, tokens=1),
+        ToolCallRequest(
+            id="crop",
+            name=tool.name,
+            arguments={"uris": [uri], "x": 0.5, "y": 0.5, "width": 100, "height": 100},
+            tokens=1,
+        ),
+    ]
+    provider = _MediaProvider([[call] for call in calls], supports_media=False)
+    loop = make_loop(provider=provider, max_iterations=3)
+    await loop._run_agent_loop(
+        messages=[{"role": "user", "content": "Look at the center detail"}],
+        session_key=SessionKey(type="cli", channel_id="default", chat_id="real-crop"),
+        publish_events=False,
+        tool_registry=Registry(),
+    )
+
+    def last_image(request):
+        message = [m for m in request if m.get("name") == "tool_result_media"][-1]
+        part = [p for p in message["content"] if p["type"] == "image_url"][-1]
+        return Image.open(io.BytesIO(base64.b64decode(part["image_url"]["url"].split(",", 1)[1])))
+
+    assert last_image(provider.calls[1]).size == (2048, 1229)
+    crop = last_image(provider.calls[2])
+    assert crop.size == (100, 100)
+    assert crop.getpixel((50, 50)) == (255, 0, 0)

@@ -989,6 +989,13 @@ async def test_read_image_returns_native_mcp_content(monkeypatch, uri, image_byt
         "get_service",
         lambda: SimpleNamespace(
             fs=SimpleNamespace(
+                read_image=AsyncMock(
+                    return_value={
+                        "text": f"Source: {uri}",
+                        "data": base64.b64encode(image_bytes).decode(),
+                        "mime_type": mime_type,
+                    }
+                ),
                 read_file_bytes=read_file_bytes,
                 read_visible=read_visible,
                 stat=stat,
@@ -1003,7 +1010,7 @@ async def test_read_image_returns_native_mcp_content(monkeypatch, uri, image_byt
     assert isinstance(result[1], ImageContent)
     assert result[1].mimeType == mime_type
     assert base64.b64decode(result[1].data) == image_bytes
-    read_file_bytes.assert_awaited_once_with(uri, ctx=DEFAULT_CTX)
+    read_file_bytes.assert_not_awaited()
     read_visible.assert_not_awaited()
 
 
@@ -1017,6 +1024,13 @@ async def test_read_mixed_batch_preserves_source_order(monkeypatch):
         "get_service",
         lambda: SimpleNamespace(
             fs=SimpleNamespace(
+                read_image=AsyncMock(
+                    return_value={
+                        "text": "Image",
+                        "data": base64.b64encode(image_bytes).decode(),
+                        "mime_type": "image/jpeg",
+                    }
+                ),
                 read_file_bytes=read_file_bytes,
                 read_visible=read_visible,
                 stat=stat,
@@ -1029,11 +1043,11 @@ async def test_read_mixed_batch_preserves_source_order(monkeypatch):
     result = await mcp_endpoint.mcp.call_tool("read", {"uris": [text_uri, image_uri]})
 
     assert isinstance(result, list)
-    assert [block.type for block in result] == ["text", "text", "text", "image"]
+    assert [block.type for block in result] == ["text", "text", "text", "text", "image"]
     assert result[0].text == f"=== {text_uri} ==="
     assert result[1].text == "notes"
     assert result[2].text == f"=== {image_uri} ==="
-    assert result[3].mimeType == "image/jpeg"
+    assert result[4].mimeType == "image/jpeg"
 
 
 @pytest.mark.parametrize(
@@ -1155,52 +1169,51 @@ async def test_read_video_directory_uri_preserves_directory_hint(monkeypatch):
 
 
 async def test_read_rejects_spoofed_image_extension(monkeypatch):
-    read_file_bytes = AsyncMock(return_value=b"not an image")
     monkeypatch.setattr(
         mcp_endpoint,
         "get_service",
         lambda: SimpleNamespace(
             fs=SimpleNamespace(
-                read_file_bytes=read_file_bytes,
-                read_visible=AsyncMock(),
                 stat=AsyncMock(return_value={"size": 12, "isDir": False}),
+                read_image=AsyncMock(
+                    side_effect=InvalidArgumentError("Cannot decode image safely")
+                ),
             )
         ),
     )
-
     result = await read("viking://resources/not-really.png")
+    assert "Cannot decode image safely" in result
 
-    assert "bytes do not match" in result
 
-
-async def test_read_rejects_images_too_large_for_common_clients(monkeypatch):
-    read_file_bytes = AsyncMock()
-    oversized = mcp_endpoint._MCP_MEDIA_MAX_BYTES + 1
+async def test_read_large_image_delegates_to_preview_renderer(monkeypatch):
+    renderer = AsyncMock(
+        return_value={
+            "text": "图片过大，请提供 x、y",
+            "data": base64.b64encode(b"preview").decode(),
+            "mime_type": "image/png",
+        }
+    )
     monkeypatch.setattr(
         mcp_endpoint,
         "get_service",
         lambda: SimpleNamespace(
             fs=SimpleNamespace(
-                read_file_bytes=read_file_bytes,
-                read_visible=AsyncMock(),
-                stat=AsyncMock(return_value={"size": oversized, "isDir": False}),
+                stat=AsyncMock(return_value={"size": 20 * 1024 * 1024, "isDir": False}),
+                read_image=renderer,
             )
         ),
     )
-
     result = await read("viking://resources/huge.png")
-
-    assert "too large to inline" in result
-    assert 'ov get "viking://resources/huge.png" "./huge.png"' in result
-    assert "/api/v1/content/download?uri=viking%3A%2F%2Fresources%2Fhuge.png" in result
-    read_file_bytes.assert_not_awaited()
+    assert isinstance(result[1], ImageContent)
+    assert "x、y" in result[0].text
+    renderer.assert_awaited_once()
 
 
 async def test_read_rejects_media_batch_over_aggregate_limit_before_read(monkeypatch):
-    first_uri = "viking://resources/first.png"
-    second_uri = "viking://resources/second.png"
+    first_uri = "viking://resources/first.wav"
+    second_uri = "viking://resources/second.wav"
     declared_size = mcp_endpoint._MCP_MEDIA_MAX_BYTES // 2 + 1
-    read_file_bytes = AsyncMock(return_value=b"\x89PNG\r\n\x1a\n")
+    read_file_bytes = AsyncMock(return_value=b"RIFF\x00\x00\x00\x00WAVEaudio")
     stat = AsyncMock(return_value={"size": declared_size, "isDir": False})
     monkeypatch.setattr(
         mcp_endpoint,
@@ -1218,7 +1231,7 @@ async def test_read_rejects_media_batch_over_aggregate_limit_before_read(monkeyp
 
     assert isinstance(result, list)
     assert "combined media size" in result[3].text
-    assert f'ov get "{second_uri}" "./second.png"' in result[3].text
+    assert f'ov get "{second_uri}" "./second.wav"' in result[3].text
     read_file_bytes.assert_awaited_once_with(first_uri, ctx=DEFAULT_CTX)
 
 
@@ -2453,3 +2466,74 @@ async def test_tree_include_abstract_still_renders(service):
 
     result = await tree(uri="viking://resources/test_tree_abs", include_abstract=True)
     assert "\nnote.md (11 B)" in result
+
+
+async def test_read_preview_then_crop_real_image(service):
+    import io
+
+    from PIL import Image, ImageDraw
+
+    uri = "viking://resources/image-read-test/source.png"
+    image = Image.new("RGB", (5000, 3000), "white")
+    ImageDraw.Draw(image).rectangle((2450, 1450, 2549, 1549), fill="red")
+    buf = io.BytesIO()
+    image.save(buf, "PNG")
+    await service.viking_fs.mkdir(
+        "viking://resources/image-read-test", ctx=DEFAULT_CTX, exist_ok=True
+    )
+    await service.viking_fs.write_file_bytes(uri, buf.getvalue(), ctx=DEFAULT_CTX)
+    preview = await mcp_endpoint.mcp.call_tool("read", {"uris": uri})
+    assert "图片过大" in preview[0].text
+    assert Image.open(io.BytesIO(base64.b64decode(preview[1].data))).size == (2048, 1229)
+    crop = await mcp_endpoint.mcp.call_tool(
+        "read",
+        {
+            "uris": uri,
+            "x": 0.5,
+            "y": 0.5,
+            "width": 100,
+            "height": 100,
+        },
+    )
+    output = Image.open(io.BytesIO(base64.b64decode(crop[1].data)))
+    assert output.size == (100, 100)
+    assert output.getpixel((50, 50)) == (255, 0, 0)
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        {"uris": "viking://resources/note.md", "x": 0, "y": 0},
+        {"uris": ["viking://resources/a.png", "viking://resources/b.png"], "x": 0, "y": 0},
+        {"uris": "viking://resources/a.png", "width": 100},
+        {"uris": "viking://resources/a.png", "x": 0.5},
+    ],
+)
+async def test_read_rejects_invalid_image_arguments(arguments):
+    from mcp.server.fastmcp.exceptions import ToolError
+
+    with pytest.raises(ToolError):
+        await mcp_endpoint.mcp.call_tool("read", arguments)
+
+
+async def test_image_batch_limits_rendered_bytes_not_source_bytes(monkeypatch):
+    monkeypatch.setattr(mcp_endpoint, "_MCP_MEDIA_MAX_BYTES", 5)
+    monkeypatch.setattr(
+        mcp_endpoint,
+        "get_service",
+        lambda: SimpleNamespace(
+            fs=SimpleNamespace(
+                stat=AsyncMock(return_value={"size": 1000, "isDir": False}),
+                read_image=AsyncMock(
+                    return_value={
+                        "text": "preview",
+                        "data": base64.b64encode(b"data").decode(),
+                        "mime_type": "image/png",
+                    }
+                ),
+            )
+        ),
+    )
+    result = await read(["viking://resources/a.png", "viking://resources/b.png"])
+    assert sum(isinstance(block, ImageContent) for block in result) == 1
+    assert "inline budget" in result[-1].text

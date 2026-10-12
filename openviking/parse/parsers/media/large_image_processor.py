@@ -134,14 +134,14 @@ def create_low_res_preview(
     original_width, original_height = img.size
 
     # Convert to RGB if needed (for PNGs with alpha)
-    if img.mode in ("RGBA", "P"):
+    if img.mode not in ("RGB", "L"):
         img = img.convert("RGB")
 
     # Resize if larger than max dimension
     if original_width > max_dimension_px or original_height > max_dimension_px:
         ratio = min(max_dimension_px / original_width, max_dimension_px / original_height)
-        new_width = int(original_width * ratio)
-        new_height = int(original_height * ratio)
+        new_width = max(1, int(original_width * ratio))
+        new_height = max(1, int(original_height * ratio))
         img = img.resize((new_width, new_height), Image.Resampling.LANCZOS)
         logger.debug(f"Resized preview to {new_width}x{new_height}")
 

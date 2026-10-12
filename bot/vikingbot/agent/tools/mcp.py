@@ -13,7 +13,7 @@ from typing import Any
 import httpx
 from loguru import logger
 
-from vikingbot.agent.tools.base import Tool, ToolContext
+from vikingbot.agent.tools.base import MultimodalToolResult, Tool, ToolContext
 from vikingbot.agent.tools.registry import ToolRegistry
 
 
@@ -102,7 +102,7 @@ class MCPToolWrapper(Tool):
     def parameters(self) -> dict[str, Any]:
         return self._parameters
 
-    async def execute(self, tool_context: ToolContext, **kwargs: Any) -> str:
+    async def execute(self, tool_context: ToolContext, **kwargs: Any) -> str | MultimodalToolResult:
         # tool_context is accepted for interface compatibility with vikingbot's
         # native Tool.execute signature, but unused here since MCP servers
         # receive their inputs purely via kwargs.
@@ -134,12 +134,26 @@ class MCPToolWrapper(Tool):
             return f"(MCP tool call failed: {type(exc).__name__})"
 
         parts = []
+        content = []
         for block in result.content:
             if isinstance(block, types.TextContent):
                 parts.append(block.text)
+                content.append({"type": "text", "text": block.text})
+            elif isinstance(block, types.ImageContent):
+                parts.append(f"[Image: {block.mimeType}]")
+                content.append(
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": f"data:{block.mimeType};base64,{block.data}"},
+                    }
+                )
             else:
                 parts.append(str(block))
-        return "\n".join(parts) or "(no output)"
+                content.append({"type": "text", "text": str(block)})
+        text = "\n".join(parts) or "(no output)"
+        if any(part["type"] == "image_url" for part in content):
+            return MultimodalToolResult(text=text, content=content)
+        return text
 
 
 async def connect_mcp_servers(

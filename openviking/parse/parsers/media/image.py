@@ -11,22 +11,25 @@ For current document parsing (PDF, Markdown, HTML, Text), see other parser modul
 """
 
 import io
+import json
 from pathlib import Path
 from typing import List, Optional, Union
 
-from PIL import Image
+from PIL import Image, ImageOps
 
 from openviking.parse.base import NodeType, ParseResult, ResourceNode
 from openviking.parse.output import create_parse_artifact_writer
 from openviking.parse.parsers.base_parser import BaseParser
 from openviking.parse.parsers.media.constants import IMAGE_EXTENSIONS
 from openviking.parse.parsers.media.large_image_processor import (
-    process_large_image,
+    create_low_res_preview,
+    needs_large_image_processing,
     save_image_to_bytes,
 )
 from openviking.parse.parsers.media.naming import resolve_media_names
 from openviking.parse.parsers.media.utils import _convert_svg_to_png
 from openviking.storage.viking_fs import get_viking_fs
+from openviking.utils.image_read import IMAGE_SOURCE_FILENAME
 from openviking_cli.utils.config.parser_config import ImageConfig
 from openviking_cli.utils.logger import get_logger
 from openviking_cli.utils.uri import VikingURI
@@ -82,9 +85,8 @@ class ImageParser(BaseParser):
         """
         Parse image file:
         - For large images (>10MB or any dimension >4096px):
-          - Create low-res preview (<=1MB) as the "original"
-          - Split into tiles (<=2048px each)
-          - Generate grid overlay image
+          - Preserve the original and an oriented preview
+          - Read high-resolution regions on demand
         - For small images: just save as-is with metadata
 
         Args:
@@ -122,7 +124,6 @@ class ImageParser(BaseParser):
                 img = Image.open(io.BytesIO(png_bytes))
                 # Save as PNG in output
                 needs_png_conversion = True
-                converted_png_bytes = png_bytes  # Save for small-image branch
             else:
                 # Check if extension is in VLM-natively supported list
                 suffix_lower = file_path.suffix.lower()
@@ -171,11 +172,7 @@ class ImageParser(BaseParser):
         try:
             await writer.mkdir(root_dir_name)
 
-            # Process the image (check if large)
-            large_image_result = process_large_image(
-                file_path, img, filename_prefix=stem, config=self.config
-            )
-            img.close()
+            is_large = needs_large_image_processing(file_path, width, height, self.config)
 
             # Create root node with metadata
             root_node = ResourceNode(
@@ -193,71 +190,51 @@ class ImageParser(BaseParser):
                     "source_title": display_stem,
                     "semantic_name": display_stem,
                     "original_filename": original_filename,
-                    "is_large_image": large_image_result.needs_processing,
+                    "is_large_image": is_large,
                 },
             )
 
-            if large_image_result.needs_processing:
-                # Large image processing mode: save preview, grid, tiles
-                # NOTE: The original file is intentionally NOT saved. Large images can be
-                # hundreds of MB; storing the full-resolution original would exceed storage
-                # budgets. The preview + tiles are the canonical representation. The
-                # `original_filename` metadata field records the original name for reference
-                # but the corresponding file is not persisted.
-                logger.debug(f"Processing large image {original_filename}: {width}x{height}")
-
-                # Save low-res preview (original is too large to store)
-                await writer.write_bytes(
-                    f"{root_dir_name}/{large_image_result.preview_filename}",
-                    large_image_result.preview_bytes,
-                )
-                root_node.meta["preview_filename"] = large_image_result.preview_filename
-
-                # Save grid overlay
-                if large_image_result.grid_overlay_bytes:
-                    grid_filename = large_image_result.grid_overlay_filename or f"{stem}_grid.jpg"
-                    await writer.write_bytes(
-                        f"{root_dir_name}/{grid_filename}",
-                        large_image_result.grid_overlay_bytes,
-                    )
-                    root_node.meta["grid_overlay"] = grid_filename
-
-                # Create tiles directory
-                if large_image_result.tiles:
-                    tiles_dir_name = "tiles"
-                    tiles_dir_rel = f"{root_dir_name}/{tiles_dir_name}"
-                    await writer.mkdir(tiles_dir_rel)
-
-                    # Save all tiles
-                    for tile in large_image_result.tiles:
-                        if tile.bytes_data:
-                            await writer.write_bytes(
-                                f"{tiles_dir_rel}/{tile.filename}", tile.bytes_data
-                            )
-
-                    # Update metadata
-                    root_node.meta["tiles_dir"] = tiles_dir_name
-                    root_node.meta["num_tiles"] = len(large_image_result.tiles)
-                    root_node.meta["grid_rows"] = large_image_result.total_rows
-                    root_node.meta["grid_cols"] = large_image_result.total_cols
-                    root_node.meta["original_width"] = width
-                    root_node.meta["original_height"] = height
-
+            if needs_png_conversion:
+                image_bytes = save_image_to_bytes(img, format="PNG")
             else:
-                # Small image: save as PNG if format is not VLM-supported, else as-is
-                if needs_png_conversion:
-                    # SVG was already converted to PNG bytes during loading
-                    if file_path.suffix.lower() == ".svg":
-                        image_bytes = converted_png_bytes
-                    else:
-                        with Image.open(file_path) as converted_img:
-                            image_bytes = save_image_to_bytes(converted_img, format="PNG")
-                else:
-                    image_bytes = file_path.read_bytes()
-                await writer.write_bytes(f"{root_dir_name}/{original_filename}", image_bytes)
+                image_bytes = file_bytes
+            await writer.write_bytes(f"{root_dir_name}/{original_filename}", image_bytes)
+
+            if is_large:
+                preview_filename = f"{stem}_preview.jpg"
+                with ImageOps.exif_transpose(img) as oriented:
+                    width, height = oriented.size
+                    preview_bytes = create_low_res_preview(oriented, self.config)
+                await writer.write_bytes(f"{root_dir_name}/{preview_filename}", preview_bytes)
+                # A visible sidecar survives directory import, sync and export.
+                # Only sibling names are stored, so moving the resource is safe.
+                await writer.write_bytes(
+                    f"{root_dir_name}/{IMAGE_SOURCE_FILENAME}",
+                    json.dumps(
+                        {
+                            "version": 1,
+                            "original": original_filename,
+                            "preview": preview_filename,
+                            "width": width,
+                            "height": height,
+                            "coordinate_space": "exif_transposed",
+                        }
+                    ).encode(),
+                )
+                root_node.meta.update(
+                    {
+                        "preview_filename": preview_filename,
+                        "width": width,
+                        "height": height,
+                        "original_width": width,
+                        "original_height": height,
+                    }
+                )
+            img.close()
 
             artifact_ref = await writer.finalize(resource_rel=root_dir_name)
         except BaseException:
+            img.close()
             await writer.cleanup()
             raise
 
@@ -272,7 +249,7 @@ class ImageParser(BaseParser):
             meta={
                 "content_type": "image",
                 "format": format_str.lower(),
-                "is_large_image": large_image_result.needs_processing,
+                "is_large_image": is_large,
             },
         )
 

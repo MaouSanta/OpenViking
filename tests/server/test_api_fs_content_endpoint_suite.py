@@ -400,3 +400,40 @@ async def test_reindex_async_returns_task_id(client, monkeypatch):
     assert body["result"]["status"] == "accepted"
     assert body["result"]["task_id"] == "task-123"
     assert body["result"]["mode"] == "vectors_only"
+
+
+async def test_image_read_is_explicit_and_passes_region(app, service, monkeypatch):
+    from unittest.mock import AsyncMock
+
+    renderer = AsyncMock(
+        return_value={"kind": "crop", "data": "aW1hZ2U=", "mime_type": "image/png"}
+    )
+    monkeypatch.setattr(service.fs, "read_image", renderer)
+    response = await _request_with_handler(
+        app,
+        "GET",
+        "/api/v1/content/read",
+        params={
+            "uri": "viking://resources/source.png",
+            "multimodal": True,
+            "x": 0.25,
+            "y": 0.75,
+            "width": 100,
+            "height": 200,
+        },
+    )
+    assert response.status_code == 200
+    assert response.json()["result"]["kind"] == "crop"
+    assert renderer.await_args.kwargs["x"] == 0.25
+    assert renderer.await_args.kwargs["height"] == 200
+    invalid = await _request_with_handler(
+        app,
+        "GET",
+        "/api/v1/content/read",
+        params={
+            "uri": "viking://resources/source.png",
+            "x": 0.25,
+            "y": 0.75,
+        },
+    )
+    _assert_error(invalid, status_code=400, error_code="INVALID_ARGUMENT")

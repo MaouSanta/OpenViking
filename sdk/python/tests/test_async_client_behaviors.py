@@ -1678,3 +1678,16 @@ async def test_import_ovpack_fails_fast_when_path_is_directory(tmp_path):
 
     with pytest.raises(ValueError, match="is not a file"):
         await client.import_ovpack(str(pack_dir), parent="viking://resources/")
+
+
+@pytest.mark.asyncio
+async def test_read_image_uses_explicit_multimodal_endpoint():
+    client = AsyncHTTPClient(url="http://localhost:1933")
+    client._request = AsyncMock(return_value=object())
+    client._handle_response = lambda _: {"kind": "crop"}
+    result = await client.read_image("viking://resources/image.png", x=0.25, y=0.75, width=100)
+    assert result == {"kind": "crop"}
+    client._request.assert_awaited_once_with("GET", "/api/v1/content/read", params={
+        "uri": "viking://resources/image.png", "multimodal": True,
+        "x": 0.25, "y": 0.75, "width": 100,
+    })

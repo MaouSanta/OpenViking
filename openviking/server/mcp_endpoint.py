@@ -75,6 +75,7 @@ from openviking.server.skill_ingest import install_skills
 from openviking.server.temp_upload_store import TempUploadStore
 from openviking.server.upload_token_store import upload_token_store
 from openviking.service.skill_sources import GIT_SKILL_SOURCE_PREFIXES
+from openviking.utils.image_read import RASTER_EXTENSIONS, validate_image_region
 from openviking.utils.media_limits import MAX_INLINE_TOOL_RESULT_MEDIA_BYTES
 from openviking.utils.search_filters import (
     SearchContextTypeInput,
@@ -638,7 +639,7 @@ async def _format_search_result(result, *, service, ctx, read_content: bool = Fa
 # -- read ------------------------------------------------------------------
 
 
-_MCP_IMAGE_EXTENSIONS = {".gif", ".jpeg", ".jpg", ".png", ".webp"}
+_MCP_IMAGE_EXTENSIONS = RASTER_EXTENSIONS
 _MCP_AUDIO_EXTENSIONS = {".flac", ".m4a", ".mp3", ".oga", ".ogg", ".wav"}
 _MCP_VIDEO_EXTENSIONS = {".avi", ".m4v", ".mkv", ".mov", ".mp4", ".webm"}
 _MCP_MEDIA_MAX_BYTES = MAX_INLINE_TOOL_RESULT_MEDIA_BYTES
@@ -660,24 +661,6 @@ def _is_mcp_audio_uri(uri: str) -> bool:
 
 def _is_mcp_video_uri(uri: str) -> bool:
     return _mcp_uri_suffix(uri) in _MCP_VIDEO_EXTENSIONS
-
-
-def _sniff_mcp_image_mime_type(data: bytes) -> Optional[str]:
-    """Recognize the raster formats shared by common MCP coding clients."""
-    if data.startswith(b"\x89PNG\r\n\x1a\n"):
-        return "image/png"
-    if data.startswith(b"\xff\xd8\xff"):
-        return "image/jpeg"
-    if data.startswith((b"GIF87a", b"GIF89a")):
-        return "image/gif"
-    if len(data) >= 12 and data.startswith(b"RIFF") and data[8:12] == b"WEBP":
-        return "image/webp"
-    return None
-
-
-def _mcp_image_content(data: bytes, mime_type: str) -> ImageContent:
-    encoded = base64.b64encode(data).decode("ascii")
-    return ImageContent(type="image", data=encoded, mimeType=mime_type)
 
 
 def _sniff_mcp_audio_mime_type(data: bytes, uri: str) -> Optional[str]:
@@ -718,13 +701,22 @@ async def read(
     uris: str | list[str],
     offset: int = 0,
     limit: int = -1,
+    x: float | None = None,
+    y: float | None = None,
+    width: int | None = None,
+    height: int | None = None,
 ) -> str | list[ContentBlock]:
-    """Read one or more viking:// file URIs. Text reads accept line-based offset/limit. Raster images and supported audio return native MCP content blocks. For directory listing, use the list tool instead."""
+    """Read one or more viking:// file URIs. Text reads accept line-based offset/limit. Large images return a preview: call read again with normalized full-image center x/y (0..1, top-left origin). Optional width/height are original pixels, default/max 2048. Crops require one image URI. Raster images and supported audio return native MCP content blocks. For directory listing, use the list tool instead."""
     import asyncio
 
     service = get_service()
     ctx = _get_ctx()
     uri_list = uris if isinstance(uris, list) else [uris]
+    validate_image_region(x, y, width, height)
+    if x is not None and (len(uri_list) != 1 or not _is_mcp_image_uri(uri_list[0])):
+        raise InvalidArgumentError("Coordinates require exactly one raster image URI.")
+    if any(_is_mcp_image_uri(uri) for uri in uri_list) and (offset != 0 or limit != -1):
+        raise InvalidArgumentError("Image reads do not accept text line ranges.")
     semaphore = asyncio.Semaphore(10)
 
     async def _preflight_one(
@@ -778,7 +770,7 @@ async def read(
     checked: list[tuple[str, Optional[int], Optional[_MCPToolFailure]]] = []
     media_total = 0
     for uri, (resolved_uri, size, error) in zip(uri_list, preflight, strict=True):
-        if error is None and size is not None:
+        if error is None and size is not None and not _is_mcp_image_uri(resolved_uri):
             if size > _MCP_MEDIA_MAX_BYTES:
                 error = _mcp_failure(
                     f"Media file is too large to inline through MCP ({size} bytes; limit "
@@ -796,7 +788,7 @@ async def read(
 
     async def _read_one(
         uri: str, prepared: tuple[str, Optional[int], Optional[_MCPToolFailure]]
-    ) -> str | ContentBlock:
+    ) -> str | ContentBlock | list[ContentBlock]:
         async with semaphore:
             try:
                 resolved_uri, declared_size, error = prepared
@@ -804,25 +796,27 @@ async def read(
                     return error
                 is_image = _is_mcp_image_uri(resolved_uri)
                 is_audio = _is_mcp_audio_uri(resolved_uri)
-                if is_image or is_audio:
+                if is_image:
+                    image = await service.fs.read_image(
+                        resolved_uri, ctx=ctx, x=x, y=y, width=width, height=height
+                    )
+                    return [
+                        TextContent(type="text", text=image["text"]),
+                        ImageContent(type="image", data=image["data"], mimeType=image["mime_type"]),
+                    ]
+                if is_audio:
                     data = await service.fs.read_file_bytes(resolved_uri, ctx=ctx)
                     if declared_size is None or len(data) > declared_size:
                         return _mcp_failure(
                             f"Cannot render {uri}: file changed after its size was checked. "
                             "Retry the read."
                         )
-                    mime_type = (
-                        _sniff_mcp_image_mime_type(data)
-                        if is_image
-                        else _sniff_mcp_audio_mime_type(data, resolved_uri)
-                    )
+                    mime_type = _sniff_mcp_audio_mime_type(data, resolved_uri)
                     if mime_type is None:
                         return _mcp_failure(
                             f"Cannot render {uri}: its bytes do not match a supported media "
                             f"format. {_mcp_media_download_hint(uri)}"
                         )
-                    if is_image:
-                        return _mcp_image_content(data, mime_type)
                     return _mcp_audio_content(data, mime_type)
                 content = await service.fs.read_visible(
                     resolved_uri,
@@ -836,7 +830,7 @@ async def read(
 
     if len(uri_list) == 1:
         result = await _read_one(uri_list[0], checked[0])
-        if isinstance(result, str):
+        if isinstance(result, (str, list)):
             return result
         return [TextContent(type="text", text=f"Source: {uri_list[0]}"), result]
 
@@ -845,12 +839,28 @@ async def read(
     )
     if any(not isinstance(result, str) for result in results):
         blocks: list[ContentBlock] = []
+        output_media_bytes = 0
         for uri, result in zip(uri_list, results, strict=True):
             blocks.append(TextContent(type="text", text=f"=== {uri} ==="))
             if isinstance(result, str):
                 blocks.append(TextContent(type="text", text=result))
             else:
-                blocks.append(result)
+                items = result if isinstance(result, list) else [result]
+                size = sum(
+                    len(base64.b64decode(item.data))
+                    for item in items
+                    if isinstance(item, (ImageContent, AudioContent))
+                )
+                if output_media_bytes + size > _MCP_MEDIA_MAX_BYTES:
+                    blocks.append(
+                        TextContent(
+                            type="text",
+                            text="Combined media exceeds the inline budget. Read fewer files at once.",
+                        )
+                    )
+                else:
+                    blocks.extend(items)
+                    output_media_bytes += size
         return blocks
 
     parts = []

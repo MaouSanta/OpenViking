@@ -100,7 +100,9 @@ def _demote_historical_tool_media(
     candidates: list[tuple[dict, int]] = []
     reclaimable_bytes = 0
     for message in messages[:history_end]:
-        if message.get("role") != "tool" or not isinstance(message.get("content"), list):
+        if (
+            message.get("role") != "tool" and message.get("name") != "tool_result_media"
+        ) or not isinstance(message.get("content"), list):
             continue
         media_bytes = _inline_media_bytes([message])
         if media_bytes <= 0:
@@ -1667,6 +1669,7 @@ class AgentLoop:
                 turn_tools: list[dict[str, Any]] = []
                 history_end = len(messages)
                 request_media_bytes = _inline_media_bytes(messages)
+                pending_tool_images = []
                 for _idx, tool_call, outcome, tool_execute_duration in results:
                     result = outcome.result
                     result_text = str(result)
@@ -1687,35 +1690,41 @@ class AgentLoop:
                     model_result = result
                     if isinstance(result, MultimodalToolResult):
                         result_media_bytes = _inline_media_bytes([{"content": result.content}])
-                        if not self.provider.supports_tool_result_media(self.model):
+                        overflow = (
+                            request_media_bytes
+                            + result_media_bytes
+                            - MAX_INLINE_TOOL_RESULT_MEDIA_BYTES
+                        )
+                        if overflow > 0:
+                            request_media_bytes -= _demote_historical_tool_media(
+                                messages,
+                                history_end=history_end,
+                                bytes_needed=overflow,
+                            )
+                        if (
+                            request_media_bytes + result_media_bytes
+                            > MAX_INLINE_TOOL_RESULT_MEDIA_BYTES
+                        ):
                             model_result = (
-                                f"{result_text}\n\nMedia content was omitted because the configured "
-                                "model provider does not support media in tool results."
+                                f"{result_text}\n\nMedia content was omitted because adding it would "
+                                "make this model request exceed the inline media "
+                                f"limit of {MAX_INLINE_TOOL_RESULT_MEDIA_BYTES} bytes."
                             )
                         else:
-                            overflow = (
-                                request_media_bytes
-                                + result_media_bytes
-                                - MAX_INLINE_TOOL_RESULT_MEDIA_BYTES
-                            )
-                            if overflow > 0:
-                                reclaimed = _demote_historical_tool_media(
-                                    messages,
-                                    history_end=history_end,
-                                    bytes_needed=overflow,
+                            request_media_bytes += result_media_bytes
+                            if not self.provider.supports_tool_result_media(self.model):
+                                model_result = result_text
+                                pending_tool_images.append(
+                                    {
+                                        "type": "text",
+                                        "text": f"Images from tool {tool_call.name}, call {tool_call.id}:\n{result_text}",
+                                    }
                                 )
-                                request_media_bytes -= reclaimed
-                            if (
-                                request_media_bytes + result_media_bytes
-                                > MAX_INLINE_TOOL_RESULT_MEDIA_BYTES
-                            ):
-                                model_result = (
-                                    f"{result_text}\n\nMedia content was omitted because adding it would "
-                                    "make this model request exceed the inline media "
-                                    f"limit of {MAX_INLINE_TOOL_RESULT_MEDIA_BYTES} bytes."
+                                pending_tool_images.extend(
+                                    part
+                                    for part in result.content
+                                    if part.get("type") == "image_url"
                                 )
-                            else:
-                                request_media_bytes += result_media_bytes
                     messages = self.context.add_tool_result(
                         messages, tool_call.id, tool_call.name, model_result
                     )
@@ -1736,6 +1745,16 @@ class AgentLoop:
                         tool_used_dict["skill_uris"] = list(outcome.skill_uris)
                     tools_used.append(tool_used_dict)
                     turn_tools.append(tool_used_dict)
+
+                # Complete every tool response before supplying images to chat-style VLMs.
+                if pending_tool_images:
+                    messages.append(
+                        {
+                            "role": "user",
+                            "name": "tool_result_media",
+                            "content": pending_tool_images,
+                        }
+                    )
 
                 if captured_turns is not None:
                     captured_turns.append(
@@ -2037,7 +2056,9 @@ class AgentLoop:
             if msg.metadata.get("studio_managed"):
                 from vikingbot.studio.policy import disabled_group_tools
 
-                disabled_tools = list(set(disabled_tools) | set(disabled_group_tools(self.tools.tool_names)))
+                disabled_tools = list(
+                    set(disabled_tools) | set(disabled_group_tools(self.tools.tool_names))
+                )
             openviking_connection = getattr(msg, "openviking_connection", None)
             if not isinstance(openviking_connection, dict):
                 openviking_connection = None

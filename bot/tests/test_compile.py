@@ -454,9 +454,12 @@ async def test_multi_read_returns_images_as_tool_result_content(monkeypatch):
             assert uri == image_uri
             return {"size": len(image_bytes), "isDir": False}
 
-        async def download_bytes(self, uri):
+        async def read_image(self, uri, **kwargs):
             assert uri == image_uri
-            return image_bytes
+            return {
+                "text": "Image resource (image/png)",
+                "data": base64.b64encode(image_bytes).decode(),
+            }
 
         async def read_content(self, *args, **kwargs):
             raise AssertionError("image reads must not use the text endpoint")
@@ -497,8 +500,8 @@ async def test_multi_read_limits_aggregate_inline_image_bytes(monkeypatch):
         async def stat(self, uri):
             return {"size": len(images[uri]), "isDir": False}
 
-        async def download_bytes(self, uri):
-            return images[uri]
+        async def read_image(self, uri, **kwargs):
+            return {"text": "Image", "data": base64.b64encode(images[uri]).decode()}
 
         async def read_content(self, *args, **kwargs):
             raise AssertionError("image reads must not use the text endpoint")

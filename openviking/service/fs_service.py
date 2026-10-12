@@ -105,6 +105,7 @@ class FSService:
         uri_mutation_coordinator: Optional[UriMutationCoordinator] = None,
     ):
         self._viking_fs = viking_fs
+        self._image_read_semaphore = asyncio.Semaphore(2)
         self._vikingdb = vikingdb
         self._privacy_config_service = privacy_config_service
         self._resource_memory_link_service = resource_memory_link_service
@@ -1082,6 +1083,24 @@ class FSService:
         lines = content.splitlines(keepends=True)
         sliced = lines[offset:] if limit == -1 else lines[offset : offset + limit]
         return "".join(sliced)
+
+    async def read_image(
+        self, uri: str, ctx: RequestContext, *, x=None, y=None, width=None, height=None
+    ) -> dict:
+        """Read a model-sized image or a region in original image pixels."""
+        from openviking.utils.image_read import read_image
+
+        async with self._image_read_semaphore:
+            return await read_image(
+                self._ensure_initialized(),
+                uri,
+                ctx=ctx,
+                config=get_openviking_config().image,
+                x=x,
+                y=y,
+                width=width,
+                height=height,
+            )
 
     async def read_visible(
         self,

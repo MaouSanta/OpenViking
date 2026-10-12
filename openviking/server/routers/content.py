@@ -130,6 +130,11 @@ async def read(
     offset: int = Query(0, description="Starting line number (0-indexed)"),
     limit: int = Query(-1, description="Number of lines to read, -1 means read to end"),
     raw: bool = Query(False, description="Return raw stored content without memory-field cleanup"),
+    multimodal: bool = Query(False, description="Return a structured image preview or crop"),
+    x: float | None = Query(None, ge=0, le=1),
+    y: float | None = Query(None, ge=0, le=1),
+    width: int | None = Query(None, ge=1, le=2048),
+    height: int | None = Query(None, ge=1, le=2048),
     _ctx: RequestContext = Depends(get_request_context),
 ):
     """Read file content (L2)."""
@@ -140,8 +145,19 @@ async def read(
         resolved = uri
     else:
         resolved = validate_request_viking_uri(resolve_path_variables(uri), _ctx)
+    from openviking.utils.image_read import validate_image_region
+
+    validate_image_region(x, y, width, height)
+    if x is not None and not multimodal:
+        raise InvalidArgumentError("Image coordinates require multimodal=true.")
+    if multimodal and (raw or offset != 0 or limit != -1):
+        raise InvalidArgumentError("Image reads do not accept raw or text line ranges.")
     try:
-        if raw:
+        if multimodal:
+            result = await service.fs.read_image(
+                resolved, ctx=_ctx, x=x, y=y, width=width, height=height
+            )
+        elif raw:
             result = await service.fs.read(resolved, ctx=_ctx, offset=offset, limit=limit)
         else:
             result = await service.fs.read_visible(resolved, ctx=_ctx, offset=offset, limit=limit)

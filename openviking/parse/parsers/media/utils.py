@@ -274,6 +274,16 @@ async def generate_image_summary(
     config = get_openviking_config()
     file_name = original_filename
 
+    from openviking.utils.image_read import image_source
+
+    source = await image_source(viking_fs, image_uri, ctx)
+    if source and image_uri.rsplit("/", 1)[-1] == source["original"]:
+        return {
+            "name": file_name,
+            "summary": f"Full-resolution image. Read {source['preview']} for the overview; "
+            "use read with normalized x/y coordinates for HD regions.",
+        }
+
     try:
         # Read image bytes
         image_bytes = await viking_fs.read_file_bytes(image_uri, ctx=ctx)

@@ -1204,6 +1204,27 @@ class AsyncHTTPClient:
         )
         return self._handle_response(response)
 
+    async def read_image(
+        self,
+        uri: str,
+        *,
+        x: float | None = None,
+        y: float | None = None,
+        width: int | None = None,
+        height: int | None = None,
+    ) -> dict:
+        """Read an image preview or a crop centered in normalized full-image coordinates."""
+        params = {"uri": VikingURI.normalize(uri), "multimodal": True}
+        params.update(
+            {
+                k: v
+                for k, v in {"x": x, "y": y, "width": width, "height": height}.items()
+                if v is not None
+            }
+        )
+        response = await self._request("GET", "/api/v1/content/read", params=params)
+        return self._handle_response(response)
+
     async def read_raw(self, uri: str, offset: int = 0, limit: int = -1) -> str:
         """Read the exact UTF-8 content stored for a file, including hidden metadata."""
         response = await self._request(

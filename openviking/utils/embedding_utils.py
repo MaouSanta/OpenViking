@@ -34,6 +34,7 @@ from openviking.storage.resource_rnfv import NON_PORTABLE_VECTOR_RECORD_FIELDS
 from openviking.storage.viking_fs import LS_ALL_NODES, get_viking_fs
 from openviking.telemetry.request_wait_tracker import get_request_wait_tracker
 from openviking.utils.embedding_input import truncate_embedding_input
+
 from openviking.utils.image_search import image_bytes_to_model_data_uri
 from openviking.utils.ingest_options import IngestOptions
 from openviking.utils.time_utils import parse_iso_datetime
@@ -52,6 +53,13 @@ logger = get_logger(__name__)
 # fails embedding enqueue, so the resource is silently never vectorized (and thus
 # not retrievable). Cap it with headroom, mirroring
 # memory_updater._truncate_memory_abstract introduced for the memory path (#2774).
+def _bounded_file_embedding(text: str, max_tokens: int) -> str:
+    bounded = truncate_embedding_input(text, max_tokens)
+    if text.startswith("<!-- dwg-sheet-chunk:v1 -->") and bounded != text:
+        raise ValueError("DWG chunk exceeds the actual embedding input budget; rebuild chunks instead of truncating")
+    return bounded
+
+
 _ABSTRACT_MAX_BYTES = 50_000
 
 
@@ -316,6 +324,12 @@ async def _build_image_data_uri(
     Returns None if the image cannot be read.
     """
     try:
+        from openviking.utils.image_read import image_source
+
+        source = await image_source(viking_fs, file_path, ctx)
+        if source:
+            file_name = source["preview"]
+            file_path = f"{file_path.rsplit('/', 1)[0]}/{file_name}"
         content = await viking_fs.read_file_bytes(file_path, ctx=ctx)
         image_config = getattr(get_openviking_config(), "image", None)
         return image_bytes_to_model_data_uri(content, file_name, config=image_config)
@@ -660,7 +674,7 @@ async def vectorize_file(
                     if file_content is not None
                     else await viking_fs.read_file(file_path, ctx=ctx)
                 )
-                embedding_text = truncate_embedding_input(
+                embedding_text = _bounded_file_embedding(
                     content,
                     embedding_cfg.max_input_tokens,
                 )
@@ -693,7 +707,7 @@ async def vectorize_file(
                         )
                         return False
                 else:
-                    embedding_text = truncate_embedding_input(
+                    embedding_text = _bounded_file_embedding(
                         content,
                         embedding_cfg.max_input_tokens,
                     )

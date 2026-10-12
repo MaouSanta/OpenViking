@@ -69,6 +69,8 @@ class DummyFS:
         return self.content
 
     async def read_file_bytes(self, _path, ctx=None):
+        if _path.endswith("/image-source.json"):
+            raise FileNotFoundError(_path)
         self.read_file_bytes_calls += 1
         if isinstance(self.content, bytes):
             return self.content
