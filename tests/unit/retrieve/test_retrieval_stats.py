@@ -158,10 +158,11 @@ class TestRetrievalObserver:
 
     def test_no_errors_below_min_queries(self):
         collector = self._setup_collector()
-        # Only 3 queries (below the 5-query minimum for error flagging)
-        for _ in range(3):
+        # Four queries is the highest sample count below the error threshold.
+        for _ in range(4):
             collector.record_query("memory", 0, [])
         observer = RetrievalObserver()
+        assert observer.is_healthy() is True
         assert observer.has_errors() is False
 
     def test_status_table_no_data(self):

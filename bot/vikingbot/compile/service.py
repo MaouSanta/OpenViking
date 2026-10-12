@@ -9,6 +9,7 @@ import shlex
 import shutil
 import uuid
 from collections.abc import Awaitable, Callable
+from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -488,8 +489,10 @@ class BotCompileService:
     ) -> None:
         capabilities = self._compile_capabilities()
         session_key = SessionKey(type="compile", channel_id=task_id, chat_id=task_id)
-        task_config = self.config.model_copy(deep=True)
+        # Runtime VLM state may own locks and must stay shared; only sandbox is mutated below.
+        task_config = self.config.model_copy(deep=False)
         task_config.skills = []
+        task_config.sandbox = deepcopy(self.config.sandbox)
         task_config.sandbox.mode = SandboxMode.PER_SESSION
         workspace_parent = self.config.bot_data_path / "compile_workspaces" / task_id
         sandbox_manager = SandboxManager(task_config, workspace_parent, task_config.workspace_path)

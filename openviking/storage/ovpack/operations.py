@@ -9,6 +9,7 @@ import zipfile
 from typing import Any, Optional
 
 from openviking.core.namespace import context_type_for_uri, is_session_uri, relative_uri_path
+from openviking.resource.atomic_bundle import unindexed_dwg_uris
 from openviking.server.identity import RequestContext
 from openviking.storage.index_consistency import check_index_consistency
 from openviking.storage.ovpack.format import (
@@ -195,13 +196,14 @@ async def _enqueue_direct_vectorization(
     index_records = index_records or []
     manifest_path_root_uri = manifest_path_root_uri or uri
     entries = await viking_fs.tree(uri, node_limit=None, level_limit=None, ctx=ctx)
-    dir_uris = {uri}
+    excluded = await unindexed_dwg_uris(viking_fs, uri, entries, ctx=ctx)
+    dir_uris = {uri} - excluded
     file_entries: list[tuple[str, str, str, str]] = []
     for entry in entries:
         entry_uri = entry.get("uri")
         if not entry_uri:
             continue
-        if is_session_uri(entry_uri):
+        if is_session_uri(entry_uri) or entry_uri in excluded:
             continue
         rel_path = entry.get("rel_path") or relative_uri_path(uri, entry_uri)
         manifest_rel_path = relative_uri_path(manifest_path_root_uri, entry_uri)

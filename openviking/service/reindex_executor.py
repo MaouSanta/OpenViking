@@ -23,6 +23,7 @@ from openviking.core.namespace import (
     owner_fields_for_uri,
     owner_space_for_uri,
 )
+from openviking.resource.atomic_bundle import unindexed_dwg_uris
 from openviking.server.dependencies import get_service
 from openviking.server.identity import RequestContext
 from openviking.service.task_tracker import get_task_tracker
@@ -919,6 +920,10 @@ class ReindexExecutor:
         ctx: RequestContext,
         lock: dict | None = None,
     ) -> None:
+        if uri in await unindexed_dwg_uris(
+            get_viking_fs(), uri, [], ctx=ctx, include_semantic_directories=True
+        ):
+            return
         processor = SemanticProcessor(
             max_concurrent_llm=get_openviking_config().vlm.max_concurrent,
         )
@@ -1001,7 +1006,16 @@ class ReindexExecutor:
                 deduped_files.append(file_uri)
                 seen_files.add(file_uri)
 
+        excluded = await unindexed_dwg_uris(
+            get_viking_fs(),
+            root_uri,
+            [{"uri": path, "isDir": True} for path in deduped_directories]
+            + [{"uri": path} for path in deduped_files],
+            ctx=ctx,
+        )
         for directory_uri in deduped_directories:
+            if directory_uri in excluded:
+                continue
             if directory_uri == "viking://":
                 continue
             counters.scanned_records += 1
@@ -1047,6 +1061,8 @@ class ReindexExecutor:
                     counters.warnings.append(f"Failed to reindex {directory_uri} L1 vector: {exc}")
 
         for file_uri in deduped_files:
+            if file_uri in excluded:
+                continue
             counters.scanned_records += 1
             parent_uri = VikingURI(file_uri).parent.uri
             summary = await self._best_file_summary(file_uri, ctx=ctx)
@@ -1091,6 +1107,9 @@ class ReindexExecutor:
             return
 
         viking_fs = get_viking_fs()
+        if dir_uri in await unindexed_dwg_uris(viking_fs, dir_uri, [], ctx=ctx):
+            await self.delete_uri_level(uri=dir_uri, level=level, ctx=ctx)
+            return
         marker_name = ".abstract.md" if level == ContextLevel.ABSTRACT else ".overview.md"
         lock_path = viking_fs._uri_to_path(f"{dir_uri}/{marker_name}", ctx=ctx)
         lease = await viking_fs._async_agfs.pathlock_acquire_exact(lock_path)

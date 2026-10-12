@@ -552,6 +552,7 @@ fn is_contextual_top_level_command(command: &str) -> bool {
             | "write"
             | "get"
             | "find"
+            | "find-resource"
             | "search"
             | "grep"
             | "glob"

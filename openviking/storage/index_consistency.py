@@ -9,6 +9,7 @@ from typing import Any
 
 from openviking.core.context import ResourceContentType
 from openviking.core.namespace import is_session_uri
+from openviking.resource.atomic_bundle import unindexed_dwg_uris
 from openviking.server.identity import RequestContext
 from openviking.storage.expr import Eq
 from openviking.utils.embedding_utils import get_resource_content_type
@@ -154,8 +155,11 @@ async def build_index_expectations(
 ) -> tuple[IndexExpectation, ...]:
     """Build the index records expected from current filesystem content."""
     expectations: list[IndexExpectation] = []
+    excluded = await unindexed_dwg_uris(viking_fs, root_uri, entries, ctx=ctx)
 
     for uri, rel_path in _directory_candidates(root_uri, entries):
+        if uri in excluded:
+            continue
         abstract = await _read_text_if_exists(viking_fs, f"{uri}/.abstract.md", ctx)
         overview = await _read_text_if_exists(viking_fs, f"{uri}/.overview.md", ctx)
         if abstract:
@@ -164,6 +168,8 @@ async def build_index_expectations(
             expectations.append(IndexExpectation(uri=uri, rel_path=rel_path, level=1))
 
     for uri, rel_path, name in _file_candidates(root_uri, entries):
+        if uri in excluded:
+            continue
         if get_resource_content_type(name) == ResourceContentType.TEXT:
             expectations.append(IndexExpectation(uri=uri, rel_path=rel_path, level=2))
 

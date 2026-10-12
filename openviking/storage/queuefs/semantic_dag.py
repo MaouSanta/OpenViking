@@ -11,6 +11,7 @@ from uuid import uuid4
 from weakref import WeakKeyDictionary
 
 from openviking.parse.parsers.media import get_media_type
+from openviking.resource.atomic_bundle import unindexed_dwg_uris
 from openviking.server.identity import RequestContext
 from openviking.service.task_work_index import bind_task_context, get_task_context
 from openviking.storage.queuefs.semantic_sidecar import write_semantic_sidecars
@@ -26,6 +27,9 @@ logger = get_logger(__name__)
 # These are canonical archives (e.g. session transcripts) whose content provides
 # no additional retrieval value and would only waste tokens and add latency.
 _SKIP_FILENAMES = frozenset({"messages.jsonl"})
+_BUNDLE_MACHINE_FILENAMES = frozenset(
+    {"document.json", "manifest.json", "sheet.dwg", "structure.json"}
+)
 
 
 @dataclass
@@ -179,6 +183,8 @@ class SemanticDagExecutor:
         changes: Optional[Dict[str, List[str]]] = None,
         skip_vectorization: bool = False,
         ingest_options: IngestOptions | None = None,
+        bundle_assembly: bool = False,
+        summary_files: Optional[List[str]] = None,
         coalesce_key: str = "",
         coalesce_version: int = 0,
     ):
@@ -195,6 +201,8 @@ class SemanticDagExecutor:
         self._changes = changes or {}
         self._skip_vectorization = skip_vectorization
         self._ingest_options = IngestOptions.from_value(ingest_options)
+        self._bundle_assembly = bundle_assembly
+        self._summary_files = None if summary_files is None else set(summary_files)
         self._coalesce_key = coalesce_key
         self._coalesce_version = coalesce_version
         self._task_context = get_task_context()
@@ -232,6 +240,7 @@ class SemanticDagExecutor:
         self._vectorize_lock = asyncio.Lock()
         self._file_change_status: Dict[str, bool] = {}
         self._dir_change_status: Dict[str, bool] = {}
+        self._dwg_semantic_excluded: set[str] = set()
         self._overview_cache: Dict[str, Dict[str, str]] = {}
         self._overview_cache_lock = asyncio.Lock()
 
@@ -501,6 +510,12 @@ class SemanticDagExecutor:
 
         try:
             children_dirs, file_paths = await self._list_dir(dir_uri, "_dispatch_dir")
+            if dir_uri in self._dwg_semantic_excluded:
+                if parent_uri:
+                    await self._on_child_done(parent_uri, dir_uri, "")
+                elif self._root_done:
+                    self._root_done.set()
+                return True
             file_index = {path: idx for idx, path in enumerate(file_paths)}
             child_index = {path: idx for idx, path in enumerate(children_dirs)}
             if self._recursive:
@@ -551,6 +566,18 @@ class SemanticDagExecutor:
             )
             return [], []
 
+        self._dwg_semantic_excluded.update(
+            await unindexed_dwg_uris(
+                self._viking_fs,
+                uri,
+                [
+                    {**entry, "uri": VikingURI(uri).join(entry.get("name", "")).uri}
+                    for entry in entries
+                ],
+                ctx=self._ctx,
+                include_semantic_directories=True,
+            )
+        )
         children_dirs: List[str] = []
         file_paths: List[str] = []
 
@@ -558,9 +585,24 @@ class SemanticDagExecutor:
             name = entry.get("name", "")
             if not name or name.startswith(".") or name in [".", ".."] or name in _SKIP_FILENAMES:
                 continue
+            if self._bundle_assembly and name in _BUNDLE_MACHINE_FILENAMES:
+                continue
 
             item_uri = VikingURI(uri).join(name).uri
+            if item_uri in self._dwg_semantic_excluded:
+                continue
+            if self._summary_files is not None:
+                relative_path = item_uri.removeprefix(f"{self._root_uri}/")
+                if entry.get("isDir", False):
+                    if not any(
+                        path.startswith(f"{relative_path}/") for path in self._summary_files
+                    ):
+                        continue
+                elif relative_path not in self._summary_files:
+                    continue
             if entry.get("isDir", False):
+                if self._bundle_assembly and name == "drawing_text":
+                    continue
                 children_dirs.append(item_uri)
             else:
                 file_paths.append(item_uri)
@@ -973,6 +1015,8 @@ class SemanticDagExecutor:
 
     async def _add_vectorize_task(self, task: VectorizeTask) -> None:
         """Add a vectorize task to the pending list."""
+        if task.uri in await unindexed_dwg_uris(self._viking_fs, task.uri, [], ctx=self._ctx):
+            return
         if self._skip_vectorization:
             logger.info(
                 "Skipping vectorization task for %s (requested via SemanticMsg)",

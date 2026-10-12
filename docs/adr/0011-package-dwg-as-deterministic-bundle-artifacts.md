@@ -1,0 +1,5 @@
+# Package DWG as deterministic bundle artifacts
+
+**Status:** superseded by ADR-0013
+
+For a `.dwg` source ingested with `bundle=true`, LibreDWG JSON is an assembly-time intermediate, not a published artifact. The sealed bundle contains the unchanged source DWG, deterministic `beam_topology.json`, a `drawing_text/` directory containing `index.json` plus bounded spatial JSON chunks, ordinary OpenViking `.abstract.md` and `.overview.md`, optional parser-produced `preview.png`, and a `manifest.json` written last in staging. Every source text record belongs to exactly one adaptive spatial core; nearby records may repeat as bounded halo context so labels and values remain together across partition boundaries. Chunk filenames include rounded core coordinates while each JSON retains exact coordinates and source identities. The manifest inventories every published artifact except itself by role, relative path, schema, and SHA-256. Any required parse, artifact, or semantic failure terminates the request without retry or partial publication.

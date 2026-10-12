@@ -620,6 +620,86 @@ async def test_add_resource_preserves_positional_watch_args_for_legacy_callers()
 
 
 @pytest.mark.asyncio
+async def test_add_resource_forwards_atomic_bundle_mode(tmp_path):
+    resource_file = tmp_path / "model.stp"
+    resource_file.write_text("ISO-10303-21;")
+
+    client = AsyncHTTPClient(url="http://127.0.0.1:1933")
+    fake_http = SimpleNamespace(post=AsyncMock(return_value=object()))
+    client._http = fake_http
+
+    async def fake_upload(_path: str) -> str:
+        return "upload_model.stp"
+
+    client._upload_temp_file = fake_upload
+    client._handle_response_data = lambda _response: {
+        "result": {"root_uri": "viking://resources/model"}
+    }
+
+    await client.add_resource(str(resource_file), bundle=True)
+
+    payload = fake_http.post.await_args.kwargs["json"]
+    assert payload["temp_file_id"] == "upload_model.stp"
+    assert payload["bundle"] is True
+
+
+@pytest.mark.asyncio
+async def test_find_resource_posts_bundle_discovery_payload():
+    client = AsyncHTTPClient(url="http://127.0.0.1:1933")
+    fake_http = SimpleNamespace(post=AsyncMock(return_value=object()))
+    client._http = fake_http
+    client._handle_response_data = lambda _response: {
+        "result": {"resources": [], "total": 0}
+    }
+
+    result = await client.find_resource(
+        "blue gearbox",
+        target_uri="viking://resources/cad",
+        tags=["kind=step"],
+    )
+
+    assert result == {"resources": [], "total": 0}
+    fake_http.post.assert_awaited_once_with(
+        "/api/v1/search/find-resource",
+        json={
+            "query": "blue gearbox",
+            "target_uri": "viking://resources/cad",
+            "limit": 10,
+            "tags": ["kind=step"],
+            "telemetry": False,
+        },
+    )
+
+
+def test_sync_http_client_find_resource_forwards_to_async_client():
+    client = SyncHTTPClient(url="http://127.0.0.1:1933")
+    expected = {"resources": [], "total": 0}
+    with patch.object(
+        client._async_client,
+        "find_resource",
+        new_callable=Mock,
+        return_value=expected,
+    ) as mock_find_resource:
+        with patch("openviking_sdk.client.run_async", return_value=expected) as mock_run_async:
+            result = client.find_resource(
+                "blue gearbox",
+                target_uri="viking://resources/cad",
+                tags=["kind=step"],
+            )
+
+    assert result == expected
+    assert mock_run_async.called
+    mock_find_resource.assert_called_once_with(
+        query="blue gearbox",
+        target_uri="viking://resources/cad",
+        limit=10,
+        score_threshold=None,
+        tags=["kind=step"],
+        telemetry=False,
+    )
+
+
+@pytest.mark.asyncio
 async def test_admin_create_paths_accept_initial_user_config():
     client = AsyncHTTPClient(url="http://localhost:1933")
     fake_http = SimpleNamespace(post=AsyncMock(return_value=object()))

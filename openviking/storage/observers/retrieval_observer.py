@@ -96,11 +96,8 @@ class RetrievalObserver(BaseObserver):
         )
 
     def is_healthy(self) -> bool:
-        """Retrieval is healthy when empty branches still produce useful yield."""
-        stats = self._get_collector().snapshot()
-        if stats.total_queries == 0:
-            return True
-        return not self._has_unhealthy_yield(stats)
+        """Retrieval is healthy while no error threshold is met."""
+        return not self.has_errors()
 
     def has_errors(self) -> bool:
         """Errors are flagged when empty branches also have low aggregate yield."""

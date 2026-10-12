@@ -111,6 +111,19 @@ class FindRequest(BaseModel):
     telemetry: TelemetryRequest = False
 
 
+class FindResourceRequest(BaseModel):
+    """Request model for atomic resource-bundle discovery."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    query: str
+    target_uri: Union[str, List[str]] = "viking://resources"
+    limit: int = 10
+    score_threshold: Optional[float] = None
+    tags: Optional[List[str]] = None
+    telemetry: TelemetryRequest = False
+
+
 class SearchRequest(BaseModel):
     """Request model for search with session."""
 
@@ -207,6 +220,40 @@ async def find(
     return Response(
         status="ok",
         result=result,
+        telemetry=execution.telemetry,
+    ).model_dump(exclude_none=True)
+
+
+@router.post("/find-resource")
+async def find_resource(
+    request: FindResourceRequest,
+    _ctx: RequestContext = Depends(get_request_context),
+):
+    """Return atomic resource-bundle roots, grouped by their best child hit."""
+    service = get_service()
+    effective_filter = _resolve_search_filter(
+        None,
+        context_type="resource",
+        since=None,
+        until=None,
+        time_field=None,
+        tags=request.tags,
+    )
+    execution = await run_operation(
+        operation="search.find_resource",
+        telemetry=request.telemetry,
+        fn=lambda: service.search.find_resource(
+            query=request.query,
+            ctx=_ctx,
+            target_uri=_resolve_uri_or_uris(request.target_uri),
+            limit=request.limit,
+            score_threshold=request.score_threshold,
+            filter=effective_filter,
+        ),
+    )
+    return Response(
+        status="ok",
+        result=_sanitize_floats(execution.result),
         telemetry=execution.telemetry,
     ).model_dump(exclude_none=True)
 

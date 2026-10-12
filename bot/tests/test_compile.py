@@ -1477,7 +1477,7 @@ async def test_execute_skill_target_skips_recursive_catalog_and_completes(
             self.sandbox = SimpleNamespace(mode=None)
 
         def model_copy(self, *, deep):
-            assert deep is True
+            assert deep is False
             return TaskConfig()
 
     class FakeSandboxManager:

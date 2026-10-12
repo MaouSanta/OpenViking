@@ -48,6 +48,7 @@ from openviking.server.temp_upload_store import TempUploadStore
 from openviking.server.upload_token_store import upload_token_store
 from openviking.telemetry.span_models import update_root_span_identity
 from openviking.utils.search_filters import SearchContextTypeInput, merge_search_filter
+from openviking.utils.tags import build_search_tags_filter
 from openviking_cli.exceptions import (
     InvalidArgumentError,
     PermissionDeniedError,
@@ -258,6 +259,39 @@ async def find(
         level=level,
     )
     return _format_search_result(result)
+
+
+@mcp.tool()
+async def find_resource(
+    query: str,
+    target_uri: str = "viking://resources",
+    limit: int = 10,
+    min_score: float = 0.35,
+    tags: Optional[List[str]] = None,
+) -> str:
+    """Find complete atomic resource bundles by vector similarity.
+
+    Returns bundle-root URIs only. After choosing a result, use ``read`` for
+    its manifest or ``grep`` scoped to that root for exact data inside it.
+    """
+    result = await get_service().search.find_resource(
+        query=query,
+        ctx=_get_ctx(),
+        target_uri=target_uri,
+        limit=limit,
+        score_threshold=min_score,
+        filter=build_search_tags_filter(tags),
+    )
+    resources = result.get("resources", [])
+    if not resources:
+        return "No matching resource bundle found."
+    lines = [f"Found {len(resources)} resource bundle(s):"]
+    for item in resources:
+        lines.append(
+            f"- [{float(item.get('score', 0.0)) * 100:.0f}%] {item.get('uri', '')}\n"
+            f"    matched: {item.get('matched_uri', '')}"
+        )
+    return "\n".join(lines)
 
 
 @mcp.tool()
@@ -544,6 +578,7 @@ async def add_resource(
     tags: Optional[list[str]] = None,
     tag_mode: str = "replace",
     args: Optional[dict[str, Any]] = None,
+    bundle: bool = False,
 ) -> str:
     """Add a resource to OpenViking. Asynchronous — processing happens in the background.
 
@@ -564,6 +599,7 @@ async def add_resource(
             file. Requires an exact ``to`` target and cannot be combined with
             ``temp_file_id`` or ``parent``. Leave empty for the default path-probing
             behavior.
+        bundle: Assemble one local source and its derived artifacts as an immutable bundle.
         description: Optional human-readable reason for adding the resource.
         watch_interval: Auto-refresh cadence in minutes. 0 = no watch. Prefer >=1440 (24h)
             unless the source changes faster — every refresh re-embeds the whole resource.
@@ -619,6 +655,7 @@ async def add_resource(
                 processing_mode=processing_mode,
                 tags=tags,
                 tag_mode=tag_mode,
+                bundle=bundle,
             )
         except (PermissionDeniedError, InvalidArgumentError) as exc:
             return f"Error: {exc}"
@@ -666,6 +703,7 @@ async def add_resource(
                 to=to or None,
                 parent=parent or None,
                 reason=description,
+                bundle=bundle,
                 wait=False,
                 watch_interval=watch_interval,
                 processing_mode=processing_mode,
@@ -713,6 +751,7 @@ async def add_resource(
         ttl_seconds=ttl_seconds,
         to=to,
         reason=description,
+        bundle=bundle,
         actor_peer_id=ctx.actor_peer_id or "",
         processing_mode=processing_mode,
         tags=tags,

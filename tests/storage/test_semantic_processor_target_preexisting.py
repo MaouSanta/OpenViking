@@ -129,6 +129,33 @@ async def test_target_source_syncs_before_semantic_dag(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_precomputed_semantics_syncs_sidecars_without_running_the_semantic_dag(monkeypatch):
+    monkeypatch.setattr(
+        "openviking.storage.queuefs.semantic_processor.get_viking_fs",
+        lambda: _FakeVikingFS(),
+    )
+    monkeypatch.setattr(
+        "openviking.storage.queuefs.semantic_processor.SemanticLockScope.resolve",
+        AsyncMock(return_value=SimpleNamespace(lock=None, close=AsyncMock())),
+    )
+    processor = SemanticProcessor()
+    processor._sync_topdown_recursive = AsyncMock(return_value=DiffResult())
+    processor._process_precomputed_semantics = AsyncMock()
+
+    await processor.on_dequeue(
+        SemanticMsg(
+            uri="viking://temp/import_root/drawing",
+            target_uri="viking://resources/drawing",
+            context_type="resource",
+            precomputed_semantics=True,
+        ).to_dict()
+    )
+
+    assert processor._sync_topdown_recursive.await_args.kwargs["include_hidden"] is True
+    processor._process_precomputed_semantics.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 async def test_sync_diff_reports_target_uris_and_preserves_sidecars(monkeypatch):
     fake_fs = _SyncVikingFS()
     lease = {
@@ -185,3 +212,23 @@ async def test_sync_missing_source_never_touches_target(monkeypatch):
 
     fake_fs.ls.assert_not_awaited()
     fake_fs.rm.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_incremental_sync_carries_plain_dwg_processing_marker(monkeypatch):
+    from openviking.resource.atomic_bundle import DWG_PROCESSING_MARKER
+
+    fake_fs = _SyncVikingFS()
+    source = f"viking://temp/import/{DWG_PROCESSING_MARKER}"
+    target = f"viking://resources/root/{DWG_PROCESSING_MARKER}"
+    fake_fs.contents[source] = '{"schema":"openviking.dwg-processing/v1"}'
+    fake_fs.entries["viking://temp/import"].append({"name": DWG_PROCESSING_MARKER, "isDir": False})
+    monkeypatch.setattr(
+        "openviking.storage.queuefs.semantic_processor.get_viking_fs", lambda: fake_fs
+    )
+    diff = await SemanticProcessor()._sync_topdown_recursive(
+        "viking://temp/import", "viking://resources/root", include_hidden=False
+    )
+    assert target in diff.added_files
+    assert fake_fs.contents[target] == '{"schema":"openviking.dwg-processing/v1"}'
+    assert fake_fs.contents["viking://resources/root/.abstract.md"] == "old abstract"

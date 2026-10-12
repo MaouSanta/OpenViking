@@ -162,6 +162,75 @@ async def test_download_returns_attachment_response(client_with_resource):
     assert response.content
     assert response.headers["content-type"] == "application/octet-stream"
     assert "attachment;" in response.headers["content-disposition"]
+    assert response.headers["cache-control"] == "private, no-cache"
+    assert response.headers["etag"].startswith('W/"')
+    assert "X-OpenViking-Account" in response.headers["vary"]
+
+
+async def test_download_revalidates_private_cache_without_reading(app, service, monkeypatch):
+    uri = "viking://resources/cached.dwg"
+    file_stat = {
+        "name": "cached.dwg",
+        "size": 3,
+        "modTime": "2026-08-25T12:00:00Z",
+        "isDir": False,
+    }
+    read_count = 0
+
+    async def fake_stat(*args, **kwargs):
+        return file_stat
+
+    async def fake_read(*args, **kwargs):
+        nonlocal read_count
+        read_count += 1
+        return b"dwg"
+
+    monkeypatch.setattr(service.fs, "stat", fake_stat)
+    monkeypatch.setattr(service.fs, "read_file_bytes", fake_read)
+
+    first = await _request_with_handler(app, "GET", "/api/v1/content/download", params={"uri": uri})
+    etag = first.headers["etag"]
+    assert first.status_code == 200
+    assert read_count == 1
+
+    cached = await _request_with_handler(
+        app,
+        "GET",
+        "/api/v1/content/download",
+        params={"uri": uri},
+        headers={"If-None-Match": f'W/"other", {etag.removeprefix("W/")}'},
+    )
+    assert cached.status_code == 304
+    assert cached.content == b""
+    assert cached.headers["etag"] == etag
+    assert cached.headers["cache-control"] == "private, no-cache"
+    assert read_count == 1
+
+    file_stat["modTime"] = "2026-08-25T12:01:00Z"
+    changed = await _request_with_handler(
+        app,
+        "GET",
+        "/api/v1/content/download",
+        params={"uri": uri},
+        headers={"If-None-Match": etag},
+    )
+    assert changed.status_code == 200
+    assert changed.headers["etag"] != etag
+    assert read_count == 2
+
+    other_account = await _request_with_handler(
+        app,
+        "GET",
+        "/api/v1/content/download",
+        params={"uri": uri},
+        headers={
+            "If-None-Match": changed.headers["etag"],
+            "X-OpenViking-Account": "other",
+        },
+    )
+    assert other_account.status_code == 200
+    assert other_account.headers["etag"] != changed.headers["etag"]
+    assert read_count == 3
 
 
 async def test_download_missing_uri_returns_not_found(app, service, monkeypatch):

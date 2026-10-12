@@ -29,6 +29,7 @@ from openviking.parse.base import (
 from openviking.parse.image_rewrite import IMAGE_MAPPINGS_FILENAME
 from openviking.parse.parsers.base_parser import BaseParser
 from openviking.parse.parsers.media.constants import MEDIA_EXTENSIONS
+from openviking.resource.atomic_bundle import DWG_PROCESSING_MARKER, write_dwg_processing_marker
 from openviking.storage.viking_fs import LS_ALL_NODES
 from openviking_cli.utils.logger import get_logger
 
@@ -40,7 +41,7 @@ logger = get_logger(__name__)
 
 # Hidden files a parser's temp tree is allowed to carry through the merge.
 # Everything else hidden stays filtered, like a default ls.
-_MERGE_SIDECAR_ALLOWLIST = frozenset({IMAGE_MAPPINGS_FILENAME})
+_MERGE_SIDECAR_ALLOWLIST = frozenset({IMAGE_MAPPINGS_FILENAME, DWG_PROCESSING_MARKER})
 
 
 class DirectoryParser(BaseParser):
@@ -389,6 +390,8 @@ class DirectoryParser(BaseParser):
                     # (e.g. ../images/x.gif) that still live inside the import.
                     allowed_media_dirs=[Path(import_root)] if import_root else None,
                 )
+                if sub_result.source_format == "dwg":
+                    await write_dwg_processing_marker(viking_fs, sub_result.meta)
                 if sub_result.temp_dir_path:
                     if preserve_structure:
                         parent = str(PurePosixPath(rel_path).parent)

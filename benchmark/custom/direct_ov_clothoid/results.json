@@ -1,0 +1,60 @@
+{
+  "benchmark": "held-out canonical G1 Hermite clothoid in road-survey coordinates",
+  "status": "DIAGNOSTIC_COMPLETE_ALL_STRICT_PASS",
+  "openviking_version": "0.4.13.dev8",
+  "vikingbot_used": false,
+  "task": {
+    "P0": {"E_m": 468237.420, "N_m": 3468120.730, "azimuth_deg": 4.000},
+    "P1": {"E_m": 468244.204, "N_m": 3468214.326, "azimuth_deg": 355.006},
+    "fraction": 0.37
+  },
+  "gold": {
+    "length_m": 93.99956255425538,
+    "curv_start_1pm": -0.003499717371910190,
+    "curv_end_1pm": 0.006839624679112094,
+    "curvature_rate_1pm2": 0.000109993512417194,
+    "E_m": 468241.1856253988,
+    "N_m": 3468155.3005138465,
+    "azimuth_deg": 7.162353734641609
+  },
+  "arms": {
+    "A_NAME_WEB": {
+      "strict_pass": true,
+      "web_searches": 7,
+      "ov_used": false,
+      "algorithm_code_bytes": 6652,
+      "result_sha256": "6c6b819a987d95fa64c239ccba610f48839a8ad8ae76619063de12c7dd15e242",
+      "rollout_id": "019ff09c-d36c-72f0-aa96-adb117a2acfd",
+      "tokens": {"input": 912138, "cached_input": 844032, "uncached_input": 68106, "output": 11248, "reasoning_output": 5012, "total": 923386},
+      "tool_calls": 14
+    },
+    "B_FORMULA_MEMORY": {
+      "strict_pass": true,
+      "hit_uri": "viking://resources/g1-clothoid-formula-card-v1/formula_memory.md",
+      "web_used": false,
+      "algorithm_code_bytes": 7115,
+      "result_sha256": "f9bad86f1eff3f4a7f74d9ba330b9275e2e676af702b8569ce73987bd7ea0a22",
+      "rollout_id": "019ff0a3-281b-7001-aa5f-c294f41bec2f",
+      "tokens": {"input": 341164, "cached_input": 303872, "uncached_input": 37292, "output": 10240, "reasoning_output": 5599, "total": 351404},
+      "tool_calls": 8
+    },
+    "C_EXECUTABLE_SDK": {
+      "strict_pass": true,
+      "hit_uri": "viking://agent/skills/g1-clothoid-road-sdk/.abstract.md",
+      "web_used": false,
+      "algorithm_rewritten": false,
+      "downloaded_sdk_sha256": "79cc62e597ed1a74072e1b0d452f4704b3245b445caa905897e07ffe87820656",
+      "canonical_sdk_sha256": "79cc62e597ed1a74072e1b0d452f4704b3245b445caa905897e07ffe87820656",
+      "result_sha256": "fbae33f077c4ae95d3b86c67fbfa05fcfa3232e338c34b0ef2cb47c5b4e1efac",
+      "rollout_id": "019ff0a8-52ee-7161-981b-55303befcb7c",
+      "tokens": {"input": 361954, "cached_input": 343296, "uncached_input": 18658, "output": 3647, "reasoning_output": 1515, "total": 365601},
+      "tool_calls": 10
+    }
+  },
+  "comparisons_percent": {
+    "A_to_B": {"total": -61.944, "uncached_input": -45.244, "output": -8.962},
+    "A_to_C": {"total": -60.406, "uncached_input": -72.604, "output": -67.576, "reasoning_output": -69.773},
+    "B_to_C": {"total": 4.040, "uncached_input": -49.968, "output": -64.385, "reasoning_output": -72.942}
+  },
+  "interpretation": "Formula memory and executable SDK both reduced total tokens by about 60 percent versus online source reconstruction. The SDK sharply reduced uncached input, output, and reasoning versus formula memory, but its cold find-read-tree-get-self-test path used two more tool turns, so total tokens were 4.0 percent higher than B in this one run."
+}

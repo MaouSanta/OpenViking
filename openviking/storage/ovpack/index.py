@@ -7,6 +7,7 @@ from __future__ import annotations
 from typing import Any
 
 from openviking.core.namespace import context_type_for_uri, is_session_uri
+from openviking.resource.atomic_bundle import unindexed_dwg_uris
 from openviking.server.identity import RequestContext
 from openviking.storage.expr import Eq
 from openviking.storage.ovpack.format import (
@@ -27,6 +28,7 @@ PORTABLE_VECTOR_SCALAR_FIELDS = [
     "name",
     "description",
     "tags",
+    "search_tags",
     "abstract",
 ]
 EXPORT_VECTOR_FIELDS = [*PORTABLE_VECTOR_SCALAR_FIELDS, "vector"]
@@ -196,8 +198,9 @@ async def build_manifest(
     manifest_entries = [{"path": "", "kind": "directory"}]
     index_records: list[dict[str, Any]] = []
     dense_values: list[float] = []
+    excluded = await unindexed_dwg_uris(viking_fs, root_uri, entries, ctx=ctx)
 
-    if root_uri != "viking://" and not is_session_uri(root_uri):
+    if root_uri != "viking://" and not is_session_uri(root_uri) and root_uri not in excluded:
         root_records = await index_records_for_uri(
             viking_fs,
             vector_store,
@@ -219,7 +222,7 @@ async def build_manifest(
                 "size": entry.get("size", 0) if not is_dir else 0,
             }
         )
-        if is_session_uri(entry_uri):
+        if is_session_uri(entry_uri) or entry_uri in excluded:
             continue
         records = await index_records_for_uri(
             viking_fs,

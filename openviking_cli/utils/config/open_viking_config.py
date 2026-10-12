@@ -31,6 +31,7 @@ from .parser_config import (
     AudioConfig,
     CodeConfig,
     DirectoryConfig,
+    DWGConfig,
     ExcelConfig,
     FeishuConfig,
     HTMLConfig,
@@ -205,6 +206,8 @@ class OpenVikingConfig(BaseModel):
     markdown: MarkdownConfig = Field(
         default_factory=MarkdownConfig, description="Markdown parsing configuration"
     )
+
+    dwg: DWGConfig = Field(default_factory=DWGConfig, description="DWG JSON parsing budgets")
 
     excel: ExcelConfig = Field(
         # from_dict on an empty mapping, not the bare constructor: an absent
@@ -402,6 +405,7 @@ class OpenVikingConfig(BaseModel):
                 "audio",
                 "video",
                 "markdown",
+                "dwg",
                 "excel",
                 "html",
                 "text",

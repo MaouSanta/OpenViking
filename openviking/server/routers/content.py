@@ -2,10 +2,12 @@
 # SPDX-License-Identifier: AGPL-3.0
 """Content endpoints for OpenViking HTTP Server."""
 
+import hashlib
+import re
 from typing import Literal
 from urllib.parse import quote
 
-from fastapi import APIRouter, Body, Depends, Query
+from fastapi import APIRouter, Body, Depends, Query, Request
 from fastapi.responses import Response as FastAPIResponse
 from pydantic import BaseModel, ConfigDict, model_validator
 
@@ -110,6 +112,49 @@ class ReindexRequest(BaseModel):
 
 router = APIRouter(prefix="/api/v1/content", tags=["content"])
 
+_DOWNLOAD_CACHE_CONTROL = "private, no-cache"
+_DOWNLOAD_VARY = (
+    "Authorization, X-API-Key, X-OpenViking-Account, X-OpenViking-User, X-OpenViking-Actor-Peer"
+)
+_ETAG_TOKEN_RE = re.compile(r'(?:W/)?"[^"]*"|\*')
+
+
+def _download_etag(uri: str, stat: object, ctx: RequestContext) -> str | None:
+    if not isinstance(stat, dict) or stat.get("isDir") is True:
+        return None
+    size = stat.get("size")
+    mod_time = stat.get("modTime")
+    if (
+        isinstance(size, bool)
+        or not isinstance(size, int)
+        or size < 0
+        or not isinstance(mod_time, str)
+        or not mod_time
+    ):
+        return None
+
+    scope = "\0".join(
+        (
+            ctx.account_id,
+            ctx.user.user_id,
+            str(ctx.role),
+            ctx.actor_peer_id or "",
+            uri,
+            str(size),
+            mod_time,
+        )
+    )
+    digest = hashlib.sha256(scope.encode()).hexdigest()
+    return f'W/"{digest}"'
+
+
+def _if_none_match_matches(value: str | None, etag: str) -> bool:
+    target = etag.removeprefix("W/")
+    return any(
+        token == "*" or token.removeprefix("W/") == target
+        for token in _ETAG_TOKEN_RE.findall(value or "")
+    )
+
 
 def _validate_reindex_uri(uri: str) -> str:
     raw_uri = uri.strip() if isinstance(uri, str) else ""
@@ -207,12 +252,30 @@ async def overview(
 
 @router.get("/download")
 async def download(
+    request: Request,
     uri: str = Query(..., description="Viking URI"),
     _ctx: RequestContext = Depends(get_request_context),
 ):
     """Download file as raw bytes (for images, binaries, etc.)."""
     service = get_service()
     uri = resolve_path_variables(uri)
+
+    stat = None
+    try:
+        stat = await service.fs.stat(uri, ctx=_ctx)
+    except Exception:
+        pass
+
+    etag = _download_etag(uri, stat, _ctx)
+    cache_headers = {
+        "Cache-Control": _DOWNLOAD_CACHE_CONTROL,
+        "Vary": _DOWNLOAD_VARY,
+    }
+    if etag is not None:
+        cache_headers["ETag"] = etag
+        if _if_none_match_matches(request.headers.get("if-none-match"), etag):
+            return FastAPIResponse(status_code=304, headers=cache_headers)
+
     try:
         content = await service.fs.read_file_bytes(uri, ctx=_ctx)
     except AGFSNotFoundError:
@@ -223,19 +286,15 @@ async def download(
             raise mapped from e
         raise
 
-    # Try to get filename from stat
     filename = "download"
-    try:
-        stat = await service.fs.stat(uri, ctx=_ctx)
-        if stat and "name" in stat:
-            filename = stat["name"]
-    except Exception:
-        pass
+    if isinstance(stat, dict) and "name" in stat:
+        filename = stat["name"]
     filename = quote(filename)
+    cache_headers["Content-Disposition"] = f"attachment; filename*=UTF-8''{filename}"
     return FastAPIResponse(
         content=content,
         media_type="application/octet-stream",
-        headers={"Content-Disposition": f"attachment; filename*=UTF-8''{filename}"},
+        headers=cache_headers,
     )
 
 

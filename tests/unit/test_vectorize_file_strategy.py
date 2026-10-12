@@ -844,6 +844,46 @@ async def test_index_resource_skips_session_namespace(monkeypatch):
     assert queue.items == []
 
 
+@pytest.mark.asyncio
+async def test_index_resource_can_limit_files_without_directory_meta(monkeypatch):
+    class SheetFS:
+        def __init__(self):
+            self.meta_reads = []
+
+        async def exists(self, path, ctx=None):
+            return path.endswith(("/.abstract.md", "/.overview.md"))
+
+        async def read_file(self, path, ctx=None):
+            self.meta_reads.append(path)
+            return "machine-generated summary"
+
+        async def ls(self, uri, node_limit=None, ctx=None):
+            return [
+                {"name": "context.md", "isDir": False},
+                {"name": "sheet.dwg", "isDir": False},
+                {"name": "manifest.json", "isDir": False},
+            ]
+
+    fs = SheetFS()
+    vectorize_meta = AsyncMock()
+    vectorize_file = AsyncMock()
+    monkeypatch.setattr(embedding_utils, "get_viking_fs", lambda: fs)
+    monkeypatch.setattr(embedding_utils, "vectorize_directory_meta", vectorize_meta)
+    monkeypatch.setattr(embedding_utils, "vectorize_file", vectorize_file)
+
+    await embedding_utils.index_resource(
+        "viking://resources/plan/sheets/S001",
+        DummyReq(),
+        include_files={"context.md"},
+        include_directory_meta=False,
+    )
+
+    assert fs.meta_reads == []
+    vectorize_meta.assert_not_awaited()
+    vectorize_file.assert_awaited_once()
+    assert vectorize_file.await_args.kwargs["file_path"].endswith("/context.md")
+
+
 def test_truncate_abstract_bytes_caps_below_byte_limit():
     # small values pass through unchanged
     assert embedding_utils._truncate_abstract_bytes("small") == "small"

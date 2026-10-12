@@ -136,6 +136,28 @@ class ParserConfig:
 
 
 @dataclass
+class DWGConfig:
+    """Bounds for preserved LibreDWG JSON, independent of Markdown sections."""
+
+    json_max_tokens: int = 2048
+    json_max_chars: int = 6000
+
+    def __post_init__(self) -> None:
+        if any(type(value) is not int or value <= 0 for value in (self.json_max_tokens, self.json_max_chars)):
+            raise ValueError("DWG JSON budgets must be positive integers")
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "DWGConfig":
+        raise_unknown_config_fields(
+            data=data, valid_fields={"json_max_tokens", "json_max_chars"}, context_name="DWGConfig"
+        )
+        return cls(**data)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {"json_max_tokens": self.json_max_tokens, "json_max_chars": self.json_max_chars}
+
+
+@dataclass
 class PDFConfig(ParserConfig):
     """
     Configuration for PDF parsing.
@@ -773,6 +795,7 @@ class SemanticConfig:
 
 # Configuration registry for dynamic loading
 PARSER_CONFIG_REGISTRY = {
+    "dwg": DWGConfig,
     "pdf": PDFConfig,
     "code": CodeConfig,
     "image": ImageConfig,
