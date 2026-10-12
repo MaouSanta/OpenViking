@@ -660,6 +660,7 @@ impl Submitter for HttpSubmitter {
                 "",
                 "",
                 self.wait,
+                false,
                 self.timeout,
                 false,
                 None,

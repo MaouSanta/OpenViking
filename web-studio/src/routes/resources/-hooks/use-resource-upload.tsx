@@ -8,7 +8,7 @@ import {
   postResources,
   postResourcesTempUpload,
 } from '#/lib/ov-client'
-import { parseUploadError } from '../-lib/upload'
+import { getUploadPolicy, parseUploadError } from '../-lib/upload'
 import type {
   AddResourceResult,
   TempUploadResult,
@@ -414,6 +414,9 @@ export function ResourceUploadProvider({
           postResources({
             body: {
               ...commonBody,
+              ...(getUploadPolicy(params.file.name).bundle
+                ? { bundle: true }
+                : {}),
               temp_file_id: tempFileId,
               source_name: params.file.name,
             } as Parameters<typeof postResources>[0]['body'],

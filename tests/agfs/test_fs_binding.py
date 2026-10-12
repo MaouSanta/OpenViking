@@ -91,6 +91,37 @@ class TestVikingFSBindingLocal:
         root_entries = await vfs.ls("viking://temp/")
         assert not any(e["name"] == test_dir for e in root_entries)
 
+    async def test_atomic_temp_publish_extends_destination_reservation(
+        self, viking_fs_binding_instance
+    ):
+        """A native directory move must lock both the temp tree and exact destination."""
+        vfs = viking_fs_binding_instance
+        suffix = uuid.uuid4().hex
+        staging_uri = f"viking://temp/bundle_publish_{suffix}"
+        temp_uri = f"{staging_uri}/bundle"
+        target_uri = f"viking://resources/bundle_publish_{suffix}"
+        await vfs.mkdir("viking://resources/", exist_ok=True)
+        await vfs.mkdir(temp_uri)
+        await vfs.write(f"{temp_uri}/payload.txt", "atomic payload")
+
+        target_path = vfs._uri_to_path(target_uri)
+        reservation = await vfs._async_agfs.pathlock_acquire_exact(target_path)
+        try:
+            await vfs.persist_temp_tree(
+                temp_uri,
+                target_uri,
+                lease_ref=reservation,
+                _allow_atomic_bundle_write=True,
+            )
+            assert await vfs.read(f"{target_uri}/payload.txt") == b"atomic payload"
+            assert not await vfs.exists(temp_uri)
+        finally:
+            await vfs._async_agfs.pathlock_release(reservation)
+            if await vfs.exists(target_uri):
+                await vfs.rm(target_uri, recursive=True)
+            if await vfs.exists(staging_uri):
+                await vfs.rm(staging_uri, recursive=True)
+
     async def test_borrowed_pathlock_cannot_release_via_raw_ref(self, viking_fs_binding_instance):
         """Reject borrowed lifecycle control through typed and raw lease refs."""
         vfs = viking_fs_binding_instance

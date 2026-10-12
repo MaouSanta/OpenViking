@@ -11,6 +11,7 @@ from uuid import uuid4
 from weakref import WeakKeyDictionary
 
 from openviking.parse.parsers.media import get_media_type
+from openviking.resource.atomic_bundle import is_dwg_parser_data
 from openviking.server.identity import RequestContext
 from openviking.service.task_work_index import bind_task_context, get_task_context
 from openviking.storage.queuefs.semantic_sidecar import write_semantic_sidecars
@@ -26,6 +27,9 @@ logger = get_logger(__name__)
 # These are canonical archives (e.g. session transcripts) whose content provides
 # no additional retrieval value and would only waste tokens and add latency.
 _SKIP_FILENAMES = frozenset({"messages.jsonl"})
+_BUNDLE_MACHINE_FILENAMES = frozenset(
+    {"document.json", "manifest.json", "sheet.dwg", "structure.json"}
+)
 
 
 @dataclass
@@ -99,6 +103,7 @@ class SemanticNodeScheduler:
         self._max_workers = max(1, max_workers)
         self._queue: asyncio.Queue[ScheduledDagWork] = asyncio.Queue()
         self._workers: Set[asyncio.Task] = set()
+        self._busy_workers = 0
 
     def configure(self, max_workers: int) -> None:
         self._max_workers = max(1, max_workers)
@@ -110,7 +115,7 @@ class SemanticNodeScheduler:
 
     def _ensure_workers(self) -> None:
         self._workers = {task for task in self._workers if not task.done()}
-        target = min(self._max_workers, self._queue.qsize())
+        target = min(self._max_workers, self._busy_workers + self._queue.qsize())
         while len(self._workers) < target:
             task = asyncio.create_task(self._worker())
             task.add_done_callback(self._workers.discard)
@@ -129,6 +134,10 @@ class SemanticNodeScheduler:
                 continue
 
             item.executor._start_scheduled_work()
+            self._busy_workers += 1
+            # A get() can consume an item before this worker resumes; account
+            # for that active slot before admitting any remaining queued work.
+            self._ensure_workers()
             try:
                 if not item.executor.closed:
                     await item.executor._run_work(item.work)
@@ -137,6 +146,7 @@ class SemanticNodeScheduler:
             except Exception as exc:
                 item.executor.fail(exc)
             finally:
+                self._busy_workers -= 1
                 item.executor._finish_scheduled_work()
                 self._queue.task_done()
 
@@ -179,6 +189,8 @@ class SemanticDagExecutor:
         changes: Optional[Dict[str, List[str]]] = None,
         skip_vectorization: bool = False,
         ingest_options: IngestOptions | None = None,
+        bundle_assembly: bool = False,
+        summary_files: Optional[List[str]] = None,
         coalesce_key: str = "",
         coalesce_version: int = 0,
     ):
@@ -195,6 +207,8 @@ class SemanticDagExecutor:
         self._changes = changes or {}
         self._skip_vectorization = skip_vectorization
         self._ingest_options = IngestOptions.from_value(ingest_options)
+        self._bundle_assembly = bundle_assembly
+        self._summary_files = None if summary_files is None else set(summary_files)
         self._coalesce_key = coalesce_key
         self._coalesce_version = coalesce_version
         self._task_context = get_task_context()
@@ -234,6 +248,7 @@ class SemanticDagExecutor:
         self._dir_change_status: Dict[str, bool] = {}
         self._overview_cache: Dict[str, Dict[str, str]] = {}
         self._overview_cache_lock = asyncio.Lock()
+        self._dwg_filtered_dirs: set[str] = set()
 
     async def run(self, root_uri: str) -> None:
         """Run DAG execution starting from root_uri."""
@@ -496,6 +511,15 @@ class SemanticDagExecutor:
         """Lazy-dispatch tasks for a directory when it is triggered."""
         if dir_uri in self._nodes:
             return True
+        if self._summary_files is None and (
+            await is_dwg_parser_data(self._viking_fs, dir_uri, ctx=self._ctx)
+            or await is_dwg_parser_data(self._viking_fs, dir_uri, ctx=self._ctx, is_directory=True)
+        ):
+            if parent_uri:
+                await self._on_child_done(parent_uri, dir_uri, "")
+            elif self._root_done:
+                self._root_done.set()
+            return True
 
         self._parent[dir_uri] = parent_uri
 
@@ -558,9 +582,30 @@ class SemanticDagExecutor:
             name = entry.get("name", "")
             if not name or name.startswith(".") or name in [".", ".."] or name in _SKIP_FILENAMES:
                 continue
+            if self._bundle_assembly and name in _BUNDLE_MACHINE_FILENAMES:
+                continue
 
             item_uri = VikingURI(uri).join(name).uri
+            if self._summary_files is not None:
+                relative_path = item_uri.removeprefix(f"{self._root_uri}/")
+                if entry.get("isDir", False):
+                    if not any(
+                        path.startswith(f"{relative_path}/") for path in self._summary_files
+                    ):
+                        continue
+                elif relative_path not in self._summary_files:
+                    continue
+            if await is_dwg_parser_data(
+                self._viking_fs,
+                item_uri,
+                ctx=self._ctx,
+                is_directory=bool(entry.get("isDir", False)),
+            ):
+                self._dwg_filtered_dirs.add(uri)
+                continue
             if entry.get("isDir", False):
+                if self._bundle_assembly and name == "drawing_text":
+                    continue
                 children_dirs.append(item_uri)
             else:
                 file_paths.append(item_uri)
@@ -906,7 +951,7 @@ class SemanticDagExecutor:
         try:
             overview = None
             abstract = None
-            if self._incremental_update:
+            if self._incremental_update and dir_uri not in self._dwg_filtered_dirs:
                 children_changed = await self._check_dir_children_changed(
                     dir_uri, node.file_paths, node.children_dirs
                 )

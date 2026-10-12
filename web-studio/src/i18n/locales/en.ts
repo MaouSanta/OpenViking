@@ -865,6 +865,53 @@ const en = {
       save: 'Save',
       selectDirectoryContext: 'Select a chip to show folder context.',
       unsupportedBinary: 'Binary files do not support text preview.',
+      dwg: {
+        canvas: 'Interactive DWG drawing',
+        checkingSize: 'Checking DWG file size...',
+        disabled: 'DWG preview is not enabled in this build.',
+        dismissWarning: 'Dismiss notice',
+        failed: 'This DWG drawing could not be previewed.',
+        fit: 'Fit drawing',
+        incomplete:
+          'Some fonts, images, or external references are missing. The preview may be incomplete.',
+        loading: 'Loading, parsing, and rendering DWG drawing...',
+        manualLoad: 'Load anyway',
+        manualLoadDescription:
+          'The file exceeds the 5 MiB automatic preview limit or its size is unknown. DWG complexity cannot be predicted reliably from file size; continuing may use several GiB of memory and temporarily make the page unresponsive.',
+        manualLoadTitle: 'This drawing will not load automatically',
+        partial:
+          'The preview is incomplete; currently available content remains visible.',
+        progress: {
+          convert: 'Converting drawing data...',
+          download: 'Downloading the original DWG...',
+          font: 'Loading drawing fonts...',
+          parse: 'Parsing DWG...',
+          render:
+            'Generating graphics; completed content is already visible...',
+        },
+        ready: 'Drag to pan · scroll to zoom',
+        reload:
+          'A previous DWG parser did not stop. Refresh the page before previewing another drawing.',
+        timeout: 'DWG preview timed out before rendering completed.',
+        tooLarge:
+          'DWG files larger than the 25 MiB hard limit cannot be loaded in this viewer.',
+        workers: 'The DWG preview workers are unavailable.',
+      },
+      step: {
+        dimensions: 'Dimensions',
+        failed: 'Failed to parse this STEP model.',
+        fileSize: 'File size',
+        fit: 'Fit model to view',
+        info: 'Model information',
+        loading: 'Loading and parsing STEP model...',
+        meshes: 'Meshes',
+        solid: 'Solid',
+        tooLarge: 'STEP files larger than 50 MiB cannot be previewed.',
+        triangles: 'Triangles',
+        wireframe: 'Wireframe',
+        zoomIn: 'Zoom in',
+        zoomOut: 'Zoom out',
+      },
       jsonl: {
         collapse: 'Collapse',
         dialogMode: 'Dialog',

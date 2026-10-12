@@ -45,6 +45,7 @@ class _TokenInfo:
     user_id: str
     to: str
     reason: str
+    bundle: bool
     actor_peer_id: str
     processing_mode: ProcessingMode
     tags: Optional[list[str]]
@@ -60,6 +61,7 @@ class ConsumedUploadToken:
     user_id: str
     to: str
     reason: str
+    bundle: bool
     actor_peer_id: str
     processing_mode: ProcessingMode
     tags: Optional[list[str]]
@@ -78,6 +80,7 @@ class UploadTokenStore:
         *,
         to: str = "",
         reason: str = "",
+        bundle: bool = False,
         actor_peer_id: str = "",
         processing_mode: ProcessingMode = DEFAULT_PROCESSING_MODE,
         tags: Optional[list[str]] = None,
@@ -97,6 +100,7 @@ class UploadTokenStore:
             user_id,
             to,
             reason,
+            bundle,
             actor_peer_id,
             processing_mode,
             tags,
@@ -124,6 +128,7 @@ class UploadTokenStore:
             info.user_id,
             info.to,
             info.reason,
+            info.bundle,
             info.actor_peer_id,
             info.processing_mode,
             info.tags,

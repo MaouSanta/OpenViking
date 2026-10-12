@@ -13,7 +13,6 @@ from collections.abc import Callable
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
 
 from openviking.core.context import ContextLevel
-from openviking.utils.ingest_options import IngestOptions
 from openviking.core.namespace import context_type_for_uri
 from openviking.parse.image_rewrite import rewrite_image_uris
 from openviking.parse.tree_builder import TreeBuilder
@@ -24,14 +23,15 @@ from openviking.resource.processing_mode import (
     normalize_processing_mode,
 )
 from openviking.server.identity import RequestContext
-from openviking.storage.vikingdb_manager import VikingDBManager
 from openviking.storage.errors import LockAcquisitionError
 from openviking.storage.expr import And, Eq, PathScope
 from openviking.storage.internal_names import STORAGE_INTERNAL_ENTRY_NAMES
 from openviking.storage.queuefs.semantic_processor import SemanticProcessor
 from openviking.storage.viking_fs import LS_ALL_NODES, get_viking_fs
+from openviking.storage.vikingdb_manager import VikingDBManager
 from openviking.telemetry import get_current_telemetry
 from openviking.utils.embedding_utils import index_resource, vectorize_file
+from openviking.utils.ingest_options import IngestOptions
 from openviking.utils.summarizer import Summarizer
 from openviking_cli.exceptions import OpenVikingError
 from openviking_cli.utils import VikingURI, get_logger
@@ -417,7 +417,16 @@ class ResourceProcessor:
                 "source_committed": source_committed,
                 "target_preexisting": target_preexisting,
                 "is_code_repo": parse_result.source_format == "repository",
+                "precomputed_semantics": parse_result.precomputed_semantics,
             }
+            if parse_result.source_format == "dwg":
+                # TreeBuilder preserves the document-relative parser paths when
+                # moving its root; only Sheet Markdown is semantic input.
+                prepared["summary_files"] = [
+                    path
+                    for sheet in parse_result.meta.get("sheet_bundles", [])
+                    for path in sheet.get("content_paths", [])
+                ]
             if defer_post_processing:
                 result["_post_process"] = prepared
                 result["_resource_lock"] = resource_lock
@@ -457,11 +466,22 @@ class ResourceProcessor:
         temp_dir_path = prepared.get("temp_dir_path")
         source_committed = bool(prepared.get("source_committed"))
         target_preexisting = bool(prepared.get("target_preexisting"))
+        precomputed_semantics = bool(prepared.get("precomputed_semantics"))
         build_index = bool(kwargs.get("build_index", True))
         processing_mode = normalize_processing_mode(processing_mode)
         vectors_only = processing_mode == VECTORS_ONLY
         ingest_options = IngestOptions.from_value(kwargs.pop("ingest_options", None))
-        should_summarize = not vectors_only and (summarize or build_index)
+        include_files = None
+        if prepared.get("summary_files") is not None:
+            include_files = set(prepared["summary_files"])
+            if kwargs.get("summary_files") is not None:
+                # Preserve an explicit narrower caller selection.
+                include_files.intersection_update(kwargs["summary_files"])
+            kwargs["summary_files"] = sorted(include_files)
+        vector_file_options = {"include_files": include_files} if include_files is not None else {}
+        should_summarize = not vectors_only and (
+            build_index or (summarize and not precomputed_semantics)
+        )
         result: Dict[str, Any] = {"status": "success", "root_uri": root_uri}
 
         if should_summarize:
@@ -478,6 +498,7 @@ class ResourceProcessor:
                         is_code_repo=bool(prepared.get("is_code_repo")),
                         target_preexisting=target_preexisting,
                         ingest_options=ingest_options,
+                        precomputed_semantics=precomputed_semantics,
                         **kwargs,
                     )
                     if (
@@ -543,6 +564,7 @@ class ResourceProcessor:
                         root_uri,
                         ctx=ctx,
                         ingest_options=ingest_options,
+                        **vector_file_options,
                     )
             finally:
                 await get_viking_fs()._async_agfs.pathlock_release(resource_lock)
@@ -553,6 +575,7 @@ class ResourceProcessor:
                 root_uri,
                 ctx=ctx,
                 ingest_options=ingest_options,
+                **vector_file_options,
             )
         return result
 
@@ -594,15 +617,19 @@ class ResourceProcessor:
         *,
         ctx: RequestContext,
         ingest_options: IngestOptions | None = None,
+        include_files: set[str] | None = None,
     ) -> None:
         ingest_options = IngestOptions.from_value(ingest_options)
         viking_fs = get_viking_fs()
-        entries = await viking_fs.tree(
-            root_uri,
-            node_limit=None,
-            level_limit=None,
-            ctx=ctx,
-        )
+        if include_files is None:
+            entries = await viking_fs.tree(
+                root_uri,
+                node_limit=None,
+                level_limit=None,
+                ctx=ctx,
+            )
+        else:
+            entries = [{"uri": f"{root_uri}/{path}"} for path in sorted(include_files)]
         for entry in entries:
             entry_uri = entry.get("uri") if isinstance(entry, dict) else None
             if not entry_uri or entry.get("isDir"):
@@ -629,8 +656,9 @@ class ResourceProcessor:
         candidate_uri: str,
         ctx: RequestContext,
         max_attempts: int = 100,
+        exact_lock: bool = False,
     ) -> tuple[str, Dict[str, Any]]:
-        """Pick the first free candidate URI and reserve it with a resource TreeLock."""
+        """Pick the first free candidate URI and reserve it."""
         from openviking.storage.errors import ResourceBusyError
 
         viking_fs = get_viking_fs()
@@ -644,7 +672,10 @@ class ResourceProcessor:
             dst_path = viking_fs._uri_to_path(root_uri, ctx=ctx)
             try:
                 resource_lock = await self.acquire_resource_lock(
-                    dst_path, uri=root_uri, timeout=0.0
+                    dst_path,
+                    uri=root_uri,
+                    timeout=0.0,
+                    exact_lock=exact_lock,
                 )
                 return root_uri, resource_lock
             except ResourceBusyError as exc:
@@ -670,14 +701,18 @@ class ResourceProcessor:
         *,
         uri: str = "",
         timeout: float = 0.0,
+        exact_lock: bool = False,
     ) -> Dict[str, Any]:
-        """Acquire the per-resource TreeLock or raise a structured conflict."""
+        """Acquire the per-resource lock or raise a structured conflict."""
         from openviking.storage.errors import ResourceBusyError
 
         try:
-            return await get_viking_fs()._async_agfs.pathlock_acquire_tree(
-                path, timeout_secs=timeout
+            acquire = (
+                get_viking_fs()._async_agfs.pathlock_acquire_exact
+                if exact_lock
+                else get_viking_fs()._async_agfs.pathlock_acquire_tree
             )
+            return await acquire(path, timeout_secs=timeout)
         except LockAcquisitionError as exc:
             logger.warning(f"[ResourceProcessor] Failed to acquire resource lock on {path}")
             raise ResourceBusyError(

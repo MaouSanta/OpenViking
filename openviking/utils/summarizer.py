@@ -7,12 +7,12 @@ Handles summarization and key information extraction.
 
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
-from openviking.utils.ingest_options import IngestOptions
 from openviking.core.namespace import context_type_for_uri
 from openviking.storage.queuefs import SemanticMsg, get_queue_manager
 from openviking.storage.viking_fs import LS_ALL_NODES, get_viking_fs
 from openviking.telemetry import get_current_telemetry
 from openviking.telemetry.request_wait_tracker import get_request_wait_tracker
+from openviking.utils.ingest_options import IngestOptions
 from openviking_cli.utils import get_logger
 from openviking_cli.utils.uri import VikingURI
 
@@ -129,6 +129,9 @@ class Summarizer:
                     is_code_repo=kwargs.get("is_code_repo", False),
                     target_preexisting=resolve_target_preexisting(idx, target_uri),
                     ingest_options=ingest_options,
+                    precomputed_semantics=bool(kwargs.get("precomputed_semantics", False)),
+                    bundle_assembly=bool(kwargs.get("bundle_assembly", False)),
+                    summary_files=kwargs.get("summary_files"),
                 )
                 if msg.telemetry_id:
                     get_request_wait_tracker().register_semantic_root(msg.telemetry_id, msg.id)

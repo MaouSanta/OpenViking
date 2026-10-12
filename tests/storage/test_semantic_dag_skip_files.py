@@ -5,6 +5,7 @@ import pytest
 
 from openviking.server.identity import RequestContext, Role
 from openviking.storage.queuefs.semantic_dag import SemanticDagExecutor
+from openviking.storage.queuefs.semantic_msg import SemanticMsg
 from openviking_cli.session.user_id import UserIdentifier
 
 
@@ -20,9 +21,11 @@ class _FakeVikingFS:
     def __init__(self, tree):
         self._tree = tree
         self.writes = []
+        self.listed_dirs = []
         self._async_agfs = _FakeAgfs()
 
     async def ls(self, uri, node_limit=None, ctx=None):
+        self.listed_dirs.append(uri)
         return self._tree.get(uri, [])
 
     async def write_file(self, path, content, ctx=None, lease_ref=None):
@@ -160,6 +163,120 @@ async def test_messages_jsonl_excluded_in_subdirectory(monkeypatch, root_uri):
     summarized_names = [p.split("/")[-1] for p in processor.summarized_files]
     assert "messages.jsonl" not in summarized_names
     assert "data.csv" in summarized_names
+
+
+@pytest.mark.asyncio
+async def test_bundle_assembly_excludes_dwg_text_chunks(monkeypatch):
+    root_uri = "viking://temp/plan_dwg"
+    chunk_dir = f"{root_uri}/drawing_text"
+    tree = {
+        root_uri: [
+            {"name": "drawing_text", "isDir": True},
+            {"name": "beam_topology.json", "isDir": False},
+        ],
+        chunk_dir: [
+            {"name": "index.json", "isDir": False},
+            {"name": "0000_x0_y0_x10_y10.json", "isDir": False},
+        ],
+    }
+    fake_fs = _FakeVikingFS(tree)
+    monkeypatch.setattr("openviking.storage.queuefs.semantic_dag.get_viking_fs", lambda: fake_fs)
+    monkeypatch.setattr(
+        "openviking.storage.queuefs.embedding_tracker.EmbeddingTaskTracker.get_instance",
+        lambda: _DummyTracker(),
+    )
+
+    processor = _FakeProcessor()
+    ctx = RequestContext(user=UserIdentifier("acc1", "user1"), role=Role.USER)
+    executor = SemanticDagExecutor(
+        processor=processor,
+        context_type="resource",
+        max_concurrent_llm=2,
+        ctx=ctx,
+        bundle_assembly=True,
+    )
+    await executor.run(root_uri)
+
+    assert processor.summarized_files == [f"{root_uri}/beam_topology.json"]
+    assert not any(path.startswith(f"{chunk_dir}/") for path, _ in fake_fs.writes)
+
+
+@pytest.mark.asyncio
+async def test_bundle_assembly_excludes_machine_manifests(monkeypatch):
+    root_uri = "viking://temp/plan_dwg/sheets/S001"
+    tree = {
+        root_uri: [
+            {"name": "context.md", "isDir": False},
+            {"name": "manifest.json", "isDir": False},
+            {"name": "sheet.dwg", "isDir": False},
+        ]
+    }
+    fake_fs = _FakeVikingFS(tree)
+    monkeypatch.setattr("openviking.storage.queuefs.semantic_dag.get_viking_fs", lambda: fake_fs)
+    monkeypatch.setattr(
+        "openviking.storage.queuefs.embedding_tracker.EmbeddingTaskTracker.get_instance",
+        lambda: _DummyTracker(),
+    )
+
+    processor = _FakeProcessor()
+    ctx = RequestContext(user=UserIdentifier("acc1", "user1"), role=Role.USER)
+    executor = SemanticDagExecutor(
+        processor=processor,
+        context_type="resource",
+        max_concurrent_llm=2,
+        ctx=ctx,
+        bundle_assembly=True,
+    )
+    await executor.run(root_uri)
+
+    assert processor.summarized_files == [f"{root_uri}/context.md"]
+
+
+@pytest.mark.asyncio
+async def test_dwg_summary_allowlist_skips_json_and_their_directories(monkeypatch):
+    root_uri = "viking://temp/plan_dwg/sheets/S001"
+    tree = {
+        root_uri: [
+            {"name": "context_0000.md", "isDir": False},
+            {"name": "context_0001.md", "isDir": False},
+            {"name": "notes.md", "isDir": False},
+            {"name": "chunk_0001.json", "isDir": False},
+            {"name": "views", "isDir": True},
+            {"name": "unassigned", "isDir": True},
+        ],
+        f"{root_uri}/views": [{"name": "V001", "isDir": True}],
+        f"{root_uri}/views/V001": [{"name": "chunk_0001.json", "isDir": False}],
+        f"{root_uri}/unassigned": [{"name": "chunk_0001.json", "isDir": False}],
+    }
+    fake_fs = _FakeVikingFS(tree)
+    monkeypatch.setattr("openviking.storage.queuefs.semantic_dag.get_viking_fs", lambda: fake_fs)
+    processor = _FakeProcessor()
+    msg = SemanticMsg(
+        uri=root_uri,
+        context_type="resource",
+        bundle_assembly=True,
+        skip_vectorization=True,
+        summary_files=["context_0000.md", "context_0001.md"],
+    )
+    restored = SemanticMsg.from_json(msg.to_json())
+    executor = SemanticDagExecutor(
+        processor=processor,
+        context_type=restored.context_type,
+        max_concurrent_llm=2,
+        ctx=RequestContext(user=UserIdentifier("acc1", "user1"), role=Role.USER),
+        bundle_assembly=restored.bundle_assembly,
+        skip_vectorization=restored.skip_vectorization,
+        summary_files=restored.summary_files,
+    )
+    await executor.run(root_uri)
+
+    assert sorted(processor.summarized_files) == [
+        f"{root_uri}/context_0000.md",
+        f"{root_uri}/context_0001.md",
+    ]
+    assert fake_fs.listed_dirs == [root_uri]
+    assert all(path.rsplit("/", 1)[0] == root_uri for path, _ in fake_fs.writes)
+    assert processor.vectorized_files == []
 
 
 if __name__ == "__main__":

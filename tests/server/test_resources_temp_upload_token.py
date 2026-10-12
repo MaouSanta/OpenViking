@@ -31,6 +31,7 @@ def _issue(
     *,
     to: str = "",
     reason: str = "",
+    bundle: bool = False,
     actor_peer_id: str = "",
     tags: list[str] | None = None,
     tag_mode: str = "replace",
@@ -41,6 +42,7 @@ def _issue(
         ttl_seconds=600,
         to=to,
         reason=reason,
+        bundle=bundle,
         actor_peer_id=actor_peer_id,
         tags=tags,
         tag_mode=tag_mode,
@@ -58,6 +60,7 @@ def _stub_ingest(service, monkeypatch, root_uri: str = "viking://resources/uploa
         captured["ctx"] = ctx
         captured["to"] = kwargs.get("to")
         captured["reason"] = kwargs.get("reason")
+        captured["bundle"] = kwargs.get("bundle")
         captured["tags"] = kwargs.get("tags")
         captured["tag_mode"] = kwargs.get("tag_mode")
         captured["allow_local_path_resolution"] = kwargs.get("allow_local_path_resolution")
@@ -116,6 +119,20 @@ async def test_token_upload_forwards_tags_and_tag_mode(
     assert resp.status_code == 200, resp.text
     assert captured["tags"] == ["team=search"]
     assert captured["tag_mode"] == "append"
+
+
+async def test_token_upload_forwards_bundle_mode(
+    client: httpx.AsyncClient, service, upload_temp_dir: Path, monkeypatch
+):
+    captured = _stub_ingest(service, monkeypatch)
+    token = _issue(bundle=True)
+    resp = await client.post(
+        "/api/v1/resources/temp_upload",
+        params={"token": token},
+        files={"file": ("model.stp", b"ISO-10303-21", "application/step")},
+    )
+    assert resp.status_code == 200, resp.text
+    assert captured["bundle"] is True
 
 
 async def test_token_upload_uses_token_identity_ignoring_spoofed_headers(

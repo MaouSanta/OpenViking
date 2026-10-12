@@ -90,3 +90,17 @@ async def test_reservation_returns_first_available_lock(monkeypatch):
 
     assert uri == "viking://resources/report_1"
     assert acquired is lease
+
+
+@pytest.mark.asyncio
+async def test_bundle_reservation_uses_exact_lock(monkeypatch):
+    processor = _make_processor(monkeypatch)
+    processor.acquire_resource_lock = AsyncMock(return_value=object())
+
+    await processor.reserve_unique_candidate(
+        candidate_uri="viking://resources/report",
+        ctx=object(),
+        exact_lock=True,
+    )
+
+    assert processor.acquire_resource_lock.await_args.kwargs["exact_lock"] is True

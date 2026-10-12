@@ -10,6 +10,7 @@ from uuid import uuid4
 
 from openviking.utils.ingest_options import IngestOptions
 
+
 def build_semantic_coalesce_key(
     *,
     context_type: str,
@@ -55,6 +56,9 @@ class SemanticMsg:
     is_code_repo: bool = False
     target_preexisting: Optional[bool] = None
     ingest_options: IngestOptions = field(default_factory=IngestOptions)
+    precomputed_semantics: bool = False
+    bundle_assembly: bool = False
+    summary_files: Optional[List[str]] = None  # Paths relative to the semantic root.
     coalesce_key: str = ""
     coalesce_version: int = 0
     changes: Optional[Dict[str, List[str]]] = (
@@ -77,6 +81,9 @@ class SemanticMsg:
         is_code_repo: bool = False,
         target_preexisting: Optional[bool] = None,
         ingest_options: IngestOptions | Dict[str, Any] | None = None,
+        precomputed_semantics: bool = False,
+        bundle_assembly: bool = False,
+        summary_files: Optional[List[str]] = None,
         coalesce_key: str = "",
         coalesce_version: int = 0,
         changes: Optional[Dict[str, List[str]]] = None,
@@ -96,6 +103,9 @@ class SemanticMsg:
         self.is_code_repo = is_code_repo
         self.target_preexisting = target_preexisting
         self.ingest_options = IngestOptions.from_value(ingest_options)
+        self.precomputed_semantics = precomputed_semantics
+        self.bundle_assembly = bundle_assembly
+        self.summary_files = summary_files
         self.coalesce_key = coalesce_key
         self.coalesce_version = coalesce_version
         self.changes = changes
@@ -148,6 +158,9 @@ class SemanticMsg:
                     "search_tag_mode": data.get("search_tag_mode", "replace"),
                 }
             ),
+            precomputed_semantics=data.get("precomputed_semantics", False),
+            bundle_assembly=data.get("bundle_assembly", False),
+            summary_files=data.get("summary_files"),
             coalesce_key=data.get("coalesce_key", ""),
             coalesce_version=data.get("coalesce_version", 0),
             changes=data.get("changes"),

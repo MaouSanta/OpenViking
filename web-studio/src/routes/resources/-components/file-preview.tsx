@@ -30,6 +30,15 @@ const LazyCodeEditor = lazy(() =>
   import('./code-editor').then((m) => ({ default: m.CodeEditor })),
 )
 
+const dwgPreviewEnabled =
+  import.meta.env.DEV || import.meta.env.VITE_ENABLE_DWG_PREVIEW === 'true'
+const LazyDwgPreview = dwgPreviewEnabled
+  ? lazy(() => import('./dwg-preview').then((m) => ({ default: m.DwgPreview })))
+  : null
+const LazyStepPreview = lazy(() =>
+  import('./step-preview').then((m) => ({ default: m.StepPreview })),
+)
+
 const languageLoaders: Partial<
   Record<
     string,
@@ -1330,6 +1339,38 @@ export function FilePreview({
               filename={file.name}
               isDark={isDark}
             />
+          </Suspense>
+        </div>
+      ) : preview?.fileType === 'drawing2d' ? (
+        <div className="h-full min-h-0 p-4">
+          {LazyDwgPreview ? (
+            <Suspense
+              fallback={
+                <div className="flex h-full items-center justify-center text-sm text-muted-foreground">
+                  <Loader2 className="mr-2 size-4 animate-spin" />
+                  {t('filePreview.dwg.loading')}
+                </div>
+              }
+            >
+              <LazyDwgPreview file={file} />
+            </Suspense>
+          ) : (
+            <div className="flex h-full items-center justify-center text-sm text-muted-foreground">
+              {t('filePreview.dwg.disabled')}
+            </div>
+          )}
+        </div>
+      ) : preview?.fileType === 'model3d' ? (
+        <div className="h-full min-h-0 p-4">
+          <Suspense
+            fallback={
+              <div className="flex h-full items-center justify-center text-sm text-muted-foreground">
+                <Loader2 className="mr-2 size-4 animate-spin" />
+                {t('filePreview.step.loading')}
+              </div>
+            }
+          >
+            <LazyStepPreview file={file} />
           </Suspense>
         </div>
       ) : showJsonPreview ? (

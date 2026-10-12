@@ -10,6 +10,7 @@ from vikingbot.agent.memory import MemoryStore
 from vikingbot.agent.tools import ov_file as ov_file_module
 from vikingbot.agent.tools.base import ToolContext
 from vikingbot.agent.tools.ov_file import (
+    VikingFindResourceTool,
     VikingGlobTool,
     VikingGrepTool,
     VikingListTool,
@@ -1964,6 +1965,46 @@ def test_openviking_grep_schema_requires_single_string_pattern():
     tool = VikingGrepTool()
 
     assert tool.parameters["properties"]["pattern"]["type"] == "string"
+
+
+@pytest.mark.asyncio
+async def test_openviking_find_resource_returns_bundle_root_and_match(monkeypatch):
+    tool = VikingFindResourceTool()
+
+    class _FakeClient:
+        async def find_resource(self, query, target_uri, limit):
+            assert (query, target_uri, limit) == (
+                "2栋组串图",
+                "viking://resources/",
+                5,
+            )
+            return {
+                "resources": [
+                    {
+                        "uri": "viking://resources/power.dwg",
+                        "matched_uri": (
+                            "viking://resources/power.dwg/drawing_text/0000_x0_y0_x10_y10.json"
+                        ),
+                        "score": 0.9,
+                    }
+                ]
+            }
+
+    async def _fake_get_client(_tool_context):
+        return _FakeClient()
+
+    monkeypatch.setattr(tool, "_get_client", _fake_get_client)
+
+    result = json.loads(
+        await tool.execute(
+            SimpleNamespace(workspace_id="workspace"),
+            query="2栋组串图",
+            limit=5,
+        )
+    )
+
+    assert result["resources"][0]["uri"] == "viking://resources/power.dwg"
+    assert result["resources"][0]["matched_uri"].endswith("/0000_x0_y0_x10_y10.json")
 
 
 @pytest.mark.asyncio

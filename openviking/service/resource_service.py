@@ -8,18 +8,32 @@ Provides resource management operations: add_resource, add_skill, wait_processed
 
 import asyncio
 import contextlib
+import hashlib
 import inspect
 import json
+import posixpath
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
-from pathlib import Path
+from datetime import datetime, timezone
+from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 from uuid import uuid4
 
 from openviking.core.content_targets import ContentTargetSpec
 from openviking.core.uri_validation import validate_optional_content_target_uri
 from openviking.parse.parsers.constants import MPEG_TS_EXTENSION_ALIAS
+from openviking.resource.atomic_bundle import (
+    RESOURCE_BUNDLE_MANIFEST,
+    RESOURCE_BUNDLE_SCHEMA_V3,
+    build_dwg_sheet_manifest,
+    build_manifest,
+    find_resource_bundle_root,
+    kind_from_source_name,
+    read_source_and_sha256,
+    serialize_manifest,
+    source_basename,
+)
 from openviking.resource.feishu_watch_auth import (
     FEISHU_ACCESS_TOKEN_ARG,
     FEISHU_REFRESH_TOKEN_ARG,
@@ -49,12 +63,14 @@ from openviking.telemetry.resource_summary import (
     build_queue_status_payload,
 )
 from openviking.utils import is_git_repo_url, parse_code_hosting_url
+from openviking.utils.embedding_utils import index_resource
 from openviking.utils.ingest_options import IngestOptions
 from openviking.utils.media_processor import _smart_stem
 from openviking.utils.network_guard import ensure_public_remote_target
 from openviking.utils.resource_processor import ResourceProcessor
 from openviking.utils.skill_processor import SkillProcessingPreparation, SkillProcessor
 from openviking_cli.exceptions import (
+    AlreadyExistsError,
     ConflictError,
     DeadlineExceededError,
     InternalError,
@@ -109,6 +125,7 @@ _ADD_RESOURCE_ARGS_RESERVED_FIELDS = frozenset(
         "defer_post_processing",
         "tags",
         "tag_mode",
+        "bundle",
     }
 )
 _ADD_RESOURCE_TAG_MODES = frozenset({"replace", "append"})
@@ -700,7 +717,8 @@ class ResourceService:
         target: ContentTargetSpec,
         source_name: Optional[str],
         source_info: _ResourceSourceInfo,
-    ) -> tuple[str, Optional[Dict[str, Any]]]:
+        require_new: bool = False,
+    ) -> tuple[str, Dict[str, Any]]:
         if not self._resource_processor or not self._viking_fs:
             raise NotInitializedError("ResourceProcessor")
 
@@ -720,14 +738,636 @@ class ResourceService:
             return await self._resource_processor.reserve_unique_candidate(
                 candidate_uri=candidate_uri,
                 ctx=ctx,
+                exact_lock=require_new,
             )
+        if require_new and await self._viking_fs.exists(root_uri, ctx=ctx):
+            raise AlreadyExistsError(root_uri, "resource bundle")
 
         dst_path = self._viking_fs._uri_to_path(root_uri, ctx=ctx)
-        resource_lock = await self._viking_fs._async_agfs.pathlock_acquire_tree(
+        lock_method = (
+            self._viking_fs._async_agfs.pathlock_acquire_exact
+            if require_new
+            else self._viking_fs._async_agfs.pathlock_acquire_tree
+        )
+        resource_lock = await lock_method(
             dst_path,
             timeout_secs=0.0,
         )
         return root_uri, resource_lock
+
+    async def _summarize_bundle_staging(
+        self,
+        staging_uri: str,
+        *,
+        ctx: RequestContext,
+        timeout: Optional[float],
+        summary_files: Optional[List[str]] = None,
+    ) -> Dict[str, Any]:
+        """Generate ordinary L0/L1 in staging once, without indexing or retrying."""
+        return await self._summarize_bundle_staging_batch(
+            [(staging_uri, summary_files)], ctx=ctx, timeout=timeout
+        )
+
+    async def _summarize_bundle_staging_batch(
+        self,
+        inputs: List[tuple[str, Optional[List[str]]]],
+        *,
+        ctx: RequestContext,
+        timeout: Optional[float],
+    ) -> Dict[str, Any]:
+        """Admit independent roots before one request-scoped wait and cleanup."""
+        telemetry = get_current_telemetry()
+        telemetry_id = telemetry.telemetry_id
+        tracker = get_request_wait_tracker()
+        if telemetry_id:
+            register_telemetry(telemetry)
+            tracker.register_request(telemetry_id)
+        try:
+            enqueue_error = None
+            for staging_uri, summary_files in inputs:
+                try:
+                    result = await self._resource_processor.summarize(
+                        [staging_uri],
+                        ctx,
+                        skip_vectorization=True,
+                        bundle_assembly=True,
+                        **({"summary_files": summary_files} if summary_files is not None else {}),
+                    )
+                    if result.get("status") != "success" or result.get("enqueued_count", 0) != 1:
+                        raise RuntimeError(
+                            result.get("message") or "Unable to queue bundle semantics"
+                        )
+                except Exception as exc:
+                    if len(inputs) == 1:
+                        raise
+                    enqueue_error = exc
+                    break
+            try:
+                if telemetry_id:
+                    await tracker.wait_for_request(telemetry_id, timeout=timeout)
+                    status = tracker.build_queue_status(telemetry_id)
+                else:
+                    status = build_queue_status_payload(
+                        await get_queue_manager().wait_complete(timeout=timeout)
+                    )
+            except TimeoutError as exc:
+                if len(inputs) > 1:
+                    # Workers own queued roots. Finish accepted work before the
+                    # caller removes staging, even when the batch misses its deadline.
+                    if telemetry_id:
+                        await tracker.wait_for_request(telemetry_id)
+                    else:
+                        await get_queue_manager().wait_complete()
+                raise DeadlineExceededError("bundle semantic assembly", timeout) from exc
+            if enqueue_error is not None:
+                raise enqueue_error
+            semantic = status.get("Semantic", {})
+            if isinstance(semantic, dict) and semantic.get("error_count", 0):
+                raise RuntimeError("Bundle semantic assembly failed")
+            return status
+        finally:
+            if telemetry_id:
+                tracker.cleanup(telemetry_id)
+                unregister_telemetry(telemetry_id)
+
+    async def _parsed_bundle_artifacts(
+        self,
+        staging_uri: str,
+        *,
+        source_name: str,
+        source_sha256: str,
+        kind: str,
+        derived: Dict[str, tuple[str, str]],
+        ctx: RequestContext,
+    ) -> Dict[str, Dict[str, str]]:
+        specs = {
+            "source": (source_name, kind),
+            **derived,
+            "abstract": (".abstract.md", "openviking.semantic/l0"),
+            "overview": (".overview.md", "openviking.semantic/l1"),
+        }
+        artifacts = {}
+        for role, (name, schema) in specs.items():
+            content = await self._viking_fs.read_file_bytes(f"{staging_uri}/{name}", ctx=ctx)
+            artifacts[role] = {
+                "path": name,
+                "schema": schema,
+                "sha256": hashlib.sha256(content).hexdigest(),
+            }
+        if artifacts["source"]["sha256"] != source_sha256:
+            raise RuntimeError(
+                f"Parsed {kind.upper()} source snapshot does not match the bundle source"
+            )
+        return artifacts
+
+    @staticmethod
+    def _bundle_relative_path(value: Any, field: str) -> str:
+        if not isinstance(value, str) or not value.strip():
+            raise RuntimeError(f"DWG parser returned an invalid {field}")
+        raw = value.strip()
+        path = PurePosixPath(raw)
+        if (
+            raw.startswith("/")
+            or "\\" in raw
+            or "://" in raw
+            or any(part in {"", ".", ".."} for part in raw.split("/"))
+        ):
+            raise RuntimeError(f"DWG parser returned an unsafe {field}: {value}")
+        return str(path)
+
+    async def _dwg_json_artifacts(
+        self,
+        staging_uri: str,
+        specs: Any,
+        *,
+        ctx: RequestContext,
+        directory: str = "",
+        sheet_directories: Optional[set[str]] = None,
+    ) -> Dict[str, Dict[str, Any]]:
+        """Validate and inventory parser JSON without changing its contents."""
+        if not isinstance(specs, list):
+            raise RuntimeError("DWG parser returned invalid json_artifacts")
+        artifacts: Dict[str, Dict[str, Any]] = {}
+        seen: set[str] = set()
+        for index, spec in enumerate(specs):
+            if not isinstance(spec, dict):
+                raise RuntimeError("DWG parser returned an invalid JSON artifact")
+            path = self._bundle_relative_path(spec.get("path"), "JSON artifact path")
+            schema = spec.get("schema")
+            if not isinstance(schema, str) or not schema.strip():
+                raise RuntimeError(f"DWG JSON artifact {path} has no schema")
+            if directory and not path.startswith(f"{directory}/"):
+                raise RuntimeError(f"DWG JSON artifact {path} must stay inside {directory}")
+            if any(path.startswith(f"{sheet}/") for sheet in sheet_directories or set()):
+                raise RuntimeError(f"DWG root JSON artifact {path} belongs to a sheet")
+            relative = path.removeprefix(f"{directory}/") if directory else path
+            if not relative.endswith(".json") or relative == RESOURCE_BUNDLE_MANIFEST:
+                raise RuntimeError(f"DWG parser returned a reserved JSON artifact path: {path}")
+            if path in seen:
+                raise RuntimeError(f"DWG parser returned a duplicate JSON artifact: {path}")
+            seen.add(path)
+            uri = f"{staging_uri}/{path}"
+            if not await self._viking_fs.exists(uri, ctx=ctx):
+                raise RuntimeError(f"DWG JSON artifact is missing: {path}")
+            content = await self._viking_fs.read_file_bytes(uri, ctx=ctx)
+            try:
+                json.loads(content.decode("utf-8"), parse_constant=self._invalid_json_constant)
+            except (UnicodeDecodeError, ValueError) as exc:
+                raise RuntimeError(f"DWG artifact is not valid UTF-8 JSON: {path}") from exc
+            artifacts[f"json_{index:04d}"] = {
+                "path": relative,
+                "schema": schema,
+                "sha256": hashlib.sha256(content).hexdigest(),
+                **({"searchable": False} if directory else {}),
+            }
+        return artifacts
+
+    @staticmethod
+    def _invalid_json_constant(value: str) -> None:
+        raise ValueError(f"Non-JSON numeric constant: {value}")
+
+    async def _assemble_dwg_sheet_bundles(
+        self,
+        *,
+        staging_uri: str,
+        parsed_meta: Dict[str, Any],
+        stored_name: str,
+        source_sha256: str,
+        ctx: RequestContext,
+        timeout: Optional[float],
+    ) -> tuple[Dict[str, Dict[str, str]], List[Dict[str, Any]], str]:
+        """Seal parser-produced sheets while the whole DWG tree is still temporary."""
+        raw_sheets = parsed_meta.get("sheet_bundles")
+        if not isinstance(raw_sheets, list) or not raw_sheets:
+            raise RuntimeError("DWG parser did not produce sheet bundles")
+
+        source_content = await self._viking_fs.read_file_bytes(
+            f"{staging_uri}/{stored_name}", ctx=ctx
+        )
+        if hashlib.sha256(source_content).hexdigest() != source_sha256:
+            raise RuntimeError("Parsed DWG source snapshot does not match the bundle source")
+
+        document_id = parsed_meta.get("document_id")
+        if not isinstance(document_id, str) or not document_id.strip():
+            document_id = f"dwg-{source_sha256[:16]}"
+
+        root_artifacts: Dict[str, Dict[str, str]] = {
+            "source": {
+                "path": stored_name,
+                "schema": "dwg",
+                "sha256": source_sha256,
+            }
+        }
+        normalized_sheets: List[Dict[str, Any]] = []
+        artifact_maps: List[Dict[str, Dict[str, Any]]] = []
+        seen_ids: set[str] = set()
+        seen_directories: set[str] = set()
+
+        for raw_sheet in raw_sheets:
+            if not isinstance(raw_sheet, dict):
+                raise RuntimeError("DWG parser returned an invalid sheet bundle")
+            sheet_id = raw_sheet.get("sheet_id")
+            if not isinstance(sheet_id, str) or not sheet_id or sheet_id in seen_ids:
+                raise RuntimeError(f"DWG parser returned an invalid sheet_id: {sheet_id}")
+            directory = self._bundle_relative_path(
+                raw_sheet.get("directory"), f"sheet {sheet_id} directory"
+            )
+            if directory in seen_directories:
+                raise RuntimeError(f"DWG parser returned a duplicate sheet directory: {directory}")
+            if any(
+                directory.startswith(f"{existing}/") or existing.startswith(f"{directory}/")
+                for existing in seen_directories
+            ):
+                raise RuntimeError(
+                    f"DWG parser returned overlapping sheet directories: {directory}"
+                )
+
+            content_paths = raw_sheet.get("content_paths")
+            if content_paths is None and raw_sheet.get("content_path") is not None:
+                content_paths = [raw_sheet["content_path"]]
+            if not isinstance(content_paths, list) or not content_paths:
+                raise RuntimeError(f"DWG sheet {sheet_id} has no content")
+            content_paths = [
+                self._bundle_relative_path(path, f"sheet {sheet_id} content path")
+                for path in content_paths
+            ]
+            prefix = f"{directory}/"
+            if any(not path.startswith(prefix) for path in content_paths):
+                raise RuntimeError(f"DWG sheet {sheet_id} artifacts must stay inside {directory}")
+            if len(set(content_paths)) != len(content_paths):
+                raise RuntimeError(f"DWG sheet {sheet_id} contains duplicate content paths")
+            relative_content_paths = [path.removeprefix(prefix) for path in content_paths]
+            if any(
+                "/" in path or not path.startswith("context") or not path.endswith(".md")
+                for path in relative_content_paths
+            ):
+                raise RuntimeError(f"DWG sheet {sheet_id} content must be direct context*.md files")
+            status = raw_sheet.get("status", "complete")
+            if status not in {"complete", "partial"}:
+                raise RuntimeError(f"DWG sheet {sheet_id} has invalid parse status: {status}")
+
+            sheet_json_artifacts = await self._dwg_json_artifacts(
+                staging_uri,
+                raw_sheet.get("json_artifacts", []),
+                ctx=ctx,
+                directory=directory,
+            )
+
+            sheet_uri = f"{staging_uri}/{directory}"
+            for preview_name in ("preview.png", "preview.webp", "sheet.dwg"):
+                preview_uri = f"{sheet_uri}/{preview_name}"
+                if await self._viking_fs.exists(preview_uri, ctx=ctx):
+                    await self._viking_fs.rm(preview_uri, recursive=False, ctx=ctx)
+            sheet_artifacts = sheet_json_artifacts
+            for content_index, content_path in enumerate(content_paths):
+                content = await self._viking_fs.read_file_bytes(
+                    f"{staging_uri}/{content_path}", ctx=ctx
+                )
+                role = "content" if len(content_paths) == 1 else f"content_{content_index:04d}"
+                sheet_artifacts[role] = {
+                    "path": relative_content_paths[content_index],
+                    "schema": "text/markdown",
+                    "sha256": hashlib.sha256(content).hexdigest(),
+                    "searchable": True,
+                }
+
+            title = raw_sheet.get("title")
+            title = title if isinstance(title, str) and title else sheet_id
+            normalized_sheets.append(
+                {
+                    "sheet_id": sheet_id,
+                    "directory": directory,
+                    "title": title,
+                    "content_paths": content_paths,
+                    "status": status,
+                }
+            )
+            artifact_maps.append(sheet_artifacts)
+            seen_ids.add(sheet_id)
+            seen_directories.add(directory)
+
+        root_artifacts.update(
+            await self._dwg_json_artifacts(
+                staging_uri,
+                parsed_meta.get("json_artifacts", []),
+                ctx=ctx,
+                sheet_directories=seen_directories,
+            )
+        )
+        # All paths, files and JSON have passed validation before any model job.
+        # The existing Semantic queue and shared DAG scheduler bound concurrency.
+        await self._summarize_bundle_staging_batch(
+            [
+                (
+                    f"{staging_uri}/{sheet['directory']}",
+                    [
+                        path.removeprefix(f"{sheet['directory']}/")
+                        for path in sheet["content_paths"]
+                    ],
+                )
+                for sheet in normalized_sheets
+            ],
+            ctx=ctx,
+            timeout=timeout,
+        )
+
+        for index, (sheet, sheet_artifacts) in enumerate(
+            zip(normalized_sheets, artifact_maps, strict=True)
+        ):
+            directory = sheet["directory"]
+            sheet_uri = f"{staging_uri}/{directory}"
+            for role, name, schema in (
+                ("abstract", ".abstract.md", "openviking.semantic/l0"),
+                ("overview", ".overview.md", "openviking.semantic/l1"),
+            ):
+                uri = f"{sheet_uri}/{name}"
+                if await self._viking_fs.exists(uri, ctx=ctx):
+                    content = await self._viking_fs.read_file_bytes(uri, ctx=ctx)
+                    sheet_artifacts[role] = {
+                        "path": name,
+                        "schema": schema,
+                        "sha256": hashlib.sha256(content).hexdigest(),
+                        "searchable": False,
+                    }
+
+            sheet_manifest = build_dwg_sheet_manifest(
+                document_id=document_id,
+                sheet_id=sheet["sheet_id"],
+                title=sheet["title"],
+                source_path=posixpath.relpath(stored_name, directory),
+                source_sha256=source_sha256,
+                artifacts=sheet_artifacts,
+            )
+            sheet_manifest["sheet"]["status"] = sheet["status"]
+            serialized = serialize_manifest(sheet_manifest)
+            sheet_manifest_path = f"{directory}/{RESOURCE_BUNDLE_MANIFEST}"
+            await self._viking_fs.write_file(
+                f"{staging_uri}/{sheet_manifest_path}", serialized, ctx=ctx
+            )
+            root_artifacts[f"sheet_{index:04d}"] = {
+                "path": sheet_manifest_path,
+                "schema": RESOURCE_BUNDLE_SCHEMA_V3,
+                "sha256": hashlib.sha256(serialized.encode("utf-8")).hexdigest(),
+            }
+        for preview_name in ("preview.png", "preview.webp"):
+            preview_uri = f"{staging_uri}/{preview_name}"
+            if await self._viking_fs.exists(preview_uri, ctx=ctx):
+                await self._viking_fs.rm(preview_uri, recursive=False, ctx=ctx)
+        return root_artifacts, normalized_sheets, document_id
+
+    async def _add_atomic_resource_bundle(
+        self,
+        *,
+        path: str,
+        ctx: RequestContext,
+        target: ContentTargetSpec,
+        wait: bool,
+        timeout: Optional[float],
+        build_index: bool,
+        summarize: bool,
+        watch_interval: float,
+        allow_local_path_resolution: bool,
+        source_name: Optional[str],
+    ) -> Dict[str, Any]:
+        """Assemble, seal, and publish one immutable atomic resource bundle."""
+        del summarize
+        if watch_interval != 0:
+            raise InvalidArgumentError("bundle=true does not support watch_interval")
+        if is_remote_resource_source(path) or not allow_local_path_resolution:
+            raise InvalidArgumentError(
+                "bundle=true requires a local file or a server-resolved temporary upload"
+            )
+
+        source_file = Path(path).expanduser()
+        try:
+            is_file = await asyncio.to_thread(source_file.is_file)
+        except OSError as exc:
+            raise InvalidArgumentError(f"Cannot read bundle source: {path}") from exc
+        if not is_file:
+            raise InvalidArgumentError(f"bundle source must be an existing file: {path}")
+
+        stored_name = source_basename(path, source_name)
+        if stored_name.lower() == RESOURCE_BUNDLE_MANIFEST:
+            raise InvalidArgumentError(
+                f"bundle source file name is reserved: {RESOURCE_BUNDLE_MANIFEST}"
+            )
+        kind = kind_from_source_name(stored_name)
+        source_bytes, source_sha256 = await read_source_and_sha256(source_file)
+        ingested_at = datetime.now(timezone.utc)
+
+        source_info = _ResourceSourceInfo(
+            source_name=stored_name,
+            source_path=str(source_file),
+            source_format=kind,
+        )
+        root_uri, resource_lock = await self._plan_resource_target(
+            path=path,
+            ctx=ctx,
+            target=target,
+            source_name=stored_name,
+            source_info=source_info,
+            require_new=True,
+        )
+
+        created_root = False
+        staging_parent: Optional[str] = None
+        semantic_status = "skipped"
+        sheet_bundles: List[Dict[str, Any]] = []
+        document_id: Optional[str] = None
+        parse_status: Optional[str] = None
+        try:
+            parent_bundle = await find_resource_bundle_root(
+                self._viking_fs,
+                root_uri,
+                ctx=ctx,
+                uri_is_directory=True,
+            )
+            if parent_bundle:
+                raise InvalidArgumentError(
+                    "Atomic resource bundles cannot be nested: "
+                    f"{root_uri} is inside {parent_bundle}"
+                )
+
+            source_uri = f"{root_uri}/{stored_name}"
+            manifest_uri = f"{root_uri}/{RESOURCE_BUNDLE_MANIFEST}"
+            if kind in {"dwg", "step"}:
+                if kind == "dwg":
+                    from openviking.parse.parsers.dwg import DWGParser
+
+                    parser = DWGParser()
+                else:
+                    from openviking.parse.parsers.step import (
+                        STEP_EVIDENCE_SCHEMA,
+                        VIEWS,
+                        STEPParser,
+                    )
+
+                    parser = STEPParser()
+                    derived = {
+                        "evidence": ("evidence.json", STEP_EVIDENCE_SCHEMA),
+                        **{f"view_{name}": (f"{name}.png", "png") for name in VIEWS},
+                    }
+
+                with self._viking_fs.bind_request_context(ctx):
+                    parsed = await parser.parse(source_file, source_name=stored_name)
+                staging_parent = parsed.temp_dir_path
+                staging_uri = str(parsed.meta.get("temp_root_uri") or "")
+                if not staging_parent or not staging_uri:
+                    raise RuntimeError(f"{kind.upper()} parser did not produce a staging bundle")
+                if kind == "dwg":
+                    artifacts, sheet_bundles, document_id = await self._assemble_dwg_sheet_bundles(
+                        staging_uri=staging_uri,
+                        parsed_meta=parsed.meta,
+                        stored_name=stored_name,
+                        source_sha256=source_sha256,
+                        ctx=ctx,
+                        timeout=timeout,
+                    )
+                    parse_status = parsed.meta.get("parse_status", "complete")
+                    if parse_status not in {"complete", "partial"}:
+                        raise RuntimeError(
+                            f"DWG parser returned invalid parse status: {parse_status}"
+                        )
+                    if any(sheet["status"] == "partial" for sheet in sheet_bundles):
+                        parse_status = "partial"
+                else:
+                    await self._summarize_bundle_staging(staging_uri, ctx=ctx, timeout=timeout)
+                    artifacts = await self._parsed_bundle_artifacts(
+                        staging_uri,
+                        source_name=stored_name,
+                        source_sha256=source_sha256,
+                        kind=kind,
+                        derived=derived,
+                        ctx=ctx,
+                    )
+                semantic_status = "complete"
+            else:
+                artifacts = {
+                    "source": {
+                        "path": stored_name,
+                        "schema": kind,
+                        "sha256": source_sha256,
+                    }
+                }
+                staging_parent = self._viking_fs.create_temp_uri(ctx=ctx)
+                staging_uri = f"{staging_parent}/bundle"
+                await self._viking_fs.mkdir(staging_uri, ctx=ctx)
+                await self._viking_fs.write_file_bytes(
+                    f"{staging_uri}/{stored_name}",
+                    source_bytes,
+                    ctx=ctx,
+                )
+            manifest = build_manifest(
+                kind=kind,
+                source_path=stored_name,
+                sha256=source_sha256,
+                ingested_at=ingested_at,
+                artifacts=artifacts,
+            )
+            if kind == "dwg":
+                manifest["parse_status"] = parse_status
+            await self._viking_fs.write_file(
+                f"{staging_uri}/{RESOURCE_BUNDLE_MANIFEST}",
+                serialize_manifest(manifest),
+                ctx=ctx,
+            )
+            await self._viking_fs.persist_temp_tree(
+                staging_uri,
+                root_uri,
+                ctx=ctx,
+                lease_ref=resource_lock,
+                _allow_atomic_bundle_write=True,
+            )
+            created_root = True
+            await self._viking_fs.delete_temp(staging_parent, ctx=ctx)
+            staging_parent = None
+        except Exception:
+            if staging_parent:
+                with contextlib.suppress(Exception):
+                    await self._viking_fs.delete_temp(staging_parent, ctx=ctx)
+            if created_root:
+                with contextlib.suppress(Exception):
+                    await self._viking_fs.rm(
+                        root_uri,
+                        recursive=True,
+                        ctx=ctx,
+                        lease_ref=resource_lock,
+                    )
+            raise
+        finally:
+            await self._release_lock_ref(resource_lock)
+
+        result: Dict[str, Any] = {
+            "status": "success",
+            "root_uri": root_uri,
+            "source_uri": source_uri,
+            "manifest_uri": manifest_uri,
+            "kind": kind,
+            "source_sha256": source_sha256,
+            "ingested_at": manifest["source"]["ingested_at"],
+            "semantic_status": semantic_status,
+            "vector_status": "skipped",
+        }
+        if kind == "dwg":
+            result["document_id"] = document_id
+            result["parse_status"] = parse_status
+            result["sheet_uris"] = [f"{root_uri}/{sheet['directory']}" for sheet in sheet_bundles]
+        if build_index:
+            queue_status, vector_status = await self._index_atomic_resource_bundle(
+                root_uri=root_uri,
+                kind=kind,
+                ctx=ctx,
+                wait=wait,
+                timeout=timeout,
+                sheet_bundles=sheet_bundles,
+            )
+            result["vector_status"] = vector_status
+            if queue_status is not None:
+                result["queue_status"] = queue_status
+        return result
+
+    async def _index_atomic_resource_bundle(
+        self,
+        *,
+        root_uri: str,
+        kind: str,
+        ctx: RequestContext,
+        wait: bool,
+        timeout: Optional[float],
+        sheet_bundles: Optional[List[Dict[str, Any]]] = None,
+    ) -> tuple[Optional[Dict[str, Any]], str]:
+        """Index every searchable bundle artifact with the bundle's kind tag."""
+        if kind == "dwg":
+            scalar_override = {"search_tags": ["kind=dwg-sheet"]}
+            for sheet in sheet_bundles or []:
+                directory = sheet["directory"]
+                prefix = f"{directory}/"
+                await index_resource(
+                    f"{root_uri}/{directory}",
+                    ctx,
+                    scalar_override=scalar_override,
+                    include_files={path.removeprefix(prefix) for path in sheet["content_paths"]},
+                    include_directory_meta=False,
+                )
+        else:
+            scalar_override = {"search_tags": [f"kind={kind}"]}
+            await index_resource(
+                root_uri,
+                ctx,
+                scalar_override=scalar_override,
+            )
+        if not wait:
+            return None, "queued"
+        queue_manager = get_queue_manager()
+        try:
+            queue_status = build_queue_status_payload(
+                await queue_manager.wait_complete(timeout=timeout)
+            )
+        except TimeoutError as exc:
+            raise DeadlineExceededError("queue processing", timeout) from exc
+        embedding = queue_status.get("Embedding", {})
+        failed = bool(embedding.get("error_count", 0)) if isinstance(embedding, dict) else False
+        return queue_status, "failed" if failed else "complete"
 
     @staticmethod
     def _target_doc_name(
@@ -798,6 +1438,7 @@ class ResourceService:
         enforce_public_remote_targets: bool = False,
         add_type: Optional[str] = None,
         args: Optional[Dict[str, Any]] = None,
+        bundle: bool = False,
         **kwargs,
     ) -> Dict[str, Any]:
         """Accept and route a new resource-add request."""
@@ -822,6 +1463,7 @@ class ResourceService:
             build_index=build_index,
             summarize=summarize,
             processing_mode=processing_mode,
+            bundle=bundle,
             watch_interval=watch_interval,
             manage_watch=True,
             tags=tags,
@@ -891,6 +1533,7 @@ class ResourceService:
         allow_local_path_resolution: bool = True,
         enforce_public_remote_targets: bool = False,
         args: Optional[Dict[str, Any]] = None,
+        bundle: bool = False,
         **kwargs,
     ) -> Dict[str, Any]:
         """Validate and route one resource ingestion request.
@@ -913,6 +1556,7 @@ class ResourceService:
             build_index: Whether to build vector index immediately (default: True)
             summarize: Whether to generate summary (default: False)
             processing_mode: Post-ingest processing mode for semantic/vector work
+            bundle: Assemble a local source and its derived artifacts as one immutable bundle.
             watch_interval: Watch interval in minutes for automatic resource monitoring.
                 - watch_interval > 0: Creates or updates a watch task. The resource will be
                   automatically re-processed at the specified interval by the scheduler.
@@ -964,6 +1608,27 @@ class ResourceService:
             if default_parent:
                 parent = default_parent
                 kwargs["create_parent"] = True
+
+        if bundle:
+            target = ContentTargetSpec.from_fields(
+                ctx=ctx,
+                kind="resource",
+                to=to,
+                parent=parent,
+                create_parent=bool(kwargs.get("create_parent", False)),
+            )
+            return await self._add_atomic_resource_bundle(
+                path=path,
+                ctx=ctx,
+                target=target,
+                wait=wait,
+                timeout=timeout,
+                build_index=build_index,
+                summarize=summarize,
+                watch_interval=watch_interval,
+                allow_local_path_resolution=allow_local_path_resolution,
+                source_name=kwargs.get("source_name"),
+            )
 
         if self._connector.should_delegate(
             path,

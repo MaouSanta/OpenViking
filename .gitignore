@@ -229,3 +229,6 @@ node_modules/
 
 # Local scratch / working notes
 .scratch/
+
+# Local DWG comparison manifests and input paths
+/web-studio/.dwg-compare.local/

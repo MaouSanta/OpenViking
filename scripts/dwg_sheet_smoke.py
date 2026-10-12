@@ -1,0 +1,124 @@
+#!/usr/bin/env python3
+# Copyright (c) 2026 Beijing Volcano Engine Technology Co., Ltd.
+# SPDX-License-Identifier: AGPL-3.0
+"""Inspect the production DWG Markdown/JSON pipeline in a fresh local directory."""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import subprocess
+import tempfile
+from pathlib import Path
+
+from openviking.parse.parsers.dwg import _normalize_libredwg_json, build_dwg_artifacts
+
+
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _read_dwg(source: Path) -> tuple[dict, list[str]]:
+    with tempfile.TemporaryDirectory(prefix="openviking-dwg-smoke-") as temp_dir:
+        json_path = Path(temp_dir) / "libredwg.json"
+        command = ["dwgread", "-O", "JSON", "-o", str(json_path), str(source)]
+        try:
+            process = subprocess.run(command, capture_output=True, check=False)
+        except FileNotFoundError as exc:
+            raise RuntimeError("LibreDWG executable 'dwgread' is not available") from exc
+        if process.returncode:
+            details = (process.stderr or process.stdout).decode("utf-8", errors="replace").strip()
+            raise RuntimeError(
+                f"LibreDWG conversion failed for {source.name} "
+                f"(exit {process.returncode}): {details[-2000:]}"
+            )
+        try:
+            raw = json_path.read_bytes()
+        except OSError as exc:
+            raise RuntimeError(f"LibreDWG produced no JSON for {source.name}") from exc
+    drawing, _normalized, warnings = _normalize_libredwg_json(raw, source.name)
+    return drawing, warnings
+
+
+def _write_artifacts(output: Path, artifacts: dict) -> list[str]:
+    if output.exists() and (not output.is_dir() or any(output.iterdir())):
+        raise RuntimeError(f"output directory must be empty: {output}")
+    output.mkdir(parents=True, exist_ok=True)
+    written = []
+    for sheet in artifacts["sheets"]:
+        sheet_dir = output / sheet["directory"]
+        sheet_dir.mkdir(parents=True, exist_ok=True)
+        for filename, content in sheet["content_files"]:
+            path = sheet_dir / filename
+            path.write_text(content, encoding="utf-8")
+            written.append(path.relative_to(output).as_posix())
+    for relative, content in artifacts["json_files"].items():
+        path = output / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding="utf-8")
+        written.append(relative)
+    return written
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("dwg", type=Path, help="input DWG file")
+    parser.add_argument("output", type=Path, help="new or empty inspection directory")
+    parser.add_argument("--json", action="store_true", help="print a JSON result summary")
+    args = parser.parse_args(argv)
+
+    try:
+        source = args.dwg.expanduser().resolve()
+        output = args.output.expanduser().resolve()
+        if not source.is_file():
+            raise RuntimeError(f"DWG file not found: {source}")
+        if source.suffix.casefold() != ".dwg":
+            raise RuntimeError(f"input must be a .dwg file: {source}")
+        if output == source.parent or source.is_relative_to(output):
+            raise RuntimeError("output must not contain the source DWG")
+
+        drawing, warnings = _read_dwg(source)
+        artifacts = build_dwg_artifacts(
+            drawing,
+            source_path=source,
+            source_name=source.name,
+            source_sha256=_sha256(source),
+            source_size_bytes=source.stat().st_size,
+        )
+        written = _write_artifacts(output, artifacts)
+        (output / source.name).write_bytes(source.read_bytes())
+        written.append(source.name)
+    except (OSError, RuntimeError, ValueError) as exc:
+        parser.exit(1, f"error: {exc}\n")
+
+    summary = {
+        "document_id": artifacts["document"]["document_id"],
+        "sheet_count": artifacts["document"]["sheet_count"],
+        "sheet_bundle_count": artifacts["document"]["sheet_bundle_count"],
+        "detection_statistics": artifacts["document"]["detection_statistics"],
+        "output": str(output),
+        "written": written,
+        "warnings": warnings,
+        "parse_status": artifacts["parse_status"],
+    }
+    if args.json:
+        print(json.dumps(summary, ensure_ascii=False, indent=2))
+    else:
+        print(
+            f"Detected {summary['sheet_count']} Sheet(s); "
+            f"wrote {summary['sheet_bundle_count']} bundle(s) to {output}"
+        )
+        for path in written:
+            print(f"  {path}")
+        for warning in warnings:
+            print(f"warning: {warning}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

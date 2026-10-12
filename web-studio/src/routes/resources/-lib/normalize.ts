@@ -46,7 +46,9 @@ const IMAGE_EXTS = [
   'avif',
 ]
 const MARKDOWN_EXTS = ['md', 'markdown', 'mdx']
+const MODEL3D_EXTS = ['step', 'stp']
 const JSONL_EXTS = ['jsonl', 'ndjson']
+const DRAWING_2D_EXTS = ['dwg']
 const CODE_EXTS = [
   'js',
   'ts',
@@ -254,11 +256,17 @@ export function detectFileType(uri: string): VikingFileType {
   if (IMAGE_EXTS.includes(ext)) {
     return 'image'
   }
+  if (MODEL3D_EXTS.includes(ext)) {
+    return 'model3d'
+  }
   if (MARKDOWN_EXTS.includes(ext)) {
     return 'markdown'
   }
   if (JSONL_EXTS.includes(ext)) {
     return 'jsonl'
+  }
+  if (DRAWING_2D_EXTS.includes(ext)) {
+    return 'drawing2d'
   }
   if (CODE_EXTS.includes(ext)) {
     return 'code'
@@ -279,7 +287,7 @@ export function isLikelyBinary(uri: string): boolean {
   const name = fileNameFromUri(uri).toLowerCase()
   const ext = name.includes('.') ? name.split('.').pop() || '' : ''
 
-  return BINARY_EXTS.includes(ext)
+  return DRAWING_2D_EXTS.includes(ext) || BINARY_EXTS.includes(ext)
 }
 
 export function shouldAutoRead(
@@ -295,7 +303,11 @@ export function shouldAutoRead(
   }
 
   const fileType = detectFileType(entry.uri)
-  if (fileType === 'image' || isLikelyBinary(entry.uri)) {
+  if (
+    fileType === 'image' ||
+    fileType === 'model3d' ||
+    isLikelyBinary(entry.uri)
+  ) {
     return { shouldRead: false, reason: 'binary' }
   }
 

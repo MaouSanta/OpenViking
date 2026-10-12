@@ -49,6 +49,7 @@ class BaseClient(ABC):
         add_type: Optional[str] = None,
         tags: Optional[List[str]] = None,
         tag_mode: str = "replace",
+        bundle: bool = False,
     ) -> Dict[str, Any]:
         """Add resource to OpenViking.
 
@@ -89,6 +90,19 @@ class BaseClient(ABC):
         target_uri: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Find skills by semantic search."""
+        ...
+
+    @abstractmethod
+    async def find_resource(
+        self,
+        query: str,
+        target_uri: Union[str, List[str]] = "viking://resources",
+        limit: int = 10,
+        score_threshold: Optional[float] = None,
+        tags: Optional[List[str]] = None,
+        telemetry: TelemetryRequest = False,
+    ) -> Dict[str, Any]:
+        """Find atomic resource bundles by aggregated child-vector score."""
         ...
 
     @abstractmethod

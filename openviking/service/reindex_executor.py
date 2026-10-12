@@ -23,6 +23,7 @@ from openviking.core.namespace import (
     owner_fields_for_uri,
     owner_space_for_uri,
 )
+from openviking.resource.atomic_bundle import is_dwg_parser_data, unindexed_dwg_uris
 from openviking.server.dependencies import get_service
 from openviking.server.identity import RequestContext
 from openviking.service.task_tracker import get_task_tracker
@@ -1001,8 +1002,19 @@ class ReindexExecutor:
                 deduped_files.append(file_uri)
                 seen_files.add(file_uri)
 
+        excluded = await unindexed_dwg_uris(
+            get_viking_fs(),
+            root_uri,
+            [
+                *({"uri": uri, "isDir": True} for uri in deduped_directories),
+                *({"uri": uri, "isDir": False} for uri in deduped_files),
+            ],
+            ctx=ctx,
+        )
         for directory_uri in deduped_directories:
             if directory_uri == "viking://":
+                continue
+            if directory_uri in excluded:
                 continue
             counters.scanned_records += 1
             abstract = await self._read_directory_abstract(directory_uri, ctx=ctx)
@@ -1047,6 +1059,8 @@ class ReindexExecutor:
                     counters.warnings.append(f"Failed to reindex {directory_uri} L1 vector: {exc}")
 
         for file_uri in deduped_files:
+            if file_uri in excluded:
+                continue
             counters.scanned_records += 1
             parent_uri = VikingURI(file_uri).parent.uri
             summary = await self._best_file_summary(file_uri, ctx=ctx)
@@ -1092,6 +1106,8 @@ class ReindexExecutor:
 
         viking_fs = get_viking_fs()
         marker_name = ".abstract.md" if level == ContextLevel.ABSTRACT else ".overview.md"
+        if await is_dwg_parser_data(viking_fs, dir_uri, ctx=ctx, is_directory=True):
+            return
         lock_path = viking_fs._uri_to_path(f"{dir_uri}/{marker_name}", ctx=ctx)
         lease = await viking_fs._async_agfs.pathlock_acquire_exact(lock_path)
         try:

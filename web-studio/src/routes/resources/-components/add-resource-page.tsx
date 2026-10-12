@@ -34,8 +34,8 @@ import { cn } from '#/lib/utils'
 import { useResourceUpload } from '../-hooks/use-resource-upload'
 import {
   MAX_UPLOAD_FILES,
-  MAX_UPLOAD_FILE_SIZE_BYTES,
   formatFileSize,
+  getUploadPolicy,
   isBlockedFile,
 } from '../-lib/upload'
 import { DirectoryPickerDialog } from './directory-picker-dialog'
@@ -108,11 +108,12 @@ export function AddResourceForm({
             continue
           }
 
-          if (file.size > MAX_UPLOAD_FILE_SIZE_BYTES) {
+          const uploadPolicy = getUploadPolicy(file.name)
+          if (file.size > uploadPolicy.maxSizeBytes) {
             toast.error(
               t('fileTooLarge', {
                 name: file.name,
-                size: formatFileSize(MAX_UPLOAD_FILE_SIZE_BYTES),
+                size: formatFileSize(uploadPolicy.maxSizeBytes),
               }),
               { duration: 2500 },
             )
@@ -426,9 +427,7 @@ export function AddResourceForm({
                         <Info className="size-3.5 text-muted-foreground" />
                       }
                     />
-                    <TooltipContent>
-                      {t('createParent.hint')}
-                    </TooltipContent>
+                    <TooltipContent>{t('createParent.hint')}</TooltipContent>
                   </Tooltip>
                 </Label>
                 <Label className="flex items-center gap-2">

@@ -9,6 +9,7 @@ import zipfile
 from typing import Any, Optional
 
 from openviking.core.namespace import context_type_for_uri, is_session_uri, relative_uri_path
+from openviking.resource.atomic_bundle import find_resource_bundle_owner_root, unindexed_dwg_uris
 from openviking.server.identity import RequestContext
 from openviking.storage.index_consistency import check_index_consistency
 from openviking.storage.ovpack.format import (
@@ -62,7 +63,12 @@ from openviking.storage.ovpack.vectors import (
     restore_vector_snapshot,
 )
 from openviking.utils.embedding_utils import vectorize_directory_meta, vectorize_file
-from openviking_cli.exceptions import ConflictError, InvalidArgumentError, NotFoundError
+from openviking_cli.exceptions import (
+    ConflictError,
+    FailedPreconditionError,
+    InvalidArgumentError,
+    NotFoundError,
+)
 from openviking_cli.utils.logger import get_logger
 from openviking_cli.utils.uri import VikingURI
 
@@ -195,13 +201,14 @@ async def _enqueue_direct_vectorization(
     index_records = index_records or []
     manifest_path_root_uri = manifest_path_root_uri or uri
     entries = await viking_fs.tree(uri, node_limit=None, level_limit=None, ctx=ctx)
-    dir_uris = {uri}
+    excluded = await unindexed_dwg_uris(viking_fs, uri, entries, ctx=ctx)
+    dir_uris = {uri} - excluded
     file_entries: list[tuple[str, str, str, str]] = []
     for entry in entries:
         entry_uri = entry.get("uri")
         if not entry_uri:
             continue
-        if is_session_uri(entry_uri):
+        if is_session_uri(entry_uri) or entry_uri in excluded:
             continue
         rel_path = entry.get("rel_path") or relative_uri_path(uri, entry_uri)
         manifest_rel_path = relative_uri_path(manifest_path_root_uri, entry_uri)
@@ -306,6 +313,14 @@ async def import_ovpack(
         validate_import_scope_compatibility(manifest, root_uri)
         validate_import_target_uri(root_uri)
 
+        owner = await find_resource_bundle_owner_root(viking_fs, root_uri, ctx=ctx)
+        if owner:
+            raise FailedPreconditionError(
+                "Cannot import a package into an atomic resource bundle. "
+                f"Operate on the complete bundle root instead: {owner}",
+                details={"bundle_root": owner, "uri": root_uri},
+            )
+
         members = validated_import_members(infolist, base_name, root_uri)
         existing_roots = [root_uri] if await _root_exists(viking_fs, root_uri, ctx) else []
 
@@ -342,12 +357,21 @@ async def import_ovpack(
             if kind in {"manifest", "internal"}:
                 continue
             if kind == "directory":
-                await viking_fs.mkdir(join_uri(root_uri, rel_path), exist_ok=True, ctx=ctx)
+                await viking_fs.mkdir(
+                    join_uri(root_uri, rel_path),
+                    exist_ok=True,
+                    ctx=ctx,
+                    _allow_atomic_bundle_write=True,
+                )
                 continue
 
             target_file_uri = join_uri(root_uri, rel_path)
             data = zf.read(safe_zip_path)
-            await viking_fs.write_file_bytes(target_file_uri, data, ctx=ctx)
+            # All package members have passed validation; markers can precede
+            # their members without reopening the generic bundle write path.
+            await viking_fs.write_file_bytes(
+                target_file_uri, data, ctx=ctx, _allow_atomic_bundle_write=True
+            )
 
     logger.info(f"[ovpack] Successfully imported {file_path} to {root_uri}")
 
@@ -679,11 +703,18 @@ async def restore_ovpack(
             if kind in {"manifest", "internal"} or rel_path == "":
                 continue
             if kind == "directory":
-                await viking_fs.mkdir(join_uri(root_uri, rel_path), exist_ok=True, ctx=ctx)
+                await viking_fs.mkdir(
+                    join_uri(root_uri, rel_path),
+                    exist_ok=True,
+                    ctx=ctx,
+                    _allow_atomic_bundle_write=True,
+                )
                 continue
 
             data = zf.read(safe_zip_path)
-            await viking_fs.write_file_bytes(join_uri(root_uri, rel_path), data, ctx=ctx)
+            await viking_fs.write_file_bytes(
+                join_uri(root_uri, rel_path), data, ctx=ctx, _allow_atomic_bundle_write=True
+            )
 
     logger.info(f"[ovpack] Successfully restored backup {file_path}")
 
